@@ -71,6 +71,27 @@ constexpr bool kIsFp4Enabled =
 // Combined check for SM12x FP4 support
 constexpr bool kIsSm12xFp4Supported = kIsSm12xSupported && kIsFp4Enabled;
 
+// =============================================================================
+// SM12x Block-Scaled Scale Factor Constants
+// =============================================================================
+//
+// SM12x block-scaled MMA instructions use float_ue8m0_t for scale factors.
+// float_ue8m0_t is an 8-bit unsigned exponent-only type that encodes:
+//   value = 2^(storage - 127)  [like FP32 exponent, bias = 127]
+//
+// Common scale factor values:
+//   Identity (1.0): storage = 127 = 0x7F → 2^(127-127) = 2^0 = 1.0
+//   2^-1 (0.5):     storage = 126 = 0x7E → 2^(126-127) = 2^-1
+//   2^1 (2.0):      storage = 128 = 0x80 → 2^(128-127) = 2^1
+//
+// WARNING: The CUTLASS header comment says "exp_bias: 8" but the actual
+// implementation uses FP32's exponent bias of 127. Use 0x7F for identity!
+//
+constexpr uint8_t kSm12xIdentityScaleRaw = 0x7F;  // Identity scale (1.0) for float_ue8m0_t
+
+// Block scaling granularity for SM12x (Blk_MN = 128 elements)
+constexpr int kSm12xBlockScaleGranularity = 128;
+
 }  // namespace tensorrt_llm::kernels::cutlass_kernels
 
 

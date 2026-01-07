@@ -48,14 +48,18 @@ using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput
 //   - Use IDENTITY A-SCALES to avoid accuracy loss from block scaling
 //
 // Identity Scale Implementation:
-//   - Scale factor type: float_ue8m0_t (unsigned 8-bit exponent only, bias=8)
-//   - Identity scale value: raw byte = 8 (represents 2^(8-8) = 2^0 = 1.0)
+//   - Scale factor type: float_ue8m0_t (unsigned 8-bit exponent, uses FP32 bias=127)
+//   - Identity scale value: raw byte = 0x7F (127) → 2^(127-127) = 2^0 = 1.0
 //   - Broadcast trick: allocate single identity scale, use stride=0 to broadcast
 //
 // Example identity scale setup:
-//   constexpr uint8_t IDENTITY_SCALE_RAW = 8;  // 2^0 = 1.0
+//   #include "sm12x_arch_config.h"
+//   constexpr uint8_t IDENTITY_SCALE_RAW = kSm12xIdentityScaleRaw;  // 0x7F = 1.0
 //   float_ue8m0_t identity = float_ue8m0_t::bitcast(IDENTITY_SCALE_RAW);
 //   // Allocate one element, pass with stride=0 for broadcast
+//
+// WARNING: CUTLASS header says "exp_bias: 8" but convert_to_float uses FP32's
+// bias of 127. Always use 0x7F for identity, NOT 8!
 //
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag,
           typename CTAShape, typename ClusterShape, bool IsMXFP4 = false>

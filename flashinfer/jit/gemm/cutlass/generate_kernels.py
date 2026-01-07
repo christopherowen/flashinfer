@@ -470,7 +470,8 @@ def is_grouped_gemm_op_valid(op):
 
 def is_op_valid(op):
     # SM120/SM121 has its own validation function
-    if op.arch >= 120:
+    # Use explicit arch list instead of >= 120 to avoid future footguns
+    if op.arch in (120, 121):
         return is_gemm_op_valid_sm120(op)
     
     if op.arch >= 100:

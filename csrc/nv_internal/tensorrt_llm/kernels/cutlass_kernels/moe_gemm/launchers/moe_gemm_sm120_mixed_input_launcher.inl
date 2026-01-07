@@ -90,7 +90,8 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   using ElementB = typename TllmToCutlassTypeAdapter<WeightType>::type;
   
   // Scale factor type for block-scaled operations (UE8M0 = unsigned 8-bit exponent)
-  // Identity scale: raw value 8 represents 2^(8-8) = 1.0
+  // Uses FP32's exponent bias of 127: value = 2^(storage - 127)
+  // Identity scale: raw value 0x7F (127) → 2^(127-127) = 2^0 = 1.0
   using ElementSF = cutlass::float_ue8m0_t;
   
   // For SM120 block-scaled MMA, the hardware only supports FP8/FP6/FP4 inputs.
@@ -100,7 +101,7 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   //   2. Providing A-scale pointers (can be identity scales = 1.0 to avoid accuracy loss)
   //
   // For identity A-scales with broadcastable stride tricks:
-  //   - Allocate single float_ue8m0_t with raw value 8 (2^0 = 1.0)
+  //   - Allocate single float_ue8m0_t with raw value 0x7F (127) → 2^0 = 1.0
   //   - Set stride to 0 to broadcast across all blocks
   //
   // ElementA for the kernel is always FP8 when using block-scaled path.
@@ -236,7 +237,7 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   // For MXFP4 (W4A16) workloads, you have two options for A-scales:
   //
   // 1. IDENTITY SCALES (recommended for accuracy):
-  //    - Pass ptr to single float_ue8m0_t with value 8 (2^0 = 1.0)
+  //    - Pass ptr to single float_ue8m0_t with raw value 0x7F (127) → 2^0 = 1.0
   //    - Use stride layout with zeros to broadcast
   //    - This preserves quantized FP8 values without scaling
   //
