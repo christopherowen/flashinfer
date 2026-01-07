@@ -30,14 +30,33 @@ using tensorrt_llm::kernels::cutlass_kernels::GroupedGemmInput;
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 
 // SM120 Mixed-Input Grouped GEMM Launcher
-// This launcher supports mixed-precision operations on SM120 (Blackwell) architecture:
+// This launcher supports mixed-precision operations on SM120/SM121 (Blackwell) architecture:
 // - FP8 activations x FP4 weights (FP8xFP4)
 // - BF16/FP16 activations x FP4 weights (MXFP4/W4A16) - uses FP8xFP4 path with quantized activations
 //
 // Key features:
-// - Uses block-scaled collective builder for SM120
+// - Uses block-scaled collective builder for SM120/SM121
 // - Supports grouped GEMM for MoE workloads
 // - Integrates with CUTLASS SM120 block-scaled infrastructure
+//
+// IMPORTANT: A-side scaling factors are mandatory for SM120 block-scaled kernels.
+// The SM120 mma.mx_f4f6f8 instructions only support FP8/FP6/FP4 inputs, so BF16/FP16
+// activations must be pre-quantized to FP8 before calling this launcher.
+//
+// For MXFP4 (W4A16) workloads where you want to preserve activation accuracy:
+//   - Pre-quantize BF16/FP16 -> FP8 (float_e4m3_t)
+//   - Use IDENTITY A-SCALES to avoid accuracy loss from block scaling
+//
+// Identity Scale Implementation:
+//   - Scale factor type: float_ue8m0_t (unsigned 8-bit exponent only, bias=8)
+//   - Identity scale value: raw byte = 8 (represents 2^(8-8) = 2^0 = 1.0)
+//   - Broadcast trick: allocate single identity scale, use stride=0 to broadcast
+//
+// Example identity scale setup:
+//   constexpr uint8_t IDENTITY_SCALE_RAW = 8;  // 2^0 = 1.0
+//   float_ue8m0_t identity = float_ue8m0_t::bitcast(IDENTITY_SCALE_RAW);
+//   // Allocate one element, pass with stride=0 for broadcast
+//
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag,
           typename CTAShape, typename ClusterShape, bool IsMXFP4 = false>
 void sm120_mixed_input_moe_gemm_kernelLauncher(

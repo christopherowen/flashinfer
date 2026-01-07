@@ -90,12 +90,27 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   // Type definitions
   /////////////////////////////////////////////////////////////////////////////
 
-  // Input element types
-  using ElementA = typename TllmToCutlassTypeAdapter<T>::type;
+  // Input element types (from user-facing API)
+  using ElementAInput = typename TllmToCutlassTypeAdapter<T>::type;
   using ElementB = typename TllmToCutlassTypeAdapter<WeightType>::type;
   
-  // Scale factor type for block-scaled operations
+  // Scale factor type for block-scaled operations (UE8M0 = unsigned 8-bit exponent)
+  // Identity scale: raw value 8 represents 2^(8-8) = 1.0
   using ElementSF = cutlass::float_ue8m0_t;
+  
+  // For SM120 block-scaled MMA, the hardware only supports FP8/FP6/FP4 inputs.
+  // When IsMXFP4=true (BF16/FP16 activations with FP4 weights), activations must
+  // be pre-quantized to FP8 before the GEMM. The caller is responsible for:
+  //   1. Quantizing BF16/FP16 -> FP8 (float_e4m3_t)
+  //   2. Providing A-scale pointers (can be identity scales = 1.0 to avoid accuracy loss)
+  //
+  // For identity A-scales with broadcastable stride tricks:
+  //   - Allocate single float_ue8m0_t with raw value 8 (2^0 = 1.0)
+  //   - Set stride to 0 to broadcast across all blocks
+  //
+  // ElementA for the kernel is always FP8 when using block-scaled path.
+  // The IsMXFP4 flag indicates the original input was BF16/FP16 (for dispatch).
+  using ElementA = cutlass::float_e4m3_t;
   
   // For SM120, we use the mx_float types which wrap the data + scale factor
   using ElementABlockScaled = cutlass::mx_float8_t<ElementA>;
@@ -213,15 +228,32 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   /////////////////////////////////////////////////////////////////////////////
   // Set up mainloop arguments
   /////////////////////////////////////////////////////////////////////////////
-  
+  //
+  // A-SCALE HANDLING:
+  // The SM120 block-scaled kernel requires scale factors for both A and B matrices.
+  // For MXFP4 (W4A16) workloads, you have two options for A-scales:
+  //
+  // 1. IDENTITY SCALES (recommended for accuracy):
+  //    - Pass ptr to single float_ue8m0_t with value 8 (2^0 = 1.0)
+  //    - Use stride layout with zeros to broadcast
+  //    - This preserves quantized FP8 values without scaling
+  //
+  // 2. PROPER A-SCALES (for dynamic range handling):
+  //    - Compute per-block max and use for scaling
+  //    - Better for activations with wide dynamic range
+  //    - Requires scale computation kernel before GEMM
+  //
+  // The caller provides A-scales via hopper_inputs.fpX_block_scaling_factors_act
+  // and the layout via hopper_inputs.fpX_block_scaling_factors_stride_act.
+  //
   typename CollectiveMainloop::Arguments mainloop_args{
-      reinterpret_cast<ElementA const**>(hopper_inputs.ptr_act),
+      reinterpret_cast<ElementA const**>(hopper_inputs.ptr_act),       // Pre-quantized FP8 activations
       reinterpret_cast<StrideA*>(hopper_inputs.stride_act),
-      reinterpret_cast<ElementB const**>(hopper_inputs.ptr_weight),
+      reinterpret_cast<ElementB const**>(hopper_inputs.ptr_weight),    // FP4 weights
       reinterpret_cast<StrideB*>(hopper_inputs.stride_weight),
-      reinterpret_cast<ElementSF const**>(hopper_inputs.fpX_block_scaling_factors_act),
+      reinterpret_cast<ElementSF const**>(hopper_inputs.fpX_block_scaling_factors_act),   // A-scales (can be identity)
       reinterpret_cast<LayoutSFA*>(hopper_inputs.fpX_block_scaling_factors_stride_act),
-      reinterpret_cast<ElementSF const**>(hopper_inputs.fpX_block_scaling_factors_weight),
+      reinterpret_cast<ElementSF const**>(hopper_inputs.fpX_block_scaling_factors_weight), // B-scales (weight scales)
       reinterpret_cast<LayoutSFB*>(hopper_inputs.fpX_block_scaling_factors_stride_weight)};
 
   /////////////////////////////////////////////////////////////////////////////
