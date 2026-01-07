@@ -26,6 +26,21 @@
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
 
+// SM120/SM121 (Blackwell Thorough) arch support detection
+//
+// IMPORTANT: Both SM120 and SM121 use cutlass::arch::Sm120 as the arch tag, but have
+// separate CUTLASS macros:
+//   - CUTLASS_ARCH_MMA_SM120_SUPPORTED: Set when __CUDA_ARCH__ == 1200
+//   - CUTLASS_ARCH_MMA_SM121_SUPPORTED: Set when __CUDA_ARCH__ == 1210
+//
+// SM121 can run SM120-tagged kernels, but compilation must ensure the correct macro is set.
+// When compiling with -arch=sm_121a, CUTLASS_ARCH_MMA_SM121_SUPPORTED is set (not SM120).
+//
+// We use CUTLASS_ARCH_MMA_SM12x_SUPPORTED to check for either SM120 or SM121 support.
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
+#define CUTLASS_ARCH_MMA_SM12x_SUPPORTED 1
+#endif
+
 // SM120/SM121 (Blackwell Thorough) arch
 // Supports:
 // - NVFP4: FP4 x FP4 (same type)
@@ -40,7 +55,7 @@ template <typename T, typename WeightType,
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidSM120MOESpecialisation() {
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
+#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED)
 #if defined(ENABLE_FP4)
   // NVFP4: FP4 x FP4 (same type)
   constexpr bool IsNVFP4 = cutlass::platform::is_same<T, __nv_fp4_e2m1>::value &&
@@ -62,14 +77,14 @@ constexpr bool isValidSM120MOESpecialisation() {
   return false;
 #endif
 #else
-  return false;  // CUTLASS_ARCH_MMA_SM120_SUPPORTED is set when SM120 kernels are enabled
+  return false;  // CUTLASS_ARCH_MMA_SM12x_SUPPORTED is set when SM120 or SM121 kernels are enabled
 #endif
 }
 
-// Helper to check if a configuration is MXFP4 (W4A16) on SM120
+// Helper to check if a configuration is MXFP4 (W4A16) on SM120/SM121
 template <typename T, typename WeightType>
 constexpr bool isSM120MXFP4() {
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && defined(ENABLE_FP4)
+#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4)
   return (cutlass::platform::is_same<T, __nv_bfloat16>::value ||
           cutlass::platform::is_same<T, half>::value) &&
          cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value;
