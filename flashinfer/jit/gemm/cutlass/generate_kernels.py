@@ -778,30 +778,31 @@ def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
 # - Shape<128,256,256> for 1SM block-scaled
 # - Shape<256,256,256> for 2SM block-scaled
 SM120_TILE_SHAPES = {
+    # PERFORMANCE vs JIT TRADE-OFF:
+    # More tile shapes = better coverage for different problem sizes
+    # Fewer tile shapes = faster JIT compilation and smaller cache
+    #
+    # Current config targets ~80 total kernel variants (before swap_ab/fusion):
+    # NVFP4: 3 × 4 × 1 = 12 shapes
+    # FP8xFP4: 2 × 3 × 1 = 6 shapes
+    # Total base: 18 shapes × 2 otypes × 2 fusions × 2 swap_ab = ~144 kernels
+    #
     # NVFP4 (FP4 x FP4): Same-type block-scaled GEMM
-    # Supports wide range of shapes for homogeneous FP4 computation
-    # Match SM90 N-tile variety: 16,32,64,128,256 + 192 for 2880
     "nvfp4": {
-        "M_TILES": [64, 128, 256],  # M=64 for smaller batches
-        "N_TILES": [32, 64, 128, 192, 256],  # 32,64 for narrow, 192 for 2880
-        "K_TILES": [128, 256],
+        "M_TILES": [64, 128, 256],  # 64=decode, 128/256=prefill
+        "N_TILES": [64, 128, 192, 256],  # 192 for 2880, reduced from 5 to 4
+        "K_TILES": [128],  # K=128 sufficient for most cases
     },
     # FP8xFP4: Mixed-input with FP8 activations, FP4 weights
-    # Add smaller N tiles for narrow projections (router/gating)
-    # N=192 for model dims like 2880 (2880 % 192 = 0)
+    # Also used for MXFP4 after bf16/fp16 -> FP8 quantization
     "fp8xfp4": {
-        "M_TILES": [64, 128],  # M=64 for decode, M=128 for prefill
-        "N_TILES": [32, 64, 128, 192, 256],  # 32,64 for narrow N problems
-        "K_TILES": [128, 256],
+        "M_TILES": [64, 128],  # 64=decode TPS, 128=prefill
+        "N_TILES": [64, 128, 192],  # 192 for 2880 (2880%192=0)
+        "K_TILES": [128],  # K=128 is the sweet spot
     },
-    # MXFP4 (W4A16): BF16/FP16 activations with FP4 weights
-    # Uses FP8xFP4 infrastructure with activation quantization
-    # Add smaller N tiles like SM90 has for mixed-type
-    "mxfp4": {
-        "M_TILES": [64, 128, 256],  # M=64 for decode TPS
-        "N_TILES": [32, 64, 128, 192, 256],  # 32,64 for narrow, 192 for 2880
-        "K_TILES": [128, 256],  # Add K=256 like FP8xFP4
-    },
+    # NOTE: MXFP4 is NOT registered at kernel level.
+    # SM120 MMA only supports FP8/FP6/FP4 inputs. For MXFP4 (W4A16) with
+    # bf16/f16 activations, the higher layer quantizes to FP8 before dispatch.
 }
 
 # SM120 Cluster Shapes (CGA)
@@ -843,7 +844,15 @@ def is_gemm_op_valid_sm120(op):
     # Determine operation type
     is_nvfp4 = op.act_type == e2m1 and op.weight_type == e2m1
     is_fp8xfp4 = op.act_type == DataType.e4m3 and op.weight_type == e2m1
-    is_mxfp4 = op.act_type in [DataType.bf16, DataType.f16] and op.weight_type == e2m1
+    
+    # NOTE: MXFP4 (bf16/f16 activations) is NOT registered at kernel level.
+    # The SM120 launcher only supports FP8 activations. MXFP4 is handled
+    # at a higher layer that quantizes bf16/f16 -> FP8 before dispatch.
+    # If someone tries to register bf16/f16 x FP4 at kernel level, reject it.
+    is_invalid_mxfp4 = op.act_type in [DataType.bf16, DataType.f16] and op.weight_type == e2m1
+    if is_invalid_mxfp4:
+        # Do not allow bf16/f16 activations at kernel level - causes type mismatch
+        return False
     
     # NVFP4: FP4 x FP4
     if is_nvfp4:
@@ -855,23 +864,13 @@ def is_gemm_op_valid_sm120(op):
             return False
         return True
     
-    # FP8xFP4: FP8 activations x FP4 weights
+    # FP8xFP4: FP8 activations x FP4 weights (also used for MXFP4 after quantization)
     if is_fp8xfp4:
         if tile_m not in SM120_TILE_SHAPES["fp8xfp4"]["M_TILES"]:
             return False
         if tile_n not in SM120_TILE_SHAPES["fp8xfp4"]["N_TILES"]:
             return False
         if tile_k not in SM120_TILE_SHAPES["fp8xfp4"]["K_TILES"]:
-            return False
-        return True
-    
-    # MXFP4: BF16/FP16 activations x FP4 weights
-    if is_mxfp4:
-        if tile_m not in SM120_TILE_SHAPES["mxfp4"]["M_TILES"]:
-            return False
-        if tile_n not in SM120_TILE_SHAPES["mxfp4"]["N_TILES"]:
-            return False
-        if tile_k not in SM120_TILE_SHAPES["mxfp4"]["K_TILES"]:
             return False
         return True
     
@@ -884,15 +883,21 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     
     SM120/SM121 supports block-scaled operations:
     - NVFP4: FP4 x FP4 (same type)
-    - FP8xFP4: FP8 activations x FP4 weights  
-    - MXFP4 (W4A16): BF16/FP16 activations x FP4 weights
+    - FP8xFP4: FP8 activations x FP4 weights
+    
+    NOTE: MXFP4 (W4A16) is NOT registered here!
+    SM120 block-scaled MMA only supports FP8/FP6/FP4 inputs. For MXFP4 workloads
+    with BF16/FP16 activations, the higher-level API must:
+    1. Pre-quantize BF16/FP16 -> FP8 (e4m3)
+    2. Generate A-scale factors (identity or proper)
+    3. Dispatch to FP8xFP4 kernels
     
     This function generates kernel configurations using a tile matrix approach
     similar to SM90, with separate configurations per data type.
     
     Performance notes:
-    - M=32 included for decode TPS (small per-expert batch sizes)
-    - N=192 included for gpt-oss-120b hidden dim 2880 (2880 % 192 = 0)
+    - M=64,128,256 for different batch sizes (no M=32 due to Blk_MN=128)
+    - N=32,64,128,192,256 for various hidden dims (192 for 2880)
     - Cluster 1x1x1 only (current software limitation)
     
     The validation is optimistic - some generated configs may fail at
@@ -989,40 +994,29 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     # =========================================================================
     # MXFP4 (W4A16): BF16/FP16 activations x FP4 weights
     # =========================================================================
-    mxfp4_shapes = list(product(
-        SM120_TILE_SHAPES["mxfp4"]["M_TILES"],
-        SM120_TILE_SHAPES["mxfp4"]["N_TILES"],
-        SM120_TILE_SHAPES["mxfp4"]["K_TILES"],
-    ))
-    
-    for act_type in [DataType.bf16, DataType.f16]:
-        for cta_shape_mnk, epi_fusion, swap_ab in product(
-            mxfp4_shapes, epi_fusions, swap_ab_options
-        ):
-            # MXFP4: output same type as activations
-            otype = act_type
-            op = TrtLlm_GemmLauncher(
-                GemmKind.Grouped,
-                arch,
-                act_type,   # act_type (bf16 or f16)
-                e2m1,       # weight_type (FP4)
-                act_type,   # acc_type (unused)
-                act_type,   # bias_type (unused)
-                otype,      # output_type
-                TrtLlm_QuantOp.none,
-                TrtLlm_EpilogueTag.epilogue_op_default,
-                list(cta_shape_mnk),
-                warp_shape,
-                stages,
-                list(SM120_CLUSTER_SHAPES[0]),
-                KernelScheduleType.TmaWarpSpecializedCooperative,
-                None,  # epi_schedule
-                epi_fusion,
-                is_mx_fpx=True,
-                swap_ab=swap_ab,
-            )
-            if is_gemm_op_valid_sm120(op):
-                operations.append(op)
+    # NOTE: MXFP4 kernels are NOT registered with BF16/FP16 act_type!
+    # 
+    # SM120 block-scaled MMA instructions ONLY support FP8/FP6/FP4 inputs.
+    # For MXFP4 (BF16/FP16 activations), the caller must:
+    #   1. Pre-quantize BF16/FP16 -> FP8 (e4m3)
+    #   2. Generate A-scale factors (identity or proper)
+    #   3. Call the FP8xFP4 kernel
+    #
+    # Registering MXFP4 as bf16/f16 act_type would cause:
+    # - Dispatch to select the kernel for BF16/FP16 activations
+    # - But the kernel casts ptr_act to FP8 -> garbage output
+    #
+    # Instead, MXFP4 support is provided at a HIGHER layer:
+    # - FlashInfer's MoE API accepts BF16/FP16 activations
+    # - Internally quantizes to FP8 + generates SFA
+    # - Dispatches to FP8xFP4 kernel
+    #
+    # The FP8xFP4 kernel shapes above already cover MXFP4 use cases.
+    # The "mxfp4" tile config is REMOVED to avoid type confusion.
+    #
+    # DO NOT uncomment the following - it creates type mismatch bugs:
+    # for act_type in [DataType.bf16, DataType.f16]:
+    #     ... register with bf16/f16 act_type ...
     
     return operations
 

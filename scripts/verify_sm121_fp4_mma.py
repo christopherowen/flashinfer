@@ -47,15 +47,38 @@ import re
 #   without corresponding FP4/MXF4/BLOCK_SCALE instructions
 
 # Patterns that indicate native FP4 MMA is being used
+# Priority: patterns earlier in the list are stronger indicators
 FP4_MMA_PATTERNS = [
-    r'TCGEN05',              # Gen5 tensor core (Blackwell)
-    r'UMMA',                 # Unified MMA (SM100+)
-    r'\.MXF4',               # MXFP4 operations
-    r'\.F4',                 # FP4 operations
-    r'\.E2M1',               # E2M1 format (FP4)
-    r'BLOCK_SCALE',          # Block-scaled operations
-    r'UBLK',                 # Unified block operations
-    r'mma\.sync.*f4',        # MMA with FP4
+    # STRONGEST INDICATORS (block-scaled FP4 MMA)
+    r'TCGEN05\.MMA.*BLOCK_SCALE',  # Gen5 TC with block scaling
+    r'HMMA\..*\.F4.*BLOCK_SCALE',  # Half MMA with FP4 + block scale
+    r'UMMA\..*MXF4',               # Unified MMA with MXFP4
+    r'UMMA\..*BLOCK_SCALE',        # Unified MMA with block scaling
+    r'\.MXF4.*BLOCK_SCALE',        # MXFP4 with block scaling
+    r'\.E2M1.*BLOCK_SCALE',        # E2M1 (FP4) with block scaling
+    
+    # SECONDARY INDICATORS (FP4 operations without explicit block_scale)
+    r'TCGEN05',                    # Gen5 tensor core (Blackwell)
+    r'UMMA',                       # Unified MMA (SM100+)
+    r'\.MXF4',                     # MXFP4 operations
+    r'\.E2M1',                     # E2M1 format (FP4)
+    
+    # WEAK INDICATORS (may appear in non-FP4 code too)
+    r'BLOCK_SCALE',                # Block-scaled operations (could be FP8)
+    r'UBLK',                       # Unified block operations
+]
+
+# Strong pattern count threshold - need at least one of these
+FP4_STRONG_PATTERNS = [
+    r'TCGEN05\.MMA.*BLOCK_SCALE',
+    r'HMMA\..*\.F4.*BLOCK_SCALE',
+    r'UMMA\..*MXF4',
+    r'UMMA\..*BLOCK_SCALE',
+    r'\.MXF4.*BLOCK_SCALE',
+    r'\.E2M1.*BLOCK_SCALE',
+    r'TCGEN05',
+    r'\.MXF4',
+    r'\.E2M1',
 ]
 
 # Patterns that indicate fallback to BF16/FP16 MMA (without FP4)
@@ -112,9 +135,17 @@ def get_sass_dump(cubin_path, tool):
 
 
 def analyze_sass(sass_output):
-    """Analyze SASS output for FP4 MMA instructions."""
+    """Analyze SASS output for FP4 MMA instructions.
+    
+    Returns:
+        tuple: (fp4_matches, fallback_matches, strong_matches)
+        - fp4_matches: All FP4-related pattern matches
+        - fallback_matches: BF16/FP16 fallback pattern matches
+        - strong_matches: Strong FP4 block-scaled pattern matches (definitive proof)
+    """
     fp4_matches = []
     fallback_matches = []
+    strong_matches = []
     
     for line in sass_output.split('\n'):
         # Check for FP4 patterns
@@ -122,12 +153,17 @@ def analyze_sass(sass_output):
             if re.search(pattern, line, re.IGNORECASE):
                 fp4_matches.append((pattern, line.strip()))
         
+        # Check for strong FP4 patterns (definitive proof)
+        for pattern in FP4_STRONG_PATTERNS:
+            if re.search(pattern, line, re.IGNORECASE):
+                strong_matches.append((pattern, line.strip()))
+        
         # Check for fallback patterns
         for pattern in FALLBACK_PATTERNS:
             if re.search(pattern, line, re.IGNORECASE):
                 fallback_matches.append((pattern, line.strip()))
     
-    return fp4_matches, fallback_matches
+    return fp4_matches, fallback_matches, strong_matches
 
 
 def create_test_kernel_source(kernel_type):
@@ -301,44 +337,67 @@ def build_test_kernel(kernel_type, flashinfer_root):
 
 
 def verify_kernel(cubin_path, tool):
-    """Verify a kernel uses native FP4 MMA instructions."""
+    """Verify a kernel uses native FP4 MMA instructions.
+    
+    Verification is STRICT: we require at least one "strong" FP4 pattern
+    (TCGEN05, MXF4, E2M1, or BLOCK_SCALE with FP4 indicators).
+    """
     
     print(f"\n=== Analyzing SASS for {cubin_path} ===")
     
     sass = get_sass_dump(cubin_path, tool)
-    fp4_matches, fallback_matches = analyze_sass(sass)
+    fp4_matches, fallback_matches, strong_matches = analyze_sass(sass)
     
-    print(f"\nFP4 MMA pattern matches: {len(fp4_matches)}")
-    for pattern, line in fp4_matches[:10]:  # Show first 10
-        print(f"  [{pattern}] {line[:100]}...")
-    if len(fp4_matches) > 10:
-        print(f"  ... and {len(fp4_matches) - 10} more")
+    print(f"\n=== Pattern Matches ===")
+    print(f"Strong FP4 indicators: {len(strong_matches)}")
+    for pattern, line in strong_matches[:5]:  # Show first 5
+        print(f"  ✓ [{pattern}] {line[:80]}...")
+    if len(strong_matches) > 5:
+        print(f"  ... and {len(strong_matches) - 5} more")
     
-    print(f"\nBF16/FP16 fallback pattern matches: {len(fallback_matches)}")
-    for pattern, line in fallback_matches[:5]:
-        print(f"  [{pattern}] {line[:100]}...")
-    if len(fallback_matches) > 5:
-        print(f"  ... and {len(fallback_matches) - 5} more")
+    print(f"\nAll FP4 pattern matches: {len(fp4_matches)}")
+    for pattern, line in fp4_matches[:5]:
+        print(f"  [{pattern}] {line[:80]}...")
+    if len(fp4_matches) > 5:
+        print(f"  ... and {len(fp4_matches) - 5} more")
     
-    # Decision logic
-    uses_fp4 = len(fp4_matches) > 0
+    print(f"\nBF16/FP16 fallback patterns: {len(fallback_matches)}")
+    for pattern, line in fallback_matches[:3]:
+        print(f"  ⚠ [{pattern}] {line[:80]}...")
+    if len(fallback_matches) > 3:
+        print(f"  ... and {len(fallback_matches) - 3} more")
+    
+    # Decision logic - STRICT verification
+    has_strong_fp4 = len(strong_matches) > 0
+    has_any_fp4 = len(fp4_matches) > 0
     has_fallback = len(fallback_matches) > 0
     
     print("\n=== Verification Result ===")
     
-    if uses_fp4:
-        print("✅ PASS: Native FP4 MMA instructions detected!")
+    if has_strong_fp4:
+        print("✅ PASS: Native SM12x block-scaled FP4 MMA instructions detected!")
+        print(f"   Found {len(strong_matches)} strong FP4 indicators.")
         if has_fallback:
             print("   Note: Some BF16/FP16 MMA also present (may be for epilogue/aux ops)")
         return True
-    elif has_fallback:
+    elif has_any_fp4 and not has_fallback:
+        print("⚠️ WARNING: Some FP4 patterns found but no strong indicators.")
+        print("   This may still be correct, but manual verification recommended.")
+        print("   Looking for: TCGEN05, MXF4, E2M1, BLOCK_SCALE patterns.")
+        return False  # Strict mode: require strong indicators
+    elif has_fallback and not has_any_fp4:
         print("❌ FAIL: Only BF16/FP16 MMA found, no native FP4!")
         print("   The kernel is NOT using native FP4 tensor cores.")
+        print("   Check: Is the kernel actually dispatching to SM120 builders?")
+        return False
+    elif has_fallback and has_any_fp4:
+        print("⚠️ WARNING: Mixed FP4 and BF16/FP16 patterns without strong FP4 indicators.")
+        print("   Cannot confirm block-scaled FP4 MMA is being used.")
         return False
     else:
-        print("⚠️ WARNING: No recognized MMA patterns found.")
-        print("   Could not determine if kernel uses FP4 or fallback.")
-        print("   Manual SASS inspection may be needed.")
+        print("❌ FAIL: No recognized MMA patterns found.")
+        print("   The compiled binary may not contain the expected kernel.")
+        print("   Check: Is the kernel being instantiated? Is it for SM121?")
         return False
 
 

@@ -53,6 +53,9 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+#include <mutex>
+#include <unordered_map>
+
 #include "sm12x_arch_config.h"
 
 namespace tensorrt_llm {
@@ -81,10 +84,22 @@ static constexpr uint8_t kIdentityScaleRaw = kSm12xIdentityScaleRaw;  // 0x7F
 // - Number of scale blocks in K: ceil(K / SFVecSize)  where SFVecSize = 32 or 128
 // - Layout is a complex tiled pattern, not simple [M/128, K/SFVecSize]
 //
-// For simplicity in identity mode, we can use a single scale factor with
-// broadcast stride (stride=0 in the layout), avoiding the complex layout entirely.
+// IMPORTANT: TMA SCALE LOAD REQUIREMENTS
+// =======================================
+// TMA scale loads require real tiles with valid access patterns. Do NOT use
+// stride=0 tricks to broadcast a single scale value - this may:
+// - Work on some driver versions but break on others
+// - Force unexpected slow paths
+// - Cause misaligned TMA access errors
 //
-// For full-scale mode, we need to match CUTLASS's Sm1xxBlockScaledConfig::LayoutSF.
+// For identity mode, you MUST:
+// 1. Allocate a properly-sized SFA buffer matching CUTLASS's LayoutSFA
+// 2. Pre-fill the entire buffer with 0x7F (identity = 1.0)
+// 3. Cache this buffer per (M, K, tile_shape) configuration
+// 4. Pass the real buffer with correct strides
+//
+// The identity buffer can be shared across calls with the same layout, but
+// it must have the correct shape - not a single element with broadcast stride.
 
 // =============================================================================
 // Quantize BF16/FP16 to FP8 Kernel
@@ -110,52 +125,107 @@ __global__ void quantize_activation_to_fp8_kernel(
 }
 
 // =============================================================================
-// Identity Scale Buffer Creator
+// Identity Scale Buffer Manager
 // =============================================================================
 //
-// Creates a pre-allocated identity scale buffer that can be reused across calls.
-// Uses stride=0 trick to broadcast a single identity scale value.
+// Manages pre-allocated identity scale buffers in the correct CUTLASS layout.
+// Buffers are cached by (M_blocks, K_blocks) to avoid re-allocation.
+//
+// Each buffer is filled with 0x7F (identity = 1.0) in the layout expected by
+// CUTLASS's block-scaled collectives.
 
-struct Sm12xIdentityScaleBuffer {
-    uint8_t* d_identity_scale = nullptr;
-    bool initialized = false;
+struct Sm12xIdentityScaleBufferKey {
+    int m_blocks;  // ceil(M / 128)
+    int k_blocks;  // ceil(K / SF_VecSize)
     
-    // Initialize identity scale buffer (call once at startup)
-    cudaError_t initialize() {
-        if (initialized) return cudaSuccess;
-        
-        cudaError_t err = cudaMalloc(&d_identity_scale, sizeof(uint8_t));
-        if (err != cudaSuccess) return err;
-        
-        err = cudaMemcpy(d_identity_scale, &kIdentityScaleRaw, sizeof(uint8_t), 
-                         cudaMemcpyHostToDevice);
-        if (err != cudaSuccess) {
-            cudaFree(d_identity_scale);
-            d_identity_scale = nullptr;
-            return err;
-        }
-        
-        initialized = true;
-        return cudaSuccess;
+    bool operator==(const Sm12xIdentityScaleBufferKey& other) const {
+        return m_blocks == other.m_blocks && k_blocks == other.k_blocks;
     }
-    
-    // Cleanup
-    void destroy() {
-        if (d_identity_scale) {
-            cudaFree(d_identity_scale);
-            d_identity_scale = nullptr;
-        }
-        initialized = false;
-    }
-    
-    // Get identity scale pointer (caller uses with stride=0)
-    uint8_t* get() const { return d_identity_scale; }
 };
 
-// Global singleton for identity scale (lazy initialized)
-inline Sm12xIdentityScaleBuffer& getIdentityScaleBuffer() {
-    static Sm12xIdentityScaleBuffer buffer;
-    return buffer;
+struct Sm12xIdentityScaleBufferKeyHash {
+    size_t operator()(const Sm12xIdentityScaleBufferKey& key) const {
+        return std::hash<int>()(key.m_blocks) ^ (std::hash<int>()(key.k_blocks) << 16);
+    }
+};
+
+class Sm12xIdentityScaleBufferManager {
+public:
+    // Get or create an identity scale buffer for given dimensions
+    // Returns pointer to device buffer filled with 0x7F
+    uint8_t* getOrCreate(int M, int K, int sf_vec_size = 32, cudaStream_t stream = 0) {
+        int m_blocks = (M + kBlkMN - 1) / kBlkMN;
+        int k_blocks = (K + sf_vec_size - 1) / sf_vec_size;
+        
+        Sm12xIdentityScaleBufferKey key{m_blocks, k_blocks};
+        
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        auto it = buffers_.find(key);
+        if (it != buffers_.end()) {
+            return it->second;
+        }
+        
+        // Allocate and fill new buffer
+        size_t buffer_size = static_cast<size_t>(m_blocks) * k_blocks * sizeof(uint8_t);
+        uint8_t* d_buffer = nullptr;
+        
+        cudaError_t err = cudaMalloc(&d_buffer, buffer_size);
+        if (err != cudaSuccess) {
+            return nullptr;
+        }
+        
+        // Fill with identity scale value (0x7F)
+        err = cudaMemsetAsync(d_buffer, kIdentityScaleRaw, buffer_size, stream);
+        if (err != cudaSuccess) {
+            cudaFree(d_buffer);
+            return nullptr;
+        }
+        
+        // Synchronize to ensure fill is complete before returning
+        cudaStreamSynchronize(stream);
+        
+        buffers_[key] = d_buffer;
+        return d_buffer;
+    }
+    
+    // Get buffer size in bytes for given dimensions
+    static size_t getBufferSize(int M, int K, int sf_vec_size = 32) {
+        int m_blocks = (M + kBlkMN - 1) / kBlkMN;
+        int k_blocks = (K + sf_vec_size - 1) / sf_vec_size;
+        return static_cast<size_t>(m_blocks) * k_blocks * sizeof(uint8_t);
+    }
+    
+    // Get scale stride for proper layout
+    static int getScaleStride(int M, int K, int sf_vec_size = 32) {
+        int k_blocks = (K + sf_vec_size - 1) / sf_vec_size;
+        return k_blocks;  // Row-major: stride = number of K blocks
+    }
+    
+    // Cleanup all buffers
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& pair : buffers_) {
+            if (pair.second) {
+                cudaFree(pair.second);
+            }
+        }
+        buffers_.clear();
+    }
+    
+    ~Sm12xIdentityScaleBufferManager() {
+        clear();
+    }
+
+private:
+    std::unordered_map<Sm12xIdentityScaleBufferKey, uint8_t*, Sm12xIdentityScaleBufferKeyHash> buffers_;
+    std::mutex mutex_;
+};
+
+// Global singleton for identity scale buffer management
+inline Sm12xIdentityScaleBufferManager& getIdentityScaleBufferManager() {
+    static Sm12xIdentityScaleBufferManager manager;
+    return manager;
 }
 
 // =============================================================================
@@ -191,6 +261,10 @@ struct Sm12xQuantizedActivation {
 
 // Quantize BF16/FP16 activations to FP8 with identity scales
 // This is the recommended path for MXFP4 (W4A16) to minimize accuracy loss
+//
+// NOTE: This function allocates a properly-sized identity scale buffer in the
+// correct CUTLASS layout. The buffer is cached and reused for same (M, K) dims.
+// There is NO stride=0 broadcast - TMA requires proper scale factor tiles.
 template <typename InputType>
 cudaError_t quantizeActivationsIdentity(
     const InputType* d_input,           // [total_tokens, K] BF16/FP16 activations
@@ -199,14 +273,16 @@ cudaError_t quantizeActivationsIdentity(
     Sm12xQuantizedActivation<InputType>& output,
     cudaStream_t stream = 0
 ) {
-    // Ensure identity scale buffer is initialized
-    Sm12xIdentityScaleBuffer& id_buffer = getIdentityScaleBuffer();
-    cudaError_t err = id_buffer.initialize();
-    if (err != cudaSuccess) return err;
+    // Get or create identity scale buffer in proper layout
+    Sm12xIdentityScaleBufferManager& mgr = getIdentityScaleBufferManager();
+    uint8_t* sfa_buffer = mgr.getOrCreate(total_tokens, K, /*sf_vec_size=*/32, stream);
+    if (sfa_buffer == nullptr) {
+        return cudaErrorMemoryAllocation;
+    }
     
     // Allocate FP8 output
     size_t fp8_size = static_cast<size_t>(total_tokens) * K * sizeof(__nv_fp8_e4m3);
-    err = cudaMalloc(&output.d_fp8_activations, fp8_size);
+    cudaError_t err = cudaMalloc(&output.d_fp8_activations, fp8_size);
     if (err != cudaSuccess) return err;
     
     // Run quantization kernel
@@ -225,10 +301,10 @@ cudaError_t quantizeActivationsIdentity(
         return err;
     }
     
-    // Use identity scale with stride=0 for broadcast
-    output.d_scale_factors = id_buffer.get();
-    output.scale_factor_stride = 0;  // Broadcast mode
-    output.owns_memory = true;  // Owns FP8 memory, but not scale buffer
+    // Use cached identity scale buffer with proper stride (NOT stride=0!)
+    output.d_scale_factors = sfa_buffer;
+    output.scale_factor_stride = mgr.getScaleStride(total_tokens, K);  // Proper stride
+    output.owns_memory = true;  // Owns FP8 memory, but not scale buffer (managed by mgr)
     
     return cudaSuccess;
 }

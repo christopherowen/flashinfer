@@ -50,13 +50,21 @@ using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput
 // Identity Scale Implementation:
 //   - Scale factor type: float_ue8m0_t (unsigned 8-bit exponent, uses FP32 bias=127)
 //   - Identity scale value: raw byte = 0x7F (127) → 2^(127-127) = 2^0 = 1.0
-//   - Broadcast trick: allocate single identity scale, use stride=0 to broadcast
+//   - Layout: MUST use proper CUTLASS LayoutSFA, NOT stride=0 broadcast
+//
+// IMPORTANT: TMA scale loads require real tiles with valid access patterns.
+// Do NOT use stride=0 to broadcast a single scale value - this may fail or
+// force slow paths on some driver versions. Instead:
+//   1. Allocate SFA buffer matching CUTLASS's LayoutSFA for (M, K)
+//   2. Fill entire buffer with 0x7F using cudaMemset
+//   3. Cache buffer per (M, K, tile_shape) to avoid re-allocation
+//   4. Pass buffer with correct strides from LayoutSFA
 //
 // Example identity scale setup:
-//   #include "sm12x_arch_config.h"
-//   constexpr uint8_t IDENTITY_SCALE_RAW = kSm12xIdentityScaleRaw;  // 0x7F = 1.0
-//   float_ue8m0_t identity = float_ue8m0_t::bitcast(IDENTITY_SCALE_RAW);
-//   // Allocate one element, pass with stride=0 for broadcast
+//   #include "sm12x_activation_quantizer.cuh"
+//   Sm12xIdentityScaleBufferManager& mgr = getIdentityScaleBufferManager();
+//   uint8_t* sfa = mgr.getOrCreate(M, K, /*sf_vec_size=*/32, stream);
+//   int sfa_stride = mgr.getScaleStride(M, K);
 //
 // WARNING: CUTLASS header says "exp_bias: 8" but convert_to_float uses FP32's
 // bias of 127. Always use 0x7F for identity, NOT 8!
