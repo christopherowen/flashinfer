@@ -751,6 +751,12 @@ def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
 #
 # This section defines valid tile shapes for SM120/SM121 (Blackwell Thorough)
 # organized by data type configuration, similar to SM90's structured approach.
+#
+# IMPORTANT: Tile selection impacts performance significantly:
+# - For gpt-oss-120b, hidden dim 2880 is divisible by 192 but NOT by 128/256
+# - 2880 % 128 = 64, 2880 % 256 = 64 (tail tiles hurt TPS)
+# - 2880 % 192 = 0 (no tail, better TPS)
+# - Small M tiles (32, 64) help decode TPS when per-expert M is small
 ################################################################################
 
 # SM120 Tile Shape Configuration
@@ -760,27 +766,31 @@ SM120_TILE_SHAPES = {
     # Supports wide range of shapes for homogeneous FP4 computation
     "nvfp4": {
         "M_TILES": [64, 128, 256],
-        "N_TILES": [64, 128, 256],
+        "N_TILES": [64, 128, 192, 256],  # 192 for dims like 2880
         "K_TILES": [128, 256],
     },
     # FP8xFP4: Mixed-input with FP8 activations, FP4 weights
-    # More restricted shapes due to mixed-precision constraints
+    # M=32 included for decode TPS with small per-expert batch sizes
+    # N=192 for model dims like 2880 (2880 % 192 = 0)
     "fp8xfp4": {
-        "M_TILES": [64, 128],
-        "N_TILES": [128],
+        "M_TILES": [32, 64, 128],  # M=32 for decode, M=128 for prefill
+        "N_TILES": [128, 192, 256],  # 192 for gpt-oss 2880 hidden dim
         "K_TILES": [128, 256],
     },
     # MXFP4 (W4A16): BF16/FP16 activations with FP4 weights
     # Uses FP8xFP4 infrastructure with activation quantization
+    # M=32 for decode TPS, N=192 for model dims like 2880
     "mxfp4": {
-        "M_TILES": [64, 128, 256],
-        "N_TILES": [128, 256],
+        "M_TILES": [32, 64, 128, 256],  # M=32 for decode TPS
+        "N_TILES": [128, 192, 256],  # 192 for gpt-oss 2880 hidden dim
         "K_TILES": [128],
     },
 }
 
 # SM120 Cluster Shapes (CGA)
-# SM120 only supports single-SM execution (no 2SM mode like SM100)
+# NOTE: Cluster 1x1x1 only in current FlashInfer/CUTLASS SM12x path.
+# This is a software/toolchain limitation in the current implementation,
+# not necessarily a hardware constraint. Future updates may enable 2SM mode.
 SM120_CLUSTER_SHAPES = [(1, 1, 1)]
 
 
@@ -788,18 +798,28 @@ def is_gemm_op_valid_sm120(op):
     """Validate SM120/SM121 GEMM operation configuration.
     
     This function filters out invalid tile/dtype/schedule combinations
-    for SM120 architecture, similar to is_gemm_op_valid_sm100().
+    for SM120/SM121 architecture, similar to is_gemm_op_valid_sm100().
+    
+    NOTE: This validation is intentionally "optimistic" - it checks basic
+    tile shape and cluster constraints but does NOT validate all CUTLASS
+    compilation requirements (alignment, schedule compatibility, epilogue
+    fusion compatibility, etc.). Invalid configs may still fail at compile
+    time or never be selected at runtime.
+    
+    For a stricter approach, add compile-time filtering that drops
+    configs that fail CUTLASS instantiation.
     
     Args:
         op: GemmLauncher operation to validate
         
     Returns:
-        bool: True if operation is valid for SM120
+        bool: True if operation passes basic SM120/SM121 constraints
     """
     tile_m, tile_n, tile_k = op.cta_shape
     cga_m, cga_n, cga_k = op.cga_shape
     
-    # SM120 only supports 1x1x1 cluster shape (no programmatic multicast)
+    # Cluster 1x1x1 only in current FlashInfer/CUTLASS SM12x path
+    # (software limitation, not necessarily hardware constraint)
     if cga_m != 1 or cga_n != 1 or cga_k != 1:
         return False
     
@@ -847,11 +867,19 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     
     SM120/SM121 supports block-scaled operations:
     - NVFP4: FP4 x FP4 (same type)
-    - FP8xFP4: FP8 activations x FP4 weights
+    - FP8xFP4: FP8 activations x FP4 weights  
     - MXFP4 (W4A16): BF16/FP16 activations x FP4 weights
     
     This function generates kernel configurations using a tile matrix approach
     similar to SM90, with separate configurations per data type.
+    
+    Performance notes:
+    - M=32 included for decode TPS (small per-expert batch sizes)
+    - N=192 included for gpt-oss-120b hidden dim 2880 (2880 % 192 = 0)
+    - Cluster 1x1x1 only (current software limitation)
+    
+    The validation is optimistic - some generated configs may fail at
+    CUTLASS compile time if they violate alignment or schedule constraints.
     """
     if not is_arch_enabled:
         return []
