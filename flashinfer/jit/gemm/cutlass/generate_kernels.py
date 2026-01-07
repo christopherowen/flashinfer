@@ -757,6 +757,12 @@ def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
 # - 2880 % 128 = 64, 2880 % 256 = 64 (tail tiles hurt TPS)
 # - 2880 % 192 = 0 (no tail, better TPS)
 # - Small M tiles (32, 64) help decode TPS when per-expert M is small
+#
+# CONSTRAINT: SM120 block-scaled uses Blk_MN=128 for scale factor granularity.
+# - M < 128 tiles are EXPERIMENTAL - may not work with all scale factor layouts
+# - If M < 128 fails, remove from this list and require grouped GEMM packing
+# - M=64 likely works (half-block), M=32 needs validation
+# - N >= 32 is required (CUTLASS static_assert)
 ################################################################################
 
 # SM120 Tile Shape Configuration
@@ -765,23 +771,23 @@ SM120_TILE_SHAPES = {
     # NVFP4 (FP4 x FP4): Same-type block-scaled GEMM
     # Supports wide range of shapes for homogeneous FP4 computation
     "nvfp4": {
-        "M_TILES": [64, 128, 256],
+        "M_TILES": [64, 128, 256],  # M=64 for smaller batches
         "N_TILES": [64, 128, 192, 256],  # 192 for dims like 2880
         "K_TILES": [128, 256],
     },
     # FP8xFP4: Mixed-input with FP8 activations, FP4 weights
-    # M=32 included for decode TPS with small per-expert batch sizes
+    # M=32 EXPERIMENTAL - may fail with block-scaled layouts (Blk_MN=128)
     # N=192 for model dims like 2880 (2880 % 192 = 0)
     "fp8xfp4": {
-        "M_TILES": [32, 64, 128],  # M=32 for decode, M=128 for prefill
+        "M_TILES": [64, 128],  # M=64 for decode, M=128 for prefill
         "N_TILES": [128, 192, 256],  # 192 for gpt-oss 2880 hidden dim
         "K_TILES": [128, 256],
     },
     # MXFP4 (W4A16): BF16/FP16 activations with FP4 weights
     # Uses FP8xFP4 infrastructure with activation quantization
-    # M=32 for decode TPS, N=192 for model dims like 2880
+    # M=64 for decode TPS, N=192 for model dims like 2880
     "mxfp4": {
-        "M_TILES": [32, 64, 128, 256],  # M=32 for decode TPS
+        "M_TILES": [64, 128, 256],  # M=64 for decode TPS
         "N_TILES": [128, 192, 256],  # 192 for gpt-oss 2880 hidden dim
         "K_TILES": [128],
     },

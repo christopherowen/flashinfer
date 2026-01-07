@@ -123,9 +123,16 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   using StrideA = cute::remove_pointer_t<cutlass::detail::TagToStrideA_t<LayoutA*>>;
   using StrideB = cute::remove_pointer_t<cutlass::detail::TagToStrideB_t<LayoutB*>>;
 
-  // Alignment requirements (128-bit aligned)
-  constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-  constexpr int AlignmentB = 128;  // For FP4 weights, use larger alignment
+  // Alignment requirements
+  // For block-scaled operations, alignment is in units of elements.
+  // CUTLASS examples use 32 elements for FP4 (32 * 4 bits = 128 bits = 16 bytes)
+  // This matches TMA's 128-bit alignment requirement.
+  //
+  // Note: Using overly strict alignment (e.g., AlignmentB=128 elements for FP4
+  // = 64 bytes) can cause "mystery perf cliffs" by rejecting valid kernels
+  // or causing misaligned access assumptions.
+  constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;  // 16 elements for FP8
+  constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementB>::value;  // 32 elements for FP4
 
   // Output element types
   using ElementC = typename TllmToCutlassTypeAdapter<GemmOutputType>::type;
