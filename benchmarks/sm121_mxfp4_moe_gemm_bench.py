@@ -82,11 +82,43 @@ def create_moe_test_data(
     }
 
 
+# =============================================================================
+# BENCHMARK STATUS: PLACEHOLDER
+# =============================================================================
+# This benchmark currently uses torch.matmul as a PLACEHOLDER for the actual
+# FlashInfer SM121 MoE GEMM path. It does NOT validate:
+#   - The CUTLASS grouped GEMM path
+#   - The activation quantizer cost
+#   - Kernel selection heuristics
+#   - End-to-end MoE performance
+#
+# To be meaningful, this benchmark must:
+# 1. Prepare inputs in FlashInfer's grouped GEMM format (grouped pointers, shapes)
+# 2. Call the actual FlashInfer fused MoE entrypoint
+# 3. Time separately:
+#    a. Quantizer alone (BF16->FP8 + SFA generation)
+#    b. GEMM alone (FP8xFP4 grouped GEMM)
+#    c. Quantizer + GEMM together (end-to-end)
+#
+# TODO: Once FlashInfer SM121 MoE API is wired up:
+# - Replace torch.matmul with flashinfer.moe.mxfp4_grouped_gemm() or similar
+# - Add quantizer timing with CUDA events
+# - Report kernel selected and tile config
+# =============================================================================
+
+_USE_REAL_FLASHINFER_PATH = False  # Set to True once API is available
+
+
 def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: int = 5, num_iters: int = 20):
-    """Benchmark prefill-like workload (large M per group)."""
+    """Benchmark prefill-like workload (large M per group).
+    
+    WARNING: Currently using torch.matmul placeholder, NOT the actual SM121 path.
+    """
     
     print("\n" + "="*60)
     print("PREFILL REGIME BENCHMARK")
+    if not _USE_REAL_FLASHINFER_PATH:
+        print("*** PLACEHOLDER MODE (torch.matmul) - not real SM121 path ***")
     print("="*60)
     print(f"  Hidden dim: {hidden_dim}")
     print(f"  Num experts: {num_experts}")
@@ -101,16 +133,23 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
         data = create_moe_test_data(num_tokens, hidden_dim, num_experts, topk)
         
         # Calculate theoretical FLOPS
-        # For MoE: each token goes to topk experts, each expert does [M/num_experts, hidden] x [hidden, intermediate]
         tokens_per_expert = num_tokens * topk / num_experts
         intermediate_dim = data["intermediate_dim"]
         flops_per_expert = 2 * tokens_per_expert * hidden_dim * intermediate_dim
         total_flops = flops_per_expert * num_experts
         
+        if _USE_REAL_FLASHINFER_PATH:
+            # TODO: Replace with actual FlashInfer MoE call
+            # quantizer_time, gemm_time, total_time = flashinfer.moe.benchmark_mxfp4_grouped_gemm(...)
+            pass
+        else:
+            # PLACEHOLDER: Simple matmul (not actual grouped GEMM)
+            def run_placeholder():
+                return torch.matmul(data["activations"], data["weights"][0].T)
+        
         # Warmup
         for _ in range(num_warmup):
-            # Simulated GEMM operation (replace with actual FlashInfer MoE call)
-            _ = torch.matmul(data["activations"], data["weights"][0].T)
+            _ = run_placeholder() if not _USE_REAL_FLASHINFER_PATH else None
             torch.cuda.synchronize()
         
         # Timed iterations
@@ -118,8 +157,7 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
         start = time.perf_counter()
         
         for _ in range(num_iters):
-            # Simulated GEMM operation (replace with actual FlashInfer MoE call)
-            _ = torch.matmul(data["activations"], data["weights"][0].T)
+            _ = run_placeholder() if not _USE_REAL_FLASHINFER_PATH else None
         
         torch.cuda.synchronize()
         end = time.perf_counter()
@@ -132,18 +170,26 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
             "avg_time_ms": avg_time_ms,
             "tflops": tflops,
             "tokens_per_expert": tokens_per_expert,
+            "is_placeholder": not _USE_REAL_FLASHINFER_PATH,
         })
         
-        print(f"\n  Tokens: {num_tokens:5d}  |  Time: {avg_time_ms:8.3f} ms  |  {tflops:.2f} TFLOPS")
+        marker = "[PLACEHOLDER]" if not _USE_REAL_FLASHINFER_PATH else ""
+        print(f"\n  Tokens: {num_tokens:5d}  |  Time: {avg_time_ms:8.3f} ms  |  {tflops:.2f} TFLOPS {marker}")
     
     return results
 
 
 def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: int = 10, num_iters: int = 50):
-    """Benchmark decode-like workload (small M per group)."""
+    """Benchmark decode-like workload (small M per group).
+    
+    WARNING: Currently using torch.matmul placeholder, NOT the actual SM121 path.
+    For decode, tile selection is CRITICAL - wrong tile = massive latency.
+    """
     
     print("\n" + "="*60)
     print("DECODE REGIME BENCHMARK")
+    if not _USE_REAL_FLASHINFER_PATH:
+        print("*** PLACEHOLDER MODE (torch.matmul) - not real SM121 path ***")
     print("="*60)
     print(f"  Hidden dim: {hidden_dim}")
     print(f"  Num experts: {num_experts}")
@@ -163,9 +209,17 @@ def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: i
         flops_per_expert = 2 * tokens_per_expert * hidden_dim * intermediate_dim
         total_flops = flops_per_expert * num_experts
         
+        if _USE_REAL_FLASHINFER_PATH:
+            # TODO: Replace with actual FlashInfer MoE call
+            pass
+        else:
+            # PLACEHOLDER
+            def run_placeholder():
+                return torch.matmul(data["activations"], data["weights"][0].T)
+        
         # Warmup
         for _ in range(num_warmup):
-            _ = torch.matmul(data["activations"], data["weights"][0].T)
+            _ = run_placeholder() if not _USE_REAL_FLASHINFER_PATH else None
             torch.cuda.synchronize()
         
         # Timed iterations
@@ -173,7 +227,7 @@ def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: i
         start = time.perf_counter()
         
         for _ in range(num_iters):
-            _ = torch.matmul(data["activations"], data["weights"][0].T)
+            _ = run_placeholder() if not _USE_REAL_FLASHINFER_PATH else None
         
         torch.cuda.synchronize()
         end = time.perf_counter()
@@ -188,9 +242,11 @@ def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: i
             "avg_time_ms": avg_time_ms,
             "tokens_per_sec": tokens_per_sec,
             "tokens_per_expert": tokens_per_expert,
+            "is_placeholder": not _USE_REAL_FLASHINFER_PATH,
         })
         
-        print(f"\n  Tokens: {num_tokens:3d}  |  Time: {avg_time_ms:8.3f} ms  |  {tokens_per_sec:.0f} tok/s")
+        marker = "[PLACEHOLDER]" if not _USE_REAL_FLASHINFER_PATH else ""
+        print(f"\n  Tokens: {num_tokens:3d}  |  Time: {avg_time_ms:8.3f} ms  |  {tokens_per_sec:.0f} tok/s {marker}")
     
     return results
 

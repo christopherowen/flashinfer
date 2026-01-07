@@ -231,56 +231,131 @@ inline Sm12xIdentityScaleBufferManager& getIdentityScaleBufferManager() {
 // =============================================================================
 // Activation Quantizer API
 // =============================================================================
+//
+// IMPORTANT LAYOUT NOTE:
+// ----------------------
+// CUTLASS SM12x block-scaled kernels expect scale factors in a specific tiled
+// layout (Sm1xxBlockScaledConfig::LayoutSFA), NOT simple row-major.
+// 
+// The layout is defined by:
+//   - SfAtom: 32x4 block with 4 scale factors per 128 rows/cols
+//   - K-major ordering with complex interleaving
+//   - Alignment requirements for TMA
+//
+// Current implementation uses a SIMPLIFIED row-major layout as a placeholder.
+// This may work for identity scales (all 0x7F) but is NOT production-ready.
+//
+// TODO: Implement proper LayoutSFA-compatible buffer allocation by:
+// 1. Using CollectiveMainloop::LayoutSFA type at kernel instantiation
+// 2. Computing layout with cute::make_layout() matching SfAtom
+// 3. Using TMA-compatible alignment (128-bit boundaries)
+//
 
-// Configuration for activation quantization
-struct Sm12xQuantizerConfig {
-    bool use_identity_scales = true;  // If true, use identity A-scales (1.0)
-    int block_size = kBlkMN;          // Scale factor block size (128)
-};
-
-// Result structure containing quantized activations and scale factors
-template <typename InputType>
-struct Sm12xQuantizedActivation {
-    __nv_fp8_e4m3* d_fp8_activations = nullptr;  // Quantized activations [total_tokens, K]
-    uint8_t* d_scale_factors = nullptr;           // Scale factors (float_ue8m0_t raw)
-    int scale_factor_stride = 0;                  // Stride (0 for identity broadcast)
-    bool owns_memory = false;                     // Whether this struct owns the memory
+// Workspace sizes for pre-allocation
+struct Sm12xQuantizerWorkspaceSizes {
+    size_t fp8_activation_bytes;   // Size for FP8 activations
+    size_t sfa_bytes;              // Size for A-scale factors
+    size_t total_bytes;            // Total workspace size
+    int sfa_stride;                // Stride for scale factors
     
-    void free() {
-        if (owns_memory) {
-            if (d_fp8_activations) cudaFree(d_fp8_activations);
-            // Don't free scale factors if using identity (shared buffer)
-            if (d_scale_factors && scale_factor_stride != 0) {
-                cudaFree(d_scale_factors);
-            }
-        }
-        d_fp8_activations = nullptr;
-        d_scale_factors = nullptr;
+    // Compute sizes for given dimensions
+    static Sm12xQuantizerWorkspaceSizes compute(int total_tokens, int K, int sf_vec_size = 32) {
+        Sm12xQuantizerWorkspaceSizes sizes;
+        sizes.fp8_activation_bytes = static_cast<size_t>(total_tokens) * K * sizeof(__nv_fp8_e4m3);
+        
+        // Scale factor dimensions (simplified row-major, see TODO above)
+        int m_blocks = (total_tokens + kBlkMN - 1) / kBlkMN;
+        int k_blocks = (K + sf_vec_size - 1) / sf_vec_size;
+        sizes.sfa_bytes = static_cast<size_t>(m_blocks) * k_blocks * sizeof(uint8_t);
+        sizes.sfa_stride = k_blocks;
+        
+        // Align to 256 bytes for good memory access patterns
+        sizes.fp8_activation_bytes = (sizes.fp8_activation_bytes + 255) & ~255;
+        sizes.sfa_bytes = (sizes.sfa_bytes + 255) & ~255;
+        sizes.total_bytes = sizes.fp8_activation_bytes + sizes.sfa_bytes;
+        
+        return sizes;
     }
 };
 
-// Quantize BF16/FP16 activations to FP8 with identity scales
-// This is the recommended path for MXFP4 (W4A16) to minimize accuracy loss
+// Result structure containing quantized activations and scale factors
+// Does NOT own memory - caller provides workspace
+struct Sm12xQuantizedActivationView {
+    __nv_fp8_e4m3* d_fp8_activations = nullptr;  // Points into workspace
+    uint8_t* d_scale_factors = nullptr;           // Points into workspace
+    int scale_factor_stride = 0;                  // Row-major stride (k_blocks)
+};
+
+// WORKSPACE-BASED quantizer (no cudaMalloc in hot path!)
+// Caller pre-allocates workspace once and reuses across calls.
 //
-// NOTE: This function allocates a properly-sized identity scale buffer in the
-// correct CUTLASS layout. The buffer is cached and reused for same (M, K) dims.
-// There is NO stride=0 broadcast - TMA requires proper scale factor tiles.
+// Usage:
+//   1. Call Sm12xQuantizerWorkspaceSizes::compute() to get required size
+//   2. Pre-allocate workspace (once at engine init)
+//   3. Call quantizeActivationsWithWorkspace() per inference step
 template <typename InputType>
-cudaError_t quantizeActivationsIdentity(
+cudaError_t quantizeActivationsWithWorkspace(
     const InputType* d_input,           // [total_tokens, K] BF16/FP16 activations
     int total_tokens,
     int K,
-    Sm12xQuantizedActivation<InputType>& output,
+    void* d_workspace,                  // Pre-allocated workspace
+    size_t workspace_bytes,             // Size of workspace
+    bool use_identity_scales,           // If true, fill SFA with 0x7F
+    Sm12xQuantizedActivationView& output,
     cudaStream_t stream = 0
 ) {
-    // Get or create identity scale buffer in proper layout
+    // Compute required sizes
+    auto sizes = Sm12xQuantizerWorkspaceSizes::compute(total_tokens, K);
+    
+    if (workspace_bytes < sizes.total_bytes) {
+        return cudaErrorInvalidValue;  // Workspace too small
+    }
+    
+    // Partition workspace
+    uint8_t* ws = static_cast<uint8_t*>(d_workspace);
+    output.d_fp8_activations = reinterpret_cast<__nv_fp8_e4m3*>(ws);
+    output.d_scale_factors = ws + sizes.fp8_activation_bytes;
+    output.scale_factor_stride = sizes.sfa_stride;
+    
+    // Fill scale factors (identity = 0x7F)
+    if (use_identity_scales) {
+        cudaError_t err = cudaMemsetAsync(output.d_scale_factors, kIdentityScaleRaw, 
+                                          sizes.sfa_bytes, stream);
+        if (err != cudaSuccess) return err;
+    }
+    // TODO: else compute per-block scales (full-scale mode)
+    
+    // Run quantization kernel
+    int total_elements = total_tokens * K;
+    int block_size = 256;
+    int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    quantize_activation_to_fp8_kernel<InputType><<<num_blocks, block_size, 0, stream>>>(
+        d_input, output.d_fp8_activations, total_tokens, K
+    );
+    
+    return cudaGetLastError();
+}
+
+// Legacy API with per-call allocation (for testing only, NOT for production)
+// Use quantizeActivationsWithWorkspace() in production!
+template <typename InputType>
+[[deprecated("Use quantizeActivationsWithWorkspace() for production")]]
+cudaError_t quantizeActivationsIdentity(
+    const InputType* d_input,
+    int total_tokens,
+    int K,
+    Sm12xQuantizedActivationView& output,
+    cudaStream_t stream = 0
+) {
+    // Get or create identity scale buffer (cached)
     Sm12xIdentityScaleBufferManager& mgr = getIdentityScaleBufferManager();
     uint8_t* sfa_buffer = mgr.getOrCreate(total_tokens, K, /*sf_vec_size=*/32, stream);
     if (sfa_buffer == nullptr) {
         return cudaErrorMemoryAllocation;
     }
     
-    // Allocate FP8 output
+    // Allocate FP8 output (WARNING: malloc in hot path!)
     size_t fp8_size = static_cast<size_t>(total_tokens) * K * sizeof(__nv_fp8_e4m3);
     cudaError_t err = cudaMalloc(&output.d_fp8_activations, fp8_size);
     if (err != cudaSuccess) return err;
@@ -301,10 +376,8 @@ cudaError_t quantizeActivationsIdentity(
         return err;
     }
     
-    // Use cached identity scale buffer with proper stride (NOT stride=0!)
     output.d_scale_factors = sfa_buffer;
-    output.scale_factor_stride = mgr.getScaleStride(total_tokens, K);  // Proper stride
-    output.owns_memory = true;  // Owns FP8 memory, but not scale buffer (managed by mgr)
+    output.scale_factor_stride = mgr.getScaleStride(total_tokens, K);
     
     return cudaSuccess;
 }
