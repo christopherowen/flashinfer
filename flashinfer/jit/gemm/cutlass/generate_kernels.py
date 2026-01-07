@@ -767,29 +767,39 @@ def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
 
 # SM120 Tile Shape Configuration
 # Format: (M, N, K) - CTA tile dimensions
+#
+# These shapes are modeled after SM90 but adapted for SM120 constraints:
+# - SM90 supports N=16,32,64,128,256 and cluster shapes up to 2x2x1
+# - SM120 block-scaled has Blk_MN=128 granularity for scale factors
+# - SM120 currently limited to 1x1x1 cluster (software limitation)
+#
+# CUTLASS examples show SM120 can support:
+# - Shape<128,256,256> for 1SM block-scaled
+# - Shape<256,256,256> for 2SM block-scaled
 SM120_TILE_SHAPES = {
     # NVFP4 (FP4 x FP4): Same-type block-scaled GEMM
     # Supports wide range of shapes for homogeneous FP4 computation
+    # Match SM90 N-tile variety: 16,32,64,128,256 + 192 for 2880
     "nvfp4": {
         "M_TILES": [64, 128, 256],  # M=64 for smaller batches
-        "N_TILES": [64, 128, 192, 256],  # 192 for dims like 2880
+        "N_TILES": [32, 64, 128, 192, 256],  # 32,64 for narrow, 192 for 2880
         "K_TILES": [128, 256],
     },
     # FP8xFP4: Mixed-input with FP8 activations, FP4 weights
-    # M=32 EXPERIMENTAL - may fail with block-scaled layouts (Blk_MN=128)
+    # Add smaller N tiles for narrow projections (router/gating)
     # N=192 for model dims like 2880 (2880 % 192 = 0)
     "fp8xfp4": {
         "M_TILES": [64, 128],  # M=64 for decode, M=128 for prefill
-        "N_TILES": [128, 192, 256],  # 192 for gpt-oss 2880 hidden dim
+        "N_TILES": [32, 64, 128, 192, 256],  # 32,64 for narrow N problems
         "K_TILES": [128, 256],
     },
     # MXFP4 (W4A16): BF16/FP16 activations with FP4 weights
     # Uses FP8xFP4 infrastructure with activation quantization
-    # M=64 for decode TPS, N=192 for model dims like 2880
+    # Add smaller N tiles like SM90 has for mixed-type
     "mxfp4": {
         "M_TILES": [64, 128, 256],  # M=64 for decode TPS
-        "N_TILES": [128, 192, 256],  # 192 for gpt-oss 2880 hidden dim
-        "K_TILES": [128],
+        "N_TILES": [32, 64, 128, 192, 256],  # 32,64 for narrow, 192 for 2880
+        "K_TILES": [128, 256],  # Add K=256 like FP8xFP4
     },
 }
 
