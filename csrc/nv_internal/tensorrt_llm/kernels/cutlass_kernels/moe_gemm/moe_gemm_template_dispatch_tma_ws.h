@@ -472,7 +472,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
   } else if (gemm_config.sm_version == 120 || gemm_config.sm_version == 121) {
     TLLM_LOG_TRACE("At %s, SM120 config=%d", __PRETTY_FUNCTION__,
                    (int)gemm_config.tile_config_sm120);
-    if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType,
+    if constexpr (kernels::cutlass_kernels::isValidSM12xMOESpecialisation<T, WeightType,
                                                                           EpilogueTag, FUSION>()) {
       switch (gemm_config.tile_config_sm120) {
         SHAPE_CASE(120, 128, 128, 64)

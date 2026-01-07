@@ -605,9 +605,9 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
     return {};
   }
   if ((sm == 120 || sm == 121) &&
-      !tensorrt_llm::kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>()) {
+      !tensorrt_llm::kernels::cutlass_kernels::isValidSM12xMOESpecialisation<T, WeightType>()) {
     TLLM_LOG_TRACE(
-        "Blackwell SM120 is not supported for this configuration, not selecting any TMA WS "
+        "Blackwell SM12x is not supported for this configuration, not selecting any TMA WS "
         "implementations");
     return {};
   }
@@ -684,7 +684,7 @@ bool MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::supportsTmaWarpSpe
           tensorrt_llm::kernels::cutlass_kernels::isValidBlackwellMOESpecialisation<
               T, WeightType>()) ||
          ((sm == 120 || sm == 121) &&
-          tensorrt_llm::kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType>());
+          tensorrt_llm::kernels::cutlass_kernels::isValidSM12xMOESpecialisation<T, WeightType>());
 }
 
 template <typename T, typename WeightType, typename OutputType, typename ScaleBiasType>

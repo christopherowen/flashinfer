@@ -36,6 +36,7 @@
 #endif
 
 #include "moe_gemm_sm120_mixed_input_launcher.h"
+#include "../sm12x_arch_config.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -56,13 +57,7 @@ namespace tk = tensorrt_llm::common;
 
 using namespace cute;
 
-// SM120/SM121 support detection
-// Both SM120 and SM121 use cutlass::arch::Sm120, but have separate macros
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) || defined(CUTLASS_ARCH_MMA_SM121_SUPPORTED)
-#define CUTLASS_ARCH_MMA_SM12x_SUPPORTED_LAUNCHER 1
-#endif
-
-// SM120/SM121 Mixed-Input MOE GEMM Kernel Launcher Implementation
+// SM12x Mixed-Input MOE GEMM Kernel Launcher Implementation
 //
 // This launcher implements mixed-precision grouped GEMM for SM120/SM121 (Blackwell Thorough)
 // architecture. It leverages CUTLASS's block-scaled collective builder which provides
@@ -85,7 +80,7 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
     TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size) {
   TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
-#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED_LAUNCHER) && defined(ENABLE_FP4)
+#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4)
   /////////////////////////////////////////////////////////////////////////////
   // Type definitions
   /////////////////////////////////////////////////////////////////////////////
@@ -324,7 +319,7 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
 
 #else
   TLLM_THROW("SM120/SM121 mixed-input GEMM requires CUTLASS_ARCH_MMA_SM12x_SUPPORTED (SM120 or SM121) and ENABLE_FP4");
-#endif  // CUTLASS_ARCH_MMA_SM12x_SUPPORTED_LAUNCHER && ENABLE_FP4
+#endif  // CUTLASS_ARCH_MMA_SM12x_SUPPORTED && ENABLE_FP4
 }
 
 }  // namespace cutlass_kernels_oss
