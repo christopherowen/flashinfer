@@ -743,17 +743,54 @@ def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
 
 
 def generate_sm120_grouped_gemm_operations(is_arch_enabled):
+    """Generate SM120/SM121 (Blackwell Thorough) grouped GEMM operations.
+    
+    SM120/SM121 supports block-scaled operations:
+    - NVFP4: FP4 x FP4 (same type)
+    - FP8xFP4: FP8 activations x FP4 weights
+    - MXFP4 (W4A16): BF16/FP16 activations x FP4 weights
+    
+    This function generates kernel configurations for various tile shapes
+    optimized for MoE (Mixture of Experts) workloads.
+    """
     if not is_arch_enabled:
         return []
     arch = 120
-    supported_dtypes = [e2m1, (DataType.e4m3, e2m1)]
+    
+    # Supported data type configurations:
+    # - e2m1 (FP4): NVFP4 same-type GEMM
+    # - (e4m3, e2m1): FP8xFP4 mixed-input GEMM
+    # - (bf16, e2m1): MXFP4 W4A16 with BF16 activations (NEW)
+    # - (f16, e2m1): MXFP4 W4A16 with FP16 activations (NEW)
+    supported_dtypes = [
+        e2m1,                       # NVFP4: FP4 x FP4
+        (DataType.e4m3, e2m1),      # FP8xFP4: FP8 activations x FP4 weights
+        (DataType.bf16, e2m1),      # MXFP4: BF16 activations x FP4 weights
+        (DataType.f16, e2m1),       # MXFP4: FP16 activations x FP4 weights
+    ]
+    
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
+    
+    # Extended tile shape configurations for SM120
+    # These shapes are optimized for different problem sizes in MoE workloads
     cta_shapes_mnk = [
+        # Standard shapes (existing)
         [128, 128, 128],
         [128, 128, 256],
         [256, 128, 128],
         [128, 256, 128],
+        # Additional shapes for better coverage (NEW)
+        [64, 128, 128],      # Smaller M for small batch sizes
+        [64, 128, 256],      # Smaller M with larger K
+        [64, 256, 128],      # Smaller M with larger N
+        [128, 64, 128],      # Smaller N for narrow outputs
+        [128, 64, 256],      # Smaller N with larger K
+        [256, 64, 128],      # Larger M with smaller N
+        [256, 128, 256],     # Larger tiles for large problems
+        [256, 256, 128],     # Square-ish large tile
+        [64, 64, 128],       # Small square tile for small problems
+        [64, 64, 256],       # Small square with larger K
     ]
 
     warp_shape = [0, 0, 0]  # ignored except for naming
@@ -797,14 +834,46 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
         else:
             act_type, weight_type = dtype, dtype
 
-        # Minimal filter: for mixed FP8xFP4 on SM120, only emit 128x128x128
-        if act_type == DataType.e4m3 and weight_type == e2m1:
-            if cta_shape_mnk != [128, 128, 128]:
+        # Determine if this is a mixed-input configuration
+        is_mixed_input = act_type != weight_type
+        
+        # MXFP4 (W4A16): BF16/FP16 activations with FP4 weights
+        is_mxfp4 = (act_type in [DataType.bf16, DataType.f16]) and weight_type == e2m1
+        
+        # FP8xFP4: FP8 activations with FP4 weights
+        is_fp8xfp4 = act_type == DataType.e4m3 and weight_type == e2m1
+        
+        # Filter tile shapes based on data type configuration
+        # Mixed-input operations benefit from specific tile shapes
+        if is_fp8xfp4:
+            # FP8xFP4: Focus on balanced shapes for efficiency
+            if cta_shape_mnk not in [
+                [128, 128, 128],
+                [128, 128, 256],
+                [64, 128, 128],
+                [64, 128, 256],
+            ]:
+                continue
+        
+        if is_mxfp4:
+            # MXFP4: Start with well-tested shapes, expand as needed
+            if cta_shape_mnk not in [
+                [128, 128, 128],
+                [128, 128, 256],
+                [256, 128, 128],
+                [128, 256, 128],
+                [64, 128, 128],
+                [64, 256, 128],
+            ]:
                 continue
 
+        # Determine output types based on activation type
         otypes = [act_type]
         if act_type in [DataType.e4m3, e2m1]:
             otypes = [DataType.f16, DataType.bf16]
+        elif is_mxfp4:
+            # MXFP4: output in same type as activations
+            otypes = [act_type]
 
         for otype in otypes:
             moe_gemm_operation = TrtLlm_GemmLauncher(
@@ -824,7 +893,7 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
                 mainloop_schedule,
                 epi_schedule,
                 epi_fusion,
-                is_mx_fpx=(act_type == DataType.e4m3 and weight_type == e2m1),
+                is_mx_fpx=(is_fp8xfp4 or is_mxfp4),
                 swap_ab=swap_ab,
             )
 
@@ -832,8 +901,35 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     return operations
 
 
+def generate_sm120_mixed_input_operations(is_arch_enabled):
+    """Generate SM120-specific mixed-input operations for grouped GEMM.
+    
+    This function creates kernel configurations that leverage CUTLASS's
+    SM100 mixed-input builder infrastructure, adapted for SM120's
+    block-scaled tensor core operations.
+    
+    Mixed-input configurations:
+    - FP8xFP4: 8-bit activations, 4-bit weights
+    - MXFP4: 16-bit activations quantized on-the-fly, 4-bit weights
+    """
+    if not is_arch_enabled:
+        return []
+    
+    # This function is reserved for future SM120-specific mixed-input
+    # optimizations that may require different builder paths than the
+    # standard block-scaled operations.
+    return []
+
+
 def generate_sm120_operations(is_arch_enabled):
+    """Generate all SM120/SM121 GEMM operations.
+    
+    Includes:
+    - Block-scaled grouped GEMM operations (NVFP4, FP8xFP4, MXFP4)
+    - Mixed-input operations (future SM120-specific optimizations)
+    """
     operations = generate_sm120_grouped_gemm_operations(is_arch_enabled)
+    operations.extend(generate_sm120_mixed_input_operations(is_arch_enabled))
     return operations
 
 

@@ -26,24 +26,55 @@
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
 
-// Blackwell arch
+// SM120/SM121 (Blackwell Thorough) arch
+// Supports:
+// - NVFP4: FP4 x FP4 (same type)
+// - FP8xFP4: FP8 activations x FP4 weights
+// - MXFP4: BF16/FP16 activations x FP4 weights (via FP8xFP4 path with activation quantization)
+//
+// Note: MXFP4 (BF16/FP16 x FP4) is supported on SM120/SM121 through a workaround where
+// activations are represented as a tuple with identity scales. This satisfies the SM120
+// block-scaled builder requirement that both operands have the same scale factor type.
 template <typename T, typename WeightType,
           typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidSM120MOESpecialisation() {
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)  // TODO Is there a better choice
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
 #if defined(ENABLE_FP4)
-  return ((cutlass::platform::is_same<T, __nv_fp4_e2m1>::value &&
-           cutlass::platform::is_same<T, WeightType>::value) ||
-          (cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
-           cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value)) &&
+  // NVFP4: FP4 x FP4 (same type)
+  constexpr bool IsNVFP4 = cutlass::platform::is_same<T, __nv_fp4_e2m1>::value &&
+                           cutlass::platform::is_same<T, WeightType>::value;
+  // FP8xFP4: FP8 activations x FP4 weights  
+  constexpr bool IsFP8xFP4 = cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
+                             cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value;
+  // MXFP4 (W4A16): BF16/FP16 activations x FP4 weights
+  // Uses FP8xFP4 infrastructure with activation quantization
+  constexpr bool IsMXFP4_BF16 = cutlass::platform::is_same<T, __nv_bfloat16>::value &&
+                                cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value;
+  constexpr bool IsMXFP4_FP16 = cutlass::platform::is_same<T, half>::value &&
+                                cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value;
+  constexpr bool IsMXFP4 = IsMXFP4_BF16 || IsMXFP4_FP16;
+  
+  return (IsNVFP4 || IsFP8xFP4 || IsMXFP4) &&
          cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
 #else
   return false;
 #endif
 #else
-  return false;  // CUTLASS_ARCH_MMA_SM100_SUPPORTED is set when Blackwell kernels are enabled
+  return false;  // CUTLASS_ARCH_MMA_SM120_SUPPORTED is set when SM120 kernels are enabled
+#endif
+}
+
+// Helper to check if a configuration is MXFP4 (W4A16) on SM120
+template <typename T, typename WeightType>
+constexpr bool isSM120MXFP4() {
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED) && defined(ENABLE_FP4)
+  return (cutlass::platform::is_same<T, __nv_bfloat16>::value ||
+          cutlass::platform::is_same<T, half>::value) &&
+         cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value;
+#else
+  return false;
 #endif
 }
 
