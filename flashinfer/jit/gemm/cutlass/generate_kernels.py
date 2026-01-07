@@ -469,6 +469,10 @@ def is_grouped_gemm_op_valid(op):
 
 
 def is_op_valid(op):
+    # SM120/SM121 has its own validation function
+    if op.arch >= 120:
+        return is_gemm_op_valid_sm120(op)
+    
     if op.arch >= 100:
         return is_gemm_op_valid_sm100(op)
 
@@ -742,6 +746,102 @@ def calc_shape_mnk_sm100_grouped_gemm(cta_shape_mn, dtype):
     return cta_shape_mn + (cta_shape_k,)
 
 
+################################################################################
+# SM120/SM121 Tile Configuration Matrix
+#
+# This section defines valid tile shapes for SM120/SM121 (Blackwell Thorough)
+# organized by data type configuration, similar to SM90's structured approach.
+################################################################################
+
+# SM120 Tile Shape Configuration
+# Format: (M, N, K) - CTA tile dimensions
+SM120_TILE_SHAPES = {
+    # NVFP4 (FP4 x FP4): Same-type block-scaled GEMM
+    # Supports wide range of shapes for homogeneous FP4 computation
+    "nvfp4": {
+        "M_TILES": [64, 128, 256],
+        "N_TILES": [64, 128, 256],
+        "K_TILES": [128, 256],
+    },
+    # FP8xFP4: Mixed-input with FP8 activations, FP4 weights
+    # More restricted shapes due to mixed-precision constraints
+    "fp8xfp4": {
+        "M_TILES": [64, 128],
+        "N_TILES": [128],
+        "K_TILES": [128, 256],
+    },
+    # MXFP4 (W4A16): BF16/FP16 activations with FP4 weights
+    # Uses FP8xFP4 infrastructure with activation quantization
+    "mxfp4": {
+        "M_TILES": [64, 128, 256],
+        "N_TILES": [128, 256],
+        "K_TILES": [128],
+    },
+}
+
+# SM120 Cluster Shapes (CGA)
+# SM120 only supports single-SM execution (no 2SM mode like SM100)
+SM120_CLUSTER_SHAPES = [(1, 1, 1)]
+
+
+def is_gemm_op_valid_sm120(op):
+    """Validate SM120/SM121 GEMM operation configuration.
+    
+    This function filters out invalid tile/dtype/schedule combinations
+    for SM120 architecture, similar to is_gemm_op_valid_sm100().
+    
+    Args:
+        op: GemmLauncher operation to validate
+        
+    Returns:
+        bool: True if operation is valid for SM120
+    """
+    tile_m, tile_n, tile_k = op.cta_shape
+    cga_m, cga_n, cga_k = op.cga_shape
+    
+    # SM120 only supports 1x1x1 cluster shape (no programmatic multicast)
+    if cga_m != 1 or cga_n != 1 or cga_k != 1:
+        return False
+    
+    # Determine operation type
+    is_nvfp4 = op.act_type == e2m1 and op.weight_type == e2m1
+    is_fp8xfp4 = op.act_type == DataType.e4m3 and op.weight_type == e2m1
+    is_mxfp4 = op.act_type in [DataType.bf16, DataType.f16] and op.weight_type == e2m1
+    
+    # NVFP4: FP4 x FP4
+    if is_nvfp4:
+        if tile_m not in SM120_TILE_SHAPES["nvfp4"]["M_TILES"]:
+            return False
+        if tile_n not in SM120_TILE_SHAPES["nvfp4"]["N_TILES"]:
+            return False
+        if tile_k not in SM120_TILE_SHAPES["nvfp4"]["K_TILES"]:
+            return False
+        return True
+    
+    # FP8xFP4: FP8 activations x FP4 weights
+    if is_fp8xfp4:
+        if tile_m not in SM120_TILE_SHAPES["fp8xfp4"]["M_TILES"]:
+            return False
+        if tile_n not in SM120_TILE_SHAPES["fp8xfp4"]["N_TILES"]:
+            return False
+        if tile_k not in SM120_TILE_SHAPES["fp8xfp4"]["K_TILES"]:
+            return False
+        return True
+    
+    # MXFP4: BF16/FP16 activations x FP4 weights
+    if is_mxfp4:
+        if tile_m not in SM120_TILE_SHAPES["mxfp4"]["M_TILES"]:
+            return False
+        if tile_n not in SM120_TILE_SHAPES["mxfp4"]["N_TILES"]:
+            return False
+        if tile_k not in SM120_TILE_SHAPES["mxfp4"]["K_TILES"]:
+            return False
+        return True
+    
+    # Unknown configuration
+    return False
+
+
 def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     """Generate SM120/SM121 (Blackwell Thorough) grouped GEMM operations.
     
@@ -750,154 +850,135 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     - FP8xFP4: FP8 activations x FP4 weights
     - MXFP4 (W4A16): BF16/FP16 activations x FP4 weights
     
-    This function generates kernel configurations for various tile shapes
-    optimized for MoE (Mixture of Experts) workloads.
+    This function generates kernel configurations using a tile matrix approach
+    similar to SM90, with separate configurations per data type.
     """
     if not is_arch_enabled:
         return []
+    
     arch = 120
-    
-    # Supported data type configurations:
-    # - e2m1 (FP4): NVFP4 same-type GEMM
-    # - (e4m3, e2m1): FP8xFP4 mixed-input GEMM
-    # - (bf16, e2m1): MXFP4 W4A16 with BF16 activations (NEW)
-    # - (f16, e2m1): MXFP4 W4A16 with FP16 activations (NEW)
-    supported_dtypes = [
-        e2m1,                       # NVFP4: FP4 x FP4
-        (DataType.e4m3, e2m1),      # FP8xFP4: FP8 activations x FP4 weights
-        (DataType.bf16, e2m1),      # MXFP4: BF16 activations x FP4 weights
-        (DataType.f16, e2m1),       # MXFP4: FP16 activations x FP4 weights
-    ]
-    
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
-    
-    # Extended tile shape configurations for SM120
-    # These shapes are optimized for different problem sizes in MoE workloads
-    cta_shapes_mnk = [
-        # Standard shapes (existing)
-        [128, 128, 128],
-        [128, 128, 256],
-        [256, 128, 128],
-        [128, 256, 128],
-        # Additional shapes for better coverage (NEW)
-        [64, 128, 128],      # Smaller M for small batch sizes
-        [64, 128, 256],      # Smaller M with larger K
-        [64, 256, 128],      # Smaller M with larger N
-        [128, 64, 128],      # Smaller N for narrow outputs
-        [128, 64, 256],      # Smaller N with larger K
-        [256, 64, 128],      # Larger M with smaller N
-        [256, 128, 256],     # Larger tiles for large problems
-        [256, 256, 128],     # Square-ish large tile
-        [64, 64, 128],       # Small square tile for small problems
-        [64, 64, 256],       # Small square with larger K
-    ]
-
     warp_shape = [0, 0, 0]  # ignored except for naming
     stages = 0  # auto
-
     epi_fusions = [
         TrtLlm_EpilogueFusion.epilogue_fusion_none,
         TrtLlm_EpilogueFusion.epilogue_fusion_finalize,
     ]
-
-    cga_shapes = [[1, 1, 1]]
-
-    swap_ab = [True, False]
-
-    partial_args = product(
-        supported_dtypes,
-        quant_ops,
-        epi_tags,
-        epi_fusions,
-        cta_shapes_mnk,
-        cga_shapes,
-        swap_ab,
-    )
-
+    swap_ab_options = [True, False]
+    
     operations = list()
-    for (
-        dtype,
-        quant_op,
-        epi_tag,
-        epi_fusion,
-        cta_shape_mnk,
-        cga_shape,
-        swap_ab,
-    ) in partial_args:
-        # Ignored
-        mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
-        epi_schedule = None
-
-        if isinstance(dtype, tuple):
-            act_type, weight_type = dtype
-        else:
-            act_type, weight_type = dtype, dtype
-
-        # Determine if this is a mixed-input configuration
-        is_mixed_input = act_type != weight_type
-        
-        # MXFP4 (W4A16): BF16/FP16 activations with FP4 weights
-        is_mxfp4 = (act_type in [DataType.bf16, DataType.f16]) and weight_type == e2m1
-        
-        # FP8xFP4: FP8 activations with FP4 weights
-        is_fp8xfp4 = act_type == DataType.e4m3 and weight_type == e2m1
-        
-        # Filter tile shapes based on data type configuration
-        # Mixed-input operations benefit from specific tile shapes
-        if is_fp8xfp4:
-            # FP8xFP4: Focus on balanced shapes for efficiency
-            if cta_shape_mnk not in [
-                [128, 128, 128],
-                [128, 128, 256],
-                [64, 128, 128],
-                [64, 128, 256],
-            ]:
-                continue
-        
-        if is_mxfp4:
-            # MXFP4: Start with well-tested shapes, expand as needed
-            if cta_shape_mnk not in [
-                [128, 128, 128],
-                [128, 128, 256],
-                [256, 128, 128],
-                [128, 256, 128],
-                [64, 128, 128],
-                [64, 256, 128],
-            ]:
-                continue
-
-        # Determine output types based on activation type
-        otypes = [act_type]
-        if act_type in [DataType.e4m3, e2m1]:
-            otypes = [DataType.f16, DataType.bf16]
-        elif is_mxfp4:
-            # MXFP4: output in same type as activations
-            otypes = [act_type]
-
-        for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(
+    
+    # =========================================================================
+    # NVFP4: FP4 x FP4 (same type)
+    # =========================================================================
+    nvfp4_shapes = list(product(
+        SM120_TILE_SHAPES["nvfp4"]["M_TILES"],
+        SM120_TILE_SHAPES["nvfp4"]["N_TILES"],
+        SM120_TILE_SHAPES["nvfp4"]["K_TILES"],
+    ))
+    
+    for cta_shape_mnk, epi_fusion, swap_ab in product(
+        nvfp4_shapes, epi_fusions, swap_ab_options
+    ):
+        for otype in [DataType.f16, DataType.bf16]:
+            op = TrtLlm_GemmLauncher(
                 GemmKind.Grouped,
                 arch,
-                act_type,
-                weight_type,
-                act_type,
-                act_type,
-                otype,
-                quant_op,
-                epi_tag,
-                cta_shape_mnk,
+                e2m1,  # act_type
+                e2m1,  # weight_type
+                e2m1,  # acc_type (unused)
+                e2m1,  # bias_type (unused)
+                otype,  # output_type
+                TrtLlm_QuantOp.none,
+                TrtLlm_EpilogueTag.epilogue_op_default,
+                list(cta_shape_mnk),
                 warp_shape,
                 stages,
-                cga_shape,
-                mainloop_schedule,
-                epi_schedule,
+                list(SM120_CLUSTER_SHAPES[0]),
+                KernelScheduleType.TmaWarpSpecializedCooperative,
+                None,  # epi_schedule
                 epi_fusion,
-                is_mx_fpx=(is_fp8xfp4 or is_mxfp4),
+                is_mx_fpx=False,
                 swap_ab=swap_ab,
             )
-
-            operations.append(moe_gemm_operation)
+            if is_gemm_op_valid_sm120(op):
+                operations.append(op)
+    
+    # =========================================================================
+    # FP8xFP4: FP8 activations x FP4 weights
+    # =========================================================================
+    fp8xfp4_shapes = list(product(
+        SM120_TILE_SHAPES["fp8xfp4"]["M_TILES"],
+        SM120_TILE_SHAPES["fp8xfp4"]["N_TILES"],
+        SM120_TILE_SHAPES["fp8xfp4"]["K_TILES"],
+    ))
+    
+    for cta_shape_mnk, epi_fusion, swap_ab in product(
+        fp8xfp4_shapes, epi_fusions, swap_ab_options
+    ):
+        for otype in [DataType.f16, DataType.bf16]:
+            op = TrtLlm_GemmLauncher(
+                GemmKind.Grouped,
+                arch,
+                DataType.e4m3,  # act_type
+                e2m1,           # weight_type
+                DataType.e4m3,  # acc_type (unused)
+                DataType.e4m3,  # bias_type (unused)
+                otype,          # output_type
+                TrtLlm_QuantOp.none,
+                TrtLlm_EpilogueTag.epilogue_op_default,
+                list(cta_shape_mnk),
+                warp_shape,
+                stages,
+                list(SM120_CLUSTER_SHAPES[0]),
+                KernelScheduleType.TmaWarpSpecializedCooperative,
+                None,  # epi_schedule
+                epi_fusion,
+                is_mx_fpx=True,
+                swap_ab=swap_ab,
+            )
+            if is_gemm_op_valid_sm120(op):
+                operations.append(op)
+    
+    # =========================================================================
+    # MXFP4 (W4A16): BF16/FP16 activations x FP4 weights
+    # =========================================================================
+    mxfp4_shapes = list(product(
+        SM120_TILE_SHAPES["mxfp4"]["M_TILES"],
+        SM120_TILE_SHAPES["mxfp4"]["N_TILES"],
+        SM120_TILE_SHAPES["mxfp4"]["K_TILES"],
+    ))
+    
+    for act_type in [DataType.bf16, DataType.f16]:
+        for cta_shape_mnk, epi_fusion, swap_ab in product(
+            mxfp4_shapes, epi_fusions, swap_ab_options
+        ):
+            # MXFP4: output same type as activations
+            otype = act_type
+            op = TrtLlm_GemmLauncher(
+                GemmKind.Grouped,
+                arch,
+                act_type,   # act_type (bf16 or f16)
+                e2m1,       # weight_type (FP4)
+                act_type,   # acc_type (unused)
+                act_type,   # bias_type (unused)
+                otype,      # output_type
+                TrtLlm_QuantOp.none,
+                TrtLlm_EpilogueTag.epilogue_op_default,
+                list(cta_shape_mnk),
+                warp_shape,
+                stages,
+                list(SM120_CLUSTER_SHAPES[0]),
+                KernelScheduleType.TmaWarpSpecializedCooperative,
+                None,  # epi_schedule
+                epi_fusion,
+                is_mx_fpx=True,
+                swap_ab=swap_ab,
+            )
+            if is_gemm_op_valid_sm120(op):
+                operations.append(op)
+    
     return operations
 
 
@@ -915,9 +996,9 @@ def generate_sm120_mixed_input_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
     
-    # This function is reserved for future SM120-specific mixed-input
-    # optimizations that may require different builder paths than the
-    # standard block-scaled operations.
+    # Mixed-input operations are now generated in generate_sm120_grouped_gemm_operations
+    # using the tile matrix approach. This function is reserved for future
+    # SM120-specific optimizations that may require different builder paths.
     return []
 
 
@@ -927,6 +1008,8 @@ def generate_sm120_operations(is_arch_enabled):
     Includes:
     - Block-scaled grouped GEMM operations (NVFP4, FP8xFP4, MXFP4)
     - Mixed-input operations (future SM120-specific optimizations)
+    
+    Uses structured tile matrix configuration similar to SM90.
     """
     operations = generate_sm120_grouped_gemm_operations(is_arch_enabled)
     operations.extend(generate_sm120_mixed_input_operations(is_arch_enabled))
