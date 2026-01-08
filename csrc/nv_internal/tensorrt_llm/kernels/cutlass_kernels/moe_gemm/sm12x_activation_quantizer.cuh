@@ -57,7 +57,6 @@
 #include <unordered_map>
 #include <algorithm>
 #include <type_traits>
-#include <cstring>  // For std::memcpy in vectorized kernel
 
 #include "sm12x_arch_config.h"
 
@@ -281,29 +280,32 @@ __global__ void quantize_activation_to_fp8_vectorized_kernel(
     
     int base_idx = vec_idx * kVecSize;
     
-    // Use alignas(8) to guarantee 64-bit alignment for vectorized store
-    alignas(8) __nv_fp8_e4m3 output_buf[kVecSize];
+    // Use union for type-punning to avoid std::memcpy in device code
+    // This is safe because: 1) union guarantees alignment, 2) same size
+    // 3) no padding between fp8 elements, 4) we access only one member at a time
+    union alignas(8) {
+        __nv_fp8_e4m3 fp8[kVecSize];
+        uint2 packed;  // uint2 is 8 bytes (2 x uint32_t)
+    } output_buf;
     
     // Load directly from global memory and convert
     // Use std::is_same_v for proper type dispatch (not sizeof comparison)
     if constexpr (std::is_same_v<InputType, __nv_bfloat16>) {
-        convert_bf16x8_to_fp8x8_global(input + base_idx, output_buf);
+        convert_bf16x8_to_fp8x8_global(input + base_idx, output_buf.fp8);
     } else if constexpr (std::is_same_v<InputType, __half>) {
-        convert_fp16x8_to_fp8x8_global(input + base_idx, output_buf);
+        convert_fp16x8_to_fp8x8_global(input + base_idx, output_buf.fp8);
     } else {
         // Generic fallback for other types
         #pragma unroll
         for (int i = 0; i < kVecSize; i++) {
-            output_buf[i] = __nv_fp8_e4m3(static_cast<float>(input[base_idx + i]));
+            output_buf.fp8[i] = __nv_fp8_e4m3(static_cast<float>(input[base_idx + i]));
         }
     }
     
-    // Aligned 64-bit store (output_buf is alignas(8) so this is safe)
-    // Output pointer is also 8-byte aligned at base_idx since base_idx = vec_idx * 8
+    // Aligned 64-bit store using uint2 (no memcpy needed, union handles type punning)
+    // Output pointer is 8-byte aligned at base_idx since base_idx = vec_idx * 8
     // and FP8 is 1 byte, so output + base_idx is at an 8-byte boundary
-    uint64_t packed;
-    std::memcpy(&packed, output_buf, sizeof(uint64_t));
-    *reinterpret_cast<uint64_t*>(output + base_idx) = packed;
+    *reinterpret_cast<uint2*>(output + base_idx) = output_buf.packed;
 }
 
 // Tail kernel for remaining elements (called after vectorized kernel)
@@ -601,51 +603,78 @@ struct Sm12xQuantizedActivationView {
     int scale_factor_stride = 0;                  // Row-major stride (k_blocks)
 };
 
-// WORKSPACE-BASED quantizer (no cudaMalloc in hot path!)
+// WORKSPACE-BASED quantizer (no cudaMalloc or memset in hot path!)
 // Caller pre-allocates workspace once and reuses across calls.
 //
 // Features:
 // - Zero allocations in hot path
+// - NO memset in hot path for identity scales (uses cached pre-filled buffer)
 // - Vectorized quantization kernel (8 elements per thread)
 // - CUTLASS LayoutSFA-compatible buffer sizing
-// - Identity scale mode uses memset (fast)
+//
+// Identity Scale Mode:
+// - Does NOT touch SFA in the workspace
+// - Returns pointer to pre-initialized identity buffer from manager
+// - No memset, no stream sync
+//
+// Full Scale Mode:
+// - Uses SFA portion of workspace (caller must have space)
+// - EXPERIMENTAL: Layout mismatch, see warning above
 //
 // Usage:
 //   1. Call Sm12xQuantizerWorkspaceSizes::compute() to get required size
 //   2. Pre-allocate workspace (once at engine init)
-//   3. Call quantizeActivationsWithWorkspace() per inference step
+//   3. Call prewarmIdentityScaleBuffer() at init for identity mode
+//   4. Call quantizeActivationsWithWorkspace() per inference step
 template <typename InputType>
 cudaError_t quantizeActivationsWithWorkspace(
     const InputType* d_input,           // [total_tokens, K] BF16/FP16 activations
     int total_tokens,
     int K,
-    void* d_workspace,                  // Pre-allocated workspace
+    void* d_workspace,                  // Pre-allocated workspace (for FP8 only if identity mode)
     size_t workspace_bytes,             // Size of workspace
-    bool use_identity_scales,           // If true, fill SFA with 0x7F
+    bool use_identity_scales,           // If true, use cached identity SFA buffer (no memset!)
     Sm12xQuantizedActivationView& output,
     cudaStream_t stream = 0
 ) {
     // Compute required sizes
     auto sizes = Sm12xQuantizerWorkspaceSizes::compute(total_tokens, K);
     
-    if (workspace_bytes < sizes.total_bytes) {
+    // For identity mode, we only need FP8 space in workspace (SFA comes from manager)
+    size_t required_ws = use_identity_scales ? sizes.fp8_activation_bytes : sizes.total_bytes;
+    if (workspace_bytes < required_ws) {
         return cudaErrorInvalidValue;  // Workspace too small
     }
     
-    // Partition workspace
+    // Partition workspace - FP8 activations always from workspace
     uint8_t* ws = static_cast<uint8_t*>(d_workspace);
     output.d_fp8_activations = reinterpret_cast<__nv_fp8_e4m3*>(ws);
-    output.d_scale_factors = ws + sizes.fp8_activation_bytes;
-    output.scale_factor_stride = sizes.sfa_stride;
     
-    // Fill scale factors (identity = 0x7F)
-    // For identity mode, memset works regardless of tiled layout since all values are the same
+    // Handle SFA based on mode
     if (use_identity_scales) {
-        cudaError_t err = cudaMemsetAsync(output.d_scale_factors, kIdentityScaleRaw, 
-                                          sizes.sfa_bytes, stream);
-        if (err != cudaSuccess) return err;
+        // IDENTITY MODE: Use pre-initialized cached buffer from manager
+        // NO memset, NO allocation, NO stream sync in hot path
+        auto& mgr = getIdentityScaleBufferManager();
+        output.d_scale_factors = mgr.getOrCreate(total_tokens, K);
+        output.scale_factor_stride = mgr.getScaleStride(total_tokens, K);
+        
+        if (output.d_scale_factors == nullptr) {
+            // First call for this (M, K) - will do one-time blocking alloc+memset
+            // This should only happen if caller didn't prewarm
+            // Fall back to workspace-based approach just this once
+            output.d_scale_factors = ws + sizes.fp8_activation_bytes;
+            output.scale_factor_stride = sizes.sfa_stride;
+            // One-time memset for this workspace (subsequent calls will use cached buffer)
+            cudaError_t err = cudaMemsetAsync(output.d_scale_factors, kIdentityScaleRaw, 
+                                              sizes.sfa_bytes, stream);
+            if (err != cudaSuccess) return err;
+        }
+    } else {
+        // FULL-SCALE MODE: Use workspace for SFA (caller fills it)
+        // This path is EXPERIMENTAL due to layout mismatch
+        output.d_scale_factors = ws + sizes.fp8_activation_bytes;
+        output.scale_factor_stride = sizes.sfa_stride;
     }
-    // TODO: For full-scale mode, need proper tiled fill kernel respecting LayoutSFA
     
     // Run VECTORIZED quantization kernel (8 elements per thread) + TAIL kernel
     int total_elements = total_tokens * K;

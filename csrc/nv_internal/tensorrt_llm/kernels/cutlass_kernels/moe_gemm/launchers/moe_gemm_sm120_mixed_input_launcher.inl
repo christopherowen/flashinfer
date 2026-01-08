@@ -241,11 +241,18 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   //
   // For this kernel, the layout is:
   //   SfAtom = Layout<Shape<(32,4), (SFVecSize,4)>, Stride<(16,4), (0,1)>>
-  //   tiled to (M, K, L) dimensions
+  //   tiled to (M, N, K, L) dimensions (N is used by CUTLASS even for SFA)
   //
-  // Use computeKernelSFABufferSize<CollectiveMainloop>(M, K, L) to get the exact
-  // required buffer size for any problem shape. The identity scale buffer manager
-  // should use this kernel-derived size for correctness.
+  // CALLER USAGE:
+  // To acquire identity SFA buffer with kernel-derived sizing:
+  //
+  //   #include "../sm12x_layout_sfa_utils.h"
+  //   #include "../sm12x_activation_quantizer.cuh"
+  //
+  //   size_t required_bytes = computeKernelSFABufferSize<CollectiveMainloop>(M_max, N, K, L);
+  //   auto& mgr = getIdentityScaleBufferManager();
+  //   uint8_t* identity_sfa = mgr.getOrCreateWithSize(required_bytes);
+  //   hopper_inputs.fpX_block_scaling_factors_act = identity_sfa;
   //
   // WHERE IT IS VERIFIED:
   // In debug builds, assertSFABufferSizeCorrect<CollectiveMainloop>() checks that

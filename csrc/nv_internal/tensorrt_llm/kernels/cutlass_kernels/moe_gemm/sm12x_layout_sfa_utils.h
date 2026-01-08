@@ -100,13 +100,15 @@ static constexpr int kBlkSF_SM12x = 4;
 struct Sm12xLayoutSFAUtils {
     // Compute the number of UE8M0 bytes required for SFA buffer
     // This uses CUTLASS's layout APIs directly for correctness
-    static size_t computeBufferSize(int M, int K, int L = 1) {
+    // Accepts full (M, N, K, L) problem shape as CUTLASS expects
+    static size_t computeBufferSize(int M, int N, int K, int L = 1) {
 #ifdef ENABLE_FP4
         // Use CUTLASS's Sm1xxBlockScaledConfig to compute the exact layout
         using SfConfig = cutlass::detail::Sm1xxBlockScaledConfig<kSFVecSize_SM12x>;
         
-        // Create problem shape
-        auto problem_shape = cute::make_shape(M, 0, K, L);  // (M, N, K, L) - N=0 for SFA
+        // Create full problem shape (M, N, K, L)
+        // CUTLASS's tile_atom_to_shape_SFA extracts (M, K, L) internally for SFA
+        auto problem_shape = cute::make_shape(M, N, K, L);
         
         // Get the SFA layout for this problem shape
         auto layout_sfa = SfConfig::tile_atom_to_shape_SFA(problem_shape);
@@ -121,6 +123,12 @@ struct Sm12xLayoutSFAUtils {
         // Fallback calculation when FP4 is not enabled
         return computeBufferSizeFallback(M, K, L);
 #endif
+    }
+    
+    // Convenience overload for when N is not relevant (e.g., prewarm)
+    // Uses N=0 which CUTLASS will ignore for SFA layout computation
+    static size_t computeBufferSize(int M, int K, int L = 1) {
+        return computeBufferSize(M, 0, K, L);
     }
     
     // Fallback computation without CUTLASS headers
@@ -178,64 +186,93 @@ struct Sm12xLayoutSFAUtils {
 //
 // This template function is meant to be called from the launcher where the
 // GemmKernel type is fully instantiated. It extracts LayoutSFA from the kernel
-// and computes the exact buffer size.
+// and computes the exact buffer size using the kernel's actual layout type.
+//
+// IMPORTANT: The CollectiveMainloop type exposes LayoutSFA which defines the
+// exact memory layout expected by TMA. We use tile_atom_to_shape_SFA with the
+// FULL problem shape (M, N, K, L) to get the runtime layout instance, then
+// cute::cosize() gives the required buffer capacity.
 //
 // Usage in launcher:
-//   size_t sfa_bytes = computeKernelSFABufferSize<CollectiveMainloop>(M, K, L);
+//   size_t sfa_bytes = computeKernelSFABufferSize<CollectiveMainloop>(M, N, K, L);
 //
 
 #ifdef ENABLE_FP4
+
+// Primary API: Compute SFA buffer size from kernel's CollectiveMainloop type
+// Uses the full (M, N, K, L) problem shape as CUTLASS expects
 template <typename CollectiveMainloop>
-size_t computeKernelSFABufferSize(int M, int K, int L = 1) {
-    // The CollectiveMainloop should have a LayoutSFA typedef
-    // We need to use the SfConfig to compute the actual layout for the problem shape
+size_t computeKernelSFABufferSize(int M, int N, int K, int L = 1) {
+    // Extract the SfConfig that CollectiveMainloop uses for block-scaled layouts
+    // The CollectiveMainloop is built with ElementABlockScaled (e.g., mx_float8_t<float_e4m3_t>)
+    // which dictates the scale factor layout through Sm1xxBlockScaledConfig
+    //
+    // The SFVecSize for MXFP types is 32 (MXFPXBlockScaleVectorSize in moe_gemm_kernels.h)
     using SfConfig = cutlass::detail::Sm1xxBlockScaledConfig<kSFVecSize_SM12x>;
     
-    auto problem_shape = cute::make_shape(M, 0, K, L);
+    // Create the full problem shape (M, N, K, L)
+    // CUTLASS's tile_atom_to_shape_SFA uses (M, N, K, L) and extracts (M, K, L) for SFA
+    auto problem_shape = cute::make_shape(M, N, K, L);
+    
+    // Get the SFA layout for this problem shape
+    // This is the SAME layout the kernel's TMA descriptor will expect
     auto layout_sfa = SfConfig::tile_atom_to_shape_SFA(problem_shape);
     
+    // cosize gives the maximum linear index + 1 (the required buffer capacity in bytes)
     size_t sfa_elements = cute::cosize(layout_sfa);
     
-    // Align to 256 bytes for TMA
+    // Align to 256 bytes for TMA requirements
     return (sfa_elements + 255) & ~size_t(255);
+}
+
+// Convenience overload that takes N from the problem (for cases where N is known)
+template <typename CollectiveMainloop>
+size_t computeKernelSFABufferSizeFromShape(int M_max, int N, int K, int L = 1) {
+    return computeKernelSFABufferSize<CollectiveMainloop>(M_max, N, K, L);
 }
 
 // Debug assertion for SFA buffer size verification
 // Call this from the launcher or higher-level code in debug builds
 template <typename CollectiveMainloop>
-void assertSFABufferSizeCorrect(size_t allocated_bytes, int M, int K, int L,
+void assertSFABufferSizeCorrect(size_t allocated_bytes, int M, int N, int K, int L,
                                  const char* kernel_name) {
 #ifndef NDEBUG
-    size_t required = computeKernelSFABufferSize<CollectiveMainloop>(M, K, L);
+    size_t required = computeKernelSFABufferSize<CollectiveMainloop>(M, N, K, L);
     if (allocated_bytes < required) {
         fprintf(stderr, 
                 "ERROR: SFA buffer size mismatch for kernel '%s'\n"
-                "  Problem shape: M=%d, K=%d, L=%d\n"
+                "  Problem shape: M=%d, N=%d, K=%d, L=%d\n"
                 "  Required bytes (from CUTLASS cosize): %zu\n"
                 "  Allocated bytes: %zu\n"
                 "  Shortfall: %zu bytes\n",
-                kernel_name, M, K, L, required, allocated_bytes, required - allocated_bytes);
+                kernel_name, M, N, K, L, required, allocated_bytes, required - allocated_bytes);
         assert(allocated_bytes >= required && "SFA buffer too small for CUTLASS layout!");
     }
 #endif
 }
 
 // Non-templated verification using fallback computation (for prewarm/init)
-inline void assertSFABufferSizeCorrectFallback(size_t allocated_bytes, int M, int K, int L,
+inline void assertSFABufferSizeCorrectFallback(size_t allocated_bytes, int M, int N, int K, int L,
                                                 const char* context) {
 #ifndef NDEBUG
-    size_t required = Sm12xLayoutSFAUtils::computeBufferSize(M, K, L);
+    size_t required = Sm12xLayoutSFAUtils::computeBufferSize(M, N, K, L);
     if (allocated_bytes < required) {
         fprintf(stderr, 
                 "ERROR: SFA buffer size mismatch in '%s'\n"
-                "  Problem shape: M=%d, K=%d, L=%d\n"
+                "  Problem shape: M=%d, N=%d, K=%d, L=%d\n"
                 "  Required bytes (from LayoutSFAUtils): %zu\n"
                 "  Allocated bytes: %zu\n"
                 "  Shortfall: %zu bytes\n",
-                context, M, K, L, required, allocated_bytes, required - allocated_bytes);
+                context, M, N, K, L, required, allocated_bytes, required - allocated_bytes);
         assert(allocated_bytes >= required && "SFA buffer too small!");
     }
 #endif
+}
+
+// Overload without N for convenience
+inline void assertSFABufferSizeCorrectFallback(size_t allocated_bytes, int M, int K, int L,
+                                                const char* context) {
+    assertSFABufferSizeCorrectFallback(allocated_bytes, M, 0, K, L, context);
 }
 #endif  // ENABLE_FP4
 
