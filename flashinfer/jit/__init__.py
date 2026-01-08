@@ -91,6 +91,8 @@ from .dsv3_optimizations import (
 from .dsv3_optimizations import (
     gen_dsv3_fused_routing_module as gen_dsv3_fused_routing_module,
 )
+from .gemv import gen_gemv_fp4_sm120_module as gen_gemv_fp4_sm120_module
+from .gemv import get_gemv_module as get_gemv_module
 
 
 cuda_lib_path = os.environ.get(
