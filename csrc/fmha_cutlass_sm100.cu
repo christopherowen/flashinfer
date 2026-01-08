@@ -86,7 +86,8 @@ void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ff
                          ffi::TensorView batch_indices, ffi::TensorView o,
                          Optional<ffi::TensorView> maybe_lse, int64_t mask_mode_code,
                          double sm_scale, double scale_q, double scale_k, double scale_v,
-                         double o_scale, int64_t max_qo_len) {
+                         double o_scale, int64_t max_qo_len,
+                         Optional<ffi::TensorView> maybe_attention_sinks) {
   TVM_FFI_ICHECK_EQ(q.dtype(), k.dtype());
   auto scalar_type_in = q.dtype();
   auto scalar_type_out = o.dtype();
@@ -107,6 +108,18 @@ void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ff
 
   ffi::CUDADeviceGuard device_guard(qo_segment_offsets.device().device_id);
   const cudaStream_t stream = get_stream(o.device());
+
+  // Extract attention sinks pointer if provided
+  float const* attention_sinks_ptr = nullptr;
+  if (maybe_attention_sinks.has_value()) {
+    DLDataType expected_dtype = {kDLFloat, 32, 1};
+    DLDataType actual_dtype = maybe_attention_sinks.value().dtype();
+    TVM_FFI_ICHECK(actual_dtype.code == expected_dtype.code &&
+                   actual_dtype.bits == expected_dtype.bits &&
+                   actual_dtype.lanes == expected_dtype.lanes)
+        << "attention_sinks must be a float32 tensor";
+    attention_sinks_ptr = static_cast<float const*>(maybe_attention_sinks.value().data_ptr());
+  }
 
   DISPATCH_context(DTypeIn, DTypeOut, HEAD_DIM_QK, HEAD_DIM_VO, MASK_MODE, [&] {
     using cutlass_type_in = cutlass_dtype_t<DTypeIn>;
@@ -131,7 +144,8 @@ void FMHACutlassSM100Run(ffi::TensorView workspace_buffer, ffi::TensorView q, ff
         maybe_lse.has_value() ? static_cast<float*>(maybe_lse.value().data_ptr()) : nullptr,
         mask_mode_code, sm_scale, scale_q, scale_k, scale_v, o_scale, num_qo_heads, num_kv_heads,
         head_dim_qk, head_dim_vo, q_stride_n, q_stride_h, k_stride_n, k_stride_h, v_stride_n,
-        v_stride_h, batch_size, total_qo_len, total_kv_len, max_qo_len, stream);
+        v_stride_h, batch_size, total_qo_len, total_kv_len, max_qo_len, attention_sinks_ptr,
+        stream);
     TVM_FFI_ICHECK_EQ(status, cudaSuccess)
         << "Cutlass FMHA forward pass failed" << cudaGetErrorString(status);
 

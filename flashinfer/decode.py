@@ -945,17 +945,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 indices, non_blocking=(indices.device == self.device) and non_blocking
             )
         else:
+            # Ensure non_blocking is a boolean (older PyTorch accepts None, newer versions don't)
+            nb = non_blocking if non_blocking is not None else True
             self._paged_kv_indptr_buf = indptr.to(
-                self.device, non_blocking=non_blocking
+                self.device, non_blocking=nb
             )
             self._paged_kv_indices_buf = indices.to(
-                self.device, non_blocking=non_blocking
+                self.device, non_blocking=nb
             )
             self._paged_kv_last_page_len_buf = last_page_len.to(
-                self.device, non_blocking=non_blocking
+                self.device, non_blocking=nb
             )
             self._qo_indptr_buf = qo_indptr_host.to(
-                self.device, non_blocking=non_blocking
+                self.device, non_blocking=nb
             )
 
         indptr_host = indptr.to("cpu")

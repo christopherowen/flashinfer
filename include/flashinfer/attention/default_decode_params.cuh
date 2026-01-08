@@ -135,6 +135,10 @@ struct BatchDecodeParams {
   bool* block_valid_mask;
   bool partition_kv;
 
+  // Attention sinks: per-head value added to softmax denominator
+  // Shape: [num_qo_heads], nullptr if not used
+  float const* attention_sinks;
+
   __device__ __host__ BatchDecodeParams()
       : q(nullptr),
         q_rope_offset(nullptr),
@@ -156,7 +160,8 @@ struct BatchDecodeParams {
         o_indptr(nullptr),
         kv_chunk_size_ptr(nullptr),
         block_valid_mask(nullptr),
-        partition_kv(false) {}
+        partition_kv(false),
+        attention_sinks(nullptr) {}
 
   __device__ __host__ BatchDecodeParams(DTypeQ* q, IdType* q_rope_offset,
                                         paged_kv_t<DTypeKV, IdType> paged_kv, DTypeO* o, float* lse,

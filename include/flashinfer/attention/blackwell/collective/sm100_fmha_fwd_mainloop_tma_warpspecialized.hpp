@@ -182,6 +182,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     // scaling factor to quantize O
     float inv_scale_o = 1.0f;
+
+    // Attention sinks: per-head value added to softmax denominator
+    // Shape: [num_qo_heads], nullptr if not used
+    float const* attention_sinks = nullptr;
   };
 
   struct Params {
@@ -191,6 +195,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     float scale_softmax_log2;
 
     float scale_output;
+
+    // Attention sinks: per-head value added to softmax denominator
+    float const* attention_sinks;
   };
 
   template <class ProblemShape>
@@ -207,7 +214,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     return Params{Load::to_underlying_arguments(problem_shape, args.load, workspace),
                   args.scale_q * args.scale_k * scale_softmax,
                   args.scale_q * args.scale_k * log2_e * scale_softmax,
-                  args.scale_v * args.inv_scale_o};
+                  args.scale_v * args.inv_scale_o,
+                  args.attention_sinks};
   }
 
   CUTLASS_DEVICE
@@ -674,6 +682,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     if (final_call) {
       // re-acquire the S part in the final step
       pipeline_s.consumer_wait(pipeline_s_consumer_state);
+
+      // Add attention sink to the softmax denominator if provided
+      // The sink is a per-head value that prevents attention collapse
+      if (params.attention_sinks != nullptr) {
+        // Extract head index from block coordinates
+        // blk_coord = (qo_tile_idx, _, (qo_head_idx, batch_idx))
+        int qo_head_idx = get<0>(get<2>(blk_coord));
+        row_sum += params.attention_sinks[qo_head_idx];
+      }
 
       Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
       tTMEM_STOREVrS(kIdxFinalRowMax) = row_max;

@@ -25,10 +25,12 @@ import torch
 from .api_logging import flashinfer_api
 from .jit import (
     gen_batch_prefill_module,
+    gen_batch_prefill_attention_sink_module,
     gen_customize_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
     gen_single_prefill_module,
     get_batch_prefill_uri,
+    get_batch_prefill_attention_sink_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
     gen_trtllm_gen_fmha_module,
@@ -389,6 +391,34 @@ def get_single_prefill_module(backend, *args):
 
     # Register the module
     return SimpleNamespace(run=run_single_prefill)
+
+
+@functools.cache
+def get_batch_prefill_attention_sink_module(backend, dtype_q, dtype_kv, dtype_o, dtype_idx,
+                                             head_dim_qk, head_dim_vo, pos_encoding_mode,
+                                             use_sliding_window):
+    """Get the attention sink variant of the batch prefill module.
+    
+    This module supports attention sinks for models like GPT-OSS-120B.
+    The sink parameter is an additional value per head in the softmax denominator.
+    """
+    uri = get_batch_prefill_attention_sink_uri(
+        backend, dtype_q, dtype_kv, dtype_o, dtype_idx,
+        head_dim_qk, head_dim_vo, pos_encoding_mode, use_sliding_window
+    )
+    module = gen_batch_prefill_attention_sink_module(
+        backend, dtype_q, dtype_kv, dtype_o, dtype_idx,
+        head_dim_qk, head_dim_vo, pos_encoding_mode, use_sliding_window
+    ).build_and_load()
+    
+    # The sink module has the same interface as the regular module,
+    # but with additional sink and sm_scale parameters
+    return SimpleNamespace(
+        plan=module.plan,
+        paged_run=module.paged_run,
+        ragged_run=module.ragged_run,
+        uri=uri,
+    )
 
 
 @functools.cache
@@ -1628,6 +1658,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        use_sinks: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1915,9 +1946,25 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     use_fp16_qk_reduction,
                 )
 
-                self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
-                )
+                if use_sinks and self._backend == "fa2":
+                    # Use attention sink module for models that require sinks
+                    self._cached_module = get_batch_prefill_attention_sink_module(
+                        self._backend,
+                        q_data_type,
+                        kv_data_type,
+                        o_data_type,
+                        paged_kv_indptr.dtype,
+                        head_dim_qk,
+                        head_dim_vo,
+                        PosEncodingMode[pos_encoding_mode].value,
+                        window_left >= 0,  # use_sliding_window
+                    )
+                    self._use_sinks = True
+                else:
+                    self._cached_module = get_batch_prefill_module(
+                        self._backend, *get_module_args
+                    )
+                    self._use_sinks = False
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
@@ -2236,6 +2283,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ]
             if self._jit_module is not None:
                 run_args.extend(list(args))
+            elif getattr(self, '_use_sinks', False) and self._backend == "fa2":
+                # FA2 attention sink module: expects sink and sm_scale
+                if sinks is None:
+                    raise ValueError("sinks must be provided when use_sinks=True in plan()")
+                run_args += [
+                    sinks,  # sink tensor
+                    sm_scale,  # sm_scale
+                ]
             else:
                 # Extract FP8 scale tensors from *args if q is FP8
                 fp8_scale_q = None
@@ -3192,6 +3247,7 @@ def fmha_varlen(
     v_scale: Optional[float] = None,
     o_scale: Optional[float] = None,
     return_lse: Literal[False] = False,
+    attention_sinks: Optional[torch.Tensor] = None,
 ) -> torch.Tensor: ...
 
 
@@ -3213,6 +3269,7 @@ def fmha_varlen(
     v_scale: Optional[float] = None,
     o_scale: Optional[float] = None,
     return_lse: Literal[True] = True,
+    attention_sinks: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -3233,6 +3290,7 @@ def fmha_varlen(
     v_scale: Optional[float] = None,
     o_scale: Optional[float] = None,
     return_lse: bool = False,
+    attention_sinks: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     workspace_buffer = _get_cache_buf(
         "fmha_varlen_cutlass_workspace", 32 * 1024 * 1024, q.device
@@ -3317,6 +3375,7 @@ def fmha_varlen(
         v_scale,
         o_scale,
         max_qo_len,
+        attention_sinks,
     )
 
     return out, lse

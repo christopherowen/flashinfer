@@ -99,6 +99,37 @@ struct AttentionVariantBase {
   }
 };
 
+// Type trait to check if Params has attention_sinks
+template <typename T, typename = void>
+struct has_attention_sinks : std::false_type {};
+
+template <typename T>
+struct has_attention_sinks<T, std::void_t<decltype(std::declval<T>().attention_sinks)>>
+    : std::true_type {};
+
+template <typename T>
+constexpr bool has_attention_sinks_v = has_attention_sinks<T>::value;
+
+/*!
+ * \brief Attention variant with sink support for SM12x native FlashInfer attention.
+ *
+ * Attention sinks are per-head values added to the softmax denominator to prevent
+ * attention collapse. This variant reads from params.attention_sinks if available.
+ *
+ * The sink value is added to d (the denominator) in the final step (kv_tile_idx == 0)
+ * when iterating backwards through KV tiles.
+ */
+struct AttentionWithSinks : AttentionVariantBase {
+  REGISTER_M_D_UPDATE(params, kv_tile_idx, qo_head_idx, m, d, scale, {
+    // Add attention sink to denominator on the first KV tile (final step in backwards iteration)
+    if constexpr (has_attention_sinks_v<Params>) {
+      if (params.attention_sinks != nullptr && kv_tile_idx == 0) {
+        d += params.attention_sinks[qo_head_idx];
+      }
+    }
+  })
+};
+
 }  // namespace flashinfer
 
 #endif  // FLASHINFER_ATTENTION_VARIANT_HELPER_H

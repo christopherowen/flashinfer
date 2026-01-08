@@ -27,7 +27,9 @@ class TllmGenFmhaRunner {
   // Constructor.
   explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut)
       : mSM(getSMVersion()), mDtypeQ(dtypeQ), mDtypeKv(dtypeKv), mDtypeOut(dtypeOut) {
-    FLASHINFER_CHECK(mSM == kSM_100 || mSM == kSM_103, "Unsupported architecture");
+    // SM120/SM121 (GB10 DGX Spark) can use SM100 kernels (same Blackwell architecture class)
+    FLASHINFER_CHECK(mSM == kSM_100 || mSM == kSM_103 || mSM == kSM_120 || mSM == 121,
+                     "Unsupported architecture");
     FLASHINFER_CHECK(
         mDtypeQ == DATA_TYPE_E4M3 || mDtypeQ == DATA_TYPE_FP16 || mDtypeQ == DATA_TYPE_BF16,
         "Unsupported Q data type: " + std::string(toStr(mDtypeQ)));

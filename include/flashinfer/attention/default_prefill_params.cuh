@@ -177,6 +177,10 @@ struct BatchPrefillRaggedParams {
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
 
+  // Attention sinks: per-head value added to softmax denominator
+  // Shape: [num_qo_heads], nullptr if not used
+  float const* attention_sinks;
+
   __host__ BatchPrefillRaggedParams()
       : q(nullptr),
         k(nullptr),
@@ -218,7 +222,8 @@ struct BatchPrefillRaggedParams {
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
         token_pos_in_items_len(0),
-        maybe_max_item_len_ptr(nullptr) {}
+        maybe_max_item_len_ptr(nullptr),
+        attention_sinks(nullptr) {}
 
   __host__ BatchPrefillRaggedParams(DTypeQ* q, DTypeKV* k, DTypeKV* v, uint8_t* maybe_custom_mask,
                                     IdType* q_indptr, IdType* kv_indptr, IdType* maybe_mask_indptr,
@@ -322,6 +327,10 @@ struct BatchPrefillPagedParams {
   uint32_t token_pos_in_items_len;
   uint16_t* maybe_max_item_len_ptr;
 
+  // Attention sinks: per-head value added to softmax denominator
+  // Shape: [num_qo_heads], nullptr if not used
+  float const* attention_sinks;
+
   __host__ BatchPrefillPagedParams()
       : q(nullptr),
         paged_kv(),
@@ -355,7 +364,8 @@ struct BatchPrefillPagedParams {
         maybe_prefix_len_ptr(nullptr),
         maybe_token_pos_in_items_ptr(nullptr),
         token_pos_in_items_len(0),
-        maybe_max_item_len_ptr(nullptr) {}
+        maybe_max_item_len_ptr(nullptr),
+        attention_sinks(nullptr) {}
 
   __host__ BatchPrefillPagedParams(DTypeQ* q, paged_kv_t<DTypeKV, IdType> paged_kv,
                                    uint8_t* maybe_custom_mask, IdType* q_indptr,
