@@ -41,6 +41,12 @@ using tvm::ffi::TensorView;
 //==============================================================================
 // Feature flags - enable when ready
 //==============================================================================
+// CUTLASS GemvBlockScaled integration is complex due to:
+// 1. Namespace conflicts between cute::Tensor and other Tensor types
+// 2. Custom epilogue requirements (FP4 output only in stock epilogue)
+// 3. Template parameter matching with kernel internals
+//
+// For now, use the optimized fallback path.
 // #define USE_CUTLASS_GEMV_NATIVE  // Enable CUTLASS native path
 
 #ifdef USE_CUTLASS_GEMV_NATIVE
