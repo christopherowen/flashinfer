@@ -25,6 +25,20 @@ import numpy as np
 try:
     import flashinfer
     from flashinfer.utils import get_compute_capability
+    from flashinfer.fused_moe import (
+        trtllm_fp4_block_scale_moe,
+        trtllm_bf16_moe,
+        RoutingMethodType,
+        GatedActType,
+    )
+    _HAS_FUSED_MOE = True
+except ImportError as e:
+    print(f"WARNING: FlashInfer fused_moe not available: {e}")
+    _HAS_FUSED_MOE = False
+
+try:
+    import flashinfer
+    from flashinfer.utils import get_compute_capability
 except ImportError:
     print("ERROR: FlashInfer not installed. Please install first.")
     exit(1)
@@ -46,82 +60,178 @@ def create_moe_test_data(
     num_experts: int,
     topk: int,
     dtype: torch.dtype = torch.bfloat16,
+    use_fp4_weights: bool = True,
 ) -> Dict:
     """Create test data for MoE GEMM benchmark.
     
+    Args:
+        num_tokens: Number of input tokens
+        hidden_dim: Hidden dimension (must be divisible by 128 for block scaling)
+        num_experts: Number of experts
+        topk: Number of experts per token
+        dtype: Data type for activations (bfloat16 or float16)
+        use_fp4_weights: If True, create FP4 quantized weights for real benchmark
+    
     Returns:
-        Dict with activations, weights, and routing info
+        Dict with activations, weights, scales, and routing info
     """
     device = torch.device("cuda")
     
-    # Activations [num_tokens, hidden_dim]
-    activations = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
-    
-    # FP4 weights per expert [num_experts, intermediate_dim, hidden_dim]
-    # For simplicity, use intermediate_dim = 4 * hidden_dim (typical MLP expansion)
+    # Intermediate dim = 4 * hidden_dim (typical MLP expansion)
     intermediate_dim = 4 * hidden_dim
     
-    # Create random weights (in real case, these would be quantized FP4)
-    # For benchmark, we simulate with random data
-    weights = torch.randn(num_experts, intermediate_dim, hidden_dim, dtype=dtype, device=device)
+    # Routing logits [num_tokens, num_experts]
+    routing_logits = torch.randn(num_tokens, num_experts, dtype=dtype, device=device)
     
-    # Routing: assign topk experts per token
-    expert_indices = torch.randint(0, num_experts, (num_tokens, topk), device=device)
-    expert_weights = torch.softmax(torch.randn(num_tokens, topk, device=device), dim=-1)
+    # Hidden states [num_tokens, hidden_dim]
+    hidden_states = torch.randn(num_tokens, hidden_dim, dtype=dtype, device=device)
+    
+    if use_fp4_weights:
+        # FP4 weights are packed into uint8 (2 FP4 values per byte)
+        # Weight shapes for gated MLP (gate + up projection combined):
+        #   gemm1: [num_experts, 2*intermediate_dim, hidden_dim // 2] (packed)
+        #   gemm2: [num_experts, hidden_dim, intermediate_dim // 2] (packed)
+        
+        gemm1_weights = torch.randint(
+            0, 256, 
+            (num_experts, 2 * intermediate_dim, hidden_dim // 2),
+            dtype=torch.uint8, device=device
+        )
+        gemm2_weights = torch.randint(
+            0, 256,
+            (num_experts, hidden_dim, intermediate_dim // 2),
+            dtype=torch.uint8, device=device
+        )
+        
+        # Scale factors for FP4 block scaling (float8_e4m3fn)
+        # For MXFP4: scales are [num_experts, dim, hidden // 32]
+        gemm1_scales = torch.ones(
+            num_experts, 2 * intermediate_dim, hidden_dim // 32,
+            dtype=torch.float8_e4m3fn, device=device
+        )
+        gemm2_scales = torch.ones(
+            num_experts, hidden_dim, intermediate_dim // 32,
+            dtype=torch.float8_e4m3fn, device=device
+        )
+        
+        # Hidden states scale for identity mode (all ones = 0x7F in UE8M0)
+        # Shape: [num_tokens, hidden_dim // 32] for MXFP8
+        hidden_states_scale = torch.ones(
+            num_tokens, hidden_dim // 32,
+            dtype=torch.float8_e4m3fn, device=device
+        )
+    else:
+        # BF16 weights for placeholder mode
+        gemm1_weights = torch.randn(
+            num_experts, 2 * intermediate_dim, hidden_dim,
+            dtype=dtype, device=device
+        )
+        gemm2_weights = torch.randn(
+            num_experts, hidden_dim, intermediate_dim,
+            dtype=dtype, device=device
+        )
+        gemm1_scales = None
+        gemm2_scales = None
+        hidden_states_scale = None
     
     return {
-        "activations": activations,
-        "weights": weights,
-        "expert_indices": expert_indices,
-        "expert_weights": expert_weights,
+        "hidden_states": hidden_states,
+        "hidden_states_scale": hidden_states_scale,
+        "routing_logits": routing_logits,
+        "gemm1_weights": gemm1_weights,
+        "gemm1_scales": gemm1_scales,
+        "gemm2_weights": gemm2_weights,
+        "gemm2_scales": gemm2_scales,
         "num_tokens": num_tokens,
         "hidden_dim": hidden_dim,
         "intermediate_dim": intermediate_dim,
         "num_experts": num_experts,
         "topk": topk,
+        "use_fp4_weights": use_fp4_weights,
     }
 
 
 # =============================================================================
-# BENCHMARK STATUS: PLACEHOLDER
+# BENCHMARK MODES
 # =============================================================================
-# This benchmark currently uses torch.matmul as a PLACEHOLDER for the actual
-# FlashInfer SM121 MoE GEMM path. It does NOT validate:
-#   - The CUTLASS grouped GEMM path
-#   - The activation quantizer cost
-#   - Kernel selection heuristics
-#   - End-to-end MoE performance
-#
-# To be meaningful, this benchmark must:
-# 1. Prepare inputs in FlashInfer's grouped GEMM format (grouped pointers, shapes)
-# 2. Call the actual FlashInfer fused MoE entrypoint
-# 3. Time separately:
-#    a. Quantizer alone (BF16->FP8 + SFA generation)
-#    b. GEMM alone (FP8xFP4 grouped GEMM)
-#    c. Quantizer + GEMM together (end-to-end)
-#
-# TODO: Once FlashInfer SM121 MoE API is wired up:
-# - Replace torch.matmul with flashinfer.moe.mxfp4_grouped_gemm() or similar
-# - Add quantizer timing with CUDA events
-# - Report kernel selected and tile config
+# Mode 1: Real FlashInfer FP4 MoE path (requires SM100+ and FP4 support)
+# Mode 2: BF16 baseline (for comparison)
+# Mode 3: Placeholder (fallback when APIs unavailable)
 # =============================================================================
 
-_USE_REAL_FLASHINFER_PATH = False  # Set to True once API is available
+def run_real_fp4_moe(data: Dict) -> torch.Tensor:
+    """Run real FlashInfer FP4 block-scaled MoE."""
+    if not _HAS_FUSED_MOE:
+        raise RuntimeError("FlashInfer fused_moe not available")
+    
+    return trtllm_fp4_block_scale_moe(
+        routing_logits=data["routing_logits"],
+        routing_bias=None,
+        hidden_states=data["hidden_states"],
+        hidden_states_scale=data["hidden_states_scale"],
+        gemm1_weights=data["gemm1_weights"],
+        gemm1_weights_scale=data["gemm1_scales"],
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=data["gemm2_weights"],
+        gemm2_weights_scale=data["gemm2_scales"],
+        gemm2_bias=None,
+        output1_scale_scalar=None,
+        output1_scale_gate_scalar=None,
+        output2_scale_scalar=None,
+        num_experts=data["num_experts"],
+        top_k=data["topk"],
+        n_group=None,
+        topk_group=None,
+        intermediate_size=data["intermediate_dim"],
+        local_expert_offset=0,
+        local_num_experts=data["num_experts"],
+        routed_scaling_factor=None,
+        routing_method_type=int(RoutingMethodType.Default),
+        do_finalize=True,
+        gated_act_type=int(GatedActType.Silu) if hasattr(GatedActType, 'Silu') else 0,
+    )[0]
+
+
+def run_bf16_moe(data: Dict) -> torch.Tensor:
+    """Run BF16 MoE baseline."""
+    if not _HAS_FUSED_MOE:
+        raise RuntimeError("FlashInfer fused_moe not available")
+    
+    return trtllm_bf16_moe(
+        routing_logits=data["routing_logits"],
+        routing_bias=None,
+        hidden_states=data["hidden_states"],
+        gemm1_weights=data["gemm1_weights"],
+        gemm2_weights=data["gemm2_weights"],
+        num_experts=data["num_experts"],
+        top_k=data["topk"],
+        n_group=None,
+        topk_group=None,
+        intermediate_size=data["intermediate_dim"],
+        local_expert_offset=0,
+        local_num_experts=data["num_experts"],
+        routed_scaling_factor=None,
+        routing_method_type=int(RoutingMethodType.Default),
+    )
+
+
+def run_placeholder(data: Dict) -> torch.Tensor:
+    """Run placeholder (simple matmul)."""
+    return torch.matmul(data["hidden_states"], data["gemm1_weights"][0, :data["hidden_dim"], :].T)
 
 
 def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: int = 5, num_iters: int = 20):
-    """Benchmark prefill-like workload (large M per group).
-    
-    WARNING: Currently using torch.matmul placeholder, NOT the actual SM121 path.
-    """
+    """Benchmark prefill-like workload (large M per group)."""
     
     print("\n" + "="*60)
     print("PREFILL REGIME BENCHMARK")
-    if not _USE_REAL_FLASHINFER_PATH:
-        print("*** PLACEHOLDER MODE (torch.matmul) - not real SM121 path ***")
     print("="*60)
     print(f"  Hidden dim: {hidden_dim}")
     print(f"  Num experts: {num_experts}")
+    print(f"  FlashInfer fused_moe available: {_HAS_FUSED_MOE}")
     
     # Prefill workload: larger batch sizes
     batch_sizes = [64, 128, 256, 512, 1024]
@@ -130,7 +240,38 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
     results = []
     
     for num_tokens in batch_sizes:
-        data = create_moe_test_data(num_tokens, hidden_dim, num_experts, topk)
+        # Try FP4 path first, fall back to BF16, then placeholder
+        use_fp4 = _HAS_FUSED_MOE
+        use_bf16 = False
+        mode = "FP4"
+        
+        if use_fp4:
+            try:
+                data = create_moe_test_data(num_tokens, hidden_dim, num_experts, topk, use_fp4_weights=True)
+                run_fn = lambda: run_real_fp4_moe(data)
+                # Test run
+                _ = run_fn()
+                torch.cuda.synchronize()
+            except Exception as e:
+                print(f"  FP4 path failed: {e}, falling back to BF16")
+                use_fp4 = False
+                use_bf16 = _HAS_FUSED_MOE
+        
+        if not use_fp4 and use_bf16:
+            try:
+                data = create_moe_test_data(num_tokens, hidden_dim, num_experts, topk, use_fp4_weights=False)
+                run_fn = lambda: run_bf16_moe(data)
+                mode = "BF16"
+                _ = run_fn()
+                torch.cuda.synchronize()
+            except Exception as e:
+                print(f"  BF16 path failed: {e}, falling back to placeholder")
+                use_bf16 = False
+        
+        if not use_fp4 and not use_bf16:
+            data = create_moe_test_data(num_tokens, hidden_dim, num_experts, topk, use_fp4_weights=False)
+            run_fn = lambda: run_placeholder(data)
+            mode = "PLACEHOLDER"
         
         # Calculate theoretical FLOPS
         tokens_per_expert = num_tokens * topk / num_experts
@@ -138,18 +279,9 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
         flops_per_expert = 2 * tokens_per_expert * hidden_dim * intermediate_dim
         total_flops = flops_per_expert * num_experts
         
-        if _USE_REAL_FLASHINFER_PATH:
-            # TODO: Replace with actual FlashInfer MoE call
-            # quantizer_time, gemm_time, total_time = flashinfer.moe.benchmark_mxfp4_grouped_gemm(...)
-            pass
-        else:
-            # PLACEHOLDER: Simple matmul (not actual grouped GEMM)
-            def run_placeholder():
-                return torch.matmul(data["activations"], data["weights"][0].T)
-        
         # Warmup
         for _ in range(num_warmup):
-            _ = run_placeholder() if not _USE_REAL_FLASHINFER_PATH else None
+            _ = run_fn()
             torch.cuda.synchronize()
         
         # Timed iterations
@@ -157,7 +289,7 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
         start = time.perf_counter()
         
         for _ in range(num_iters):
-            _ = run_placeholder() if not _USE_REAL_FLASHINFER_PATH else None
+            _ = run_fn()
         
         torch.cuda.synchronize()
         end = time.perf_counter()
@@ -170,11 +302,10 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
             "avg_time_ms": avg_time_ms,
             "tflops": tflops,
             "tokens_per_expert": tokens_per_expert,
-            "is_placeholder": not _USE_REAL_FLASHINFER_PATH,
+            "mode": mode,
         })
         
-        marker = "[PLACEHOLDER]" if not _USE_REAL_FLASHINFER_PATH else ""
-        print(f"\n  Tokens: {num_tokens:5d}  |  Time: {avg_time_ms:8.3f} ms  |  {tflops:.2f} TFLOPS {marker}")
+        print(f"\n  Tokens: {num_tokens:5d}  |  Time: {avg_time_ms:8.3f} ms  |  {tflops:.2f} TFLOPS [{mode}]")
     
     return results
 
@@ -182,17 +313,16 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
 def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: int = 10, num_iters: int = 50):
     """Benchmark decode-like workload (small M per group).
     
-    WARNING: Currently using torch.matmul placeholder, NOT the actual SM121 path.
     For decode, tile selection is CRITICAL - wrong tile = massive latency.
+    This tests the SM121 FP4 path with small batch sizes (1-32 tokens).
     """
     
     print("\n" + "="*60)
     print("DECODE REGIME BENCHMARK")
-    if not _USE_REAL_FLASHINFER_PATH:
-        print("*** PLACEHOLDER MODE (torch.matmul) - not real SM121 path ***")
     print("="*60)
     print(f"  Hidden dim: {hidden_dim}")
     print(f"  Num experts: {num_experts}")
+    print(f"  FlashInfer fused_moe available: {_HAS_FUSED_MOE}")
     
     # Decode workload: small batch sizes (1-32 tokens)
     batch_sizes = [1, 2, 4, 8, 16, 32]
@@ -201,7 +331,38 @@ def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: i
     results = []
     
     for num_tokens in batch_sizes:
-        data = create_moe_test_data(num_tokens, hidden_dim, num_experts, topk)
+        # Try FP4 path first, fall back to BF16, then placeholder
+        use_fp4 = _HAS_FUSED_MOE
+        use_bf16 = False
+        mode = "FP4"
+        
+        if use_fp4:
+            try:
+                data = create_moe_test_data(num_tokens, hidden_dim, num_experts, topk, use_fp4_weights=True)
+                run_fn = lambda: run_real_fp4_moe(data)
+                # Test run
+                _ = run_fn()
+                torch.cuda.synchronize()
+            except Exception as e:
+                print(f"  FP4 path failed for {num_tokens} tokens: {e}, falling back")
+                use_fp4 = False
+                use_bf16 = _HAS_FUSED_MOE
+        
+        if not use_fp4 and use_bf16:
+            try:
+                data = create_moe_test_data(num_tokens, hidden_dim, num_experts, topk, use_fp4_weights=False)
+                run_fn = lambda: run_bf16_moe(data)
+                mode = "BF16"
+                _ = run_fn()
+                torch.cuda.synchronize()
+            except Exception as e:
+                print(f"  BF16 path failed: {e}, falling back to placeholder")
+                use_bf16 = False
+        
+        if not use_fp4 and not use_bf16:
+            data = create_moe_test_data(num_tokens, hidden_dim, num_experts, topk, use_fp4_weights=False)
+            run_fn = lambda: run_placeholder(data)
+            mode = "PLACEHOLDER"
         
         # Calculate theoretical FLOPS
         tokens_per_expert = num_tokens * topk / num_experts
@@ -209,17 +370,9 @@ def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: i
         flops_per_expert = 2 * tokens_per_expert * hidden_dim * intermediate_dim
         total_flops = flops_per_expert * num_experts
         
-        if _USE_REAL_FLASHINFER_PATH:
-            # TODO: Replace with actual FlashInfer MoE call
-            pass
-        else:
-            # PLACEHOLDER
-            def run_placeholder():
-                return torch.matmul(data["activations"], data["weights"][0].T)
-        
         # Warmup
         for _ in range(num_warmup):
-            _ = run_placeholder() if not _USE_REAL_FLASHINFER_PATH else None
+            _ = run_fn()
             torch.cuda.synchronize()
         
         # Timed iterations
@@ -227,7 +380,7 @@ def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: i
         start = time.perf_counter()
         
         for _ in range(num_iters):
-            _ = run_placeholder() if not _USE_REAL_FLASHINFER_PATH else None
+            _ = run_fn()
         
         torch.cuda.synchronize()
         end = time.perf_counter()
@@ -242,11 +395,10 @@ def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: i
             "avg_time_ms": avg_time_ms,
             "tokens_per_sec": tokens_per_sec,
             "tokens_per_expert": tokens_per_expert,
-            "is_placeholder": not _USE_REAL_FLASHINFER_PATH,
+            "mode": mode,
         })
         
-        marker = "[PLACEHOLDER]" if not _USE_REAL_FLASHINFER_PATH else ""
-        print(f"\n  Tokens: {num_tokens:3d}  |  Time: {avg_time_ms:8.3f} ms  |  {tokens_per_sec:.0f} tok/s {marker}")
+        print(f"\n  Tokens: {num_tokens:3d}  |  Time: {avg_time_ms:8.3f} ms  |  {tokens_per_sec:.0f} tok/s [{mode}]")
     
     return results
 
