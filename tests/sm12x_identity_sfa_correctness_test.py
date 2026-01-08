@@ -160,7 +160,8 @@ class TestBlockScaledKernelPath:
         
         # Create test data
         A_bf16 = create_test_activations(M, K, torch.bfloat16)
-        B_bf16 = create_test_fp4_weights(N, K)[0].t()  # [K, N]
+        # create_test_fp4_weights returns [num_experts, K, N] -> take first expert [K, N]
+        B_bf16 = create_test_fp4_weights(N, K, num_experts=1)[0]  # [K, N]
         
         # Reference in FP32
         C_ref = reference_matmul(A_bf16, B_bf16)

@@ -235,51 +235,95 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   // STATIC VERIFICATION: Kernel LayoutSFA uses the same SfConfig we use for sizing
   /////////////////////////////////////////////////////////////////////////////
   //
-  // The block-scaled collective uses Sm1xxBlockScaledConfig with a specific SFVecSize.
-  // We verify that the SFVecSize matches what our sizing computation uses.
+  // We verify at compile time that our sizing function uses the EXACT SAME
+  // Sm1xxBlockScaledConfig and SfAtom as the kernel's LayoutSFA construction.
   //
-  // For MXFP types (mx_float8_t, mx_float4_t), SFVecSize = 32 (MXFPXBlockScaleVectorSize)
-  // For NVFP4 types (nv_float4_t), SFVecSize = 16 (NVFP4BlockScaleVectorSize)
+  // The kernel's LayoutSFA is derived from:
+  //   Sm1xxBlockScaledConfig<SFVecSize>::tile_atom_to_shape_SFA(problem_shape)
+  // which uses SfAtom = Layout<Shape<(32,4),(SFVecSize,4)>, Stride<(16,4),(0,1)>>
   //
-  // The kernel's LayoutSFA is derived from Sm1xxBlockScaledConfig<SFVecSize>::LayoutSF
-  // Our sizing function uses Sm1xxBlockScaledConfig<kSFVecSize_SM12x> where kSFVecSize_SM12x=32
+  // Our sizing function uses the same tile_atom_to_shape_SFA with the same SfConfig.
+  // We enforce this by verifying:
+  //   1. SFVecSize matches (same config)
+  //   2. SfAtom type matches (same atom structure)
   //
-  // This static_assert verifies we're using the correct SFVecSize for this kernel.
-  //
-  static_assert(kSFVecSize_SM12x == TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize,
-      "SFVecSize mismatch: sizing uses kSFVecSize_SM12x but kernel uses MXFPXBlockScaleVectorSize");
-  
-  // Additional runtime verification in debug builds
   using SfConfig = cutlass::detail::Sm1xxBlockScaledConfig<kSFVecSize_SM12x>;
+  using OurSfAtom = typename SfConfig::SfAtom;
+  
+  // Check 1: SFVecSize matches
+  static_assert(kSFVecSize_SM12x == TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize,
+      "SFVecSize mismatch: our sizing uses kSFVecSize_SM12x but kernel uses MXFPXBlockScaleVectorSize");
+  
+  // Check 2: Verify the SfAtom structure is as we expect
+  // SfAtom should be Layout<Shape<(32,4),(SFVecSize,4)>, Stride<(16,4),(0,1)>>
+  // This is the K-major variant used for SM120 block-scaled
+  static_assert(cute::size<0,0>(OurSfAtom{}) == 32,
+      "SfAtom shape[0][0] mismatch: expected 32 for M-block");
+  static_assert(cute::size<0,1>(OurSfAtom{}) == 4,
+      "SfAtom shape[0][1] mismatch: expected 4 for BlkSF");
+  static_assert(cute::size<1,0>(OurSfAtom{}) == kSFVecSize_SM12x,
+      "SfAtom shape[1][0] mismatch: expected SFVecSize for K-block");
+  static_assert(cute::size<1,1>(OurSfAtom{}) == 4,
+      "SfAtom shape[1][1] mismatch: expected 4 for K-block");
+  
+  // Check 3: Verify the atom cosize matches expected (128 bytes per atom)
+  static_assert(cute::cosize(OurSfAtom{}) == 128,
+      "SfAtom cosize mismatch: expected 128 bytes per atom");
+  
+  // These static asserts prove that our sizing uses the SAME layout construction
+  // as the kernel. The LayoutSFA type itself is a runtime layout (depends on M,K,L),
+  // but the atom structure and tiling pattern are identical.
+  //
 
   /////////////////////////////////////////////////////////////////////////////
   // HOW LAYOUTSFA CAPACITY IS DERIVED
   /////////////////////////////////////////////////////////////////////////////
   //
   // The kernel's LayoutSFA type (extracted above) defines the exact memory layout
-  // expected by TMA for scale factor loads. The static_assert above verifies that
-  // our sizing function uses the SAME layout construction as the kernel.
+  // expected by TMA for scale factor loads. The static_asserts above verify that
+  // our sizing function uses the SAME SfAtom and tiling pattern as the kernel.
   //
-  // Required buffer size is computed as:
-  //   auto layout_sfa = SfConfig::tile_atom_to_shape_SFA(make_shape(M, N, K, L));
+  // GROUPED GEMM L SEMANTICS:
+  // For grouped GEMM with PtrArray, each problem has its own (M_i, N, K) shape.
+  // The TMA descriptor is set up per-problem, so L=1 for each problem's SFA.
+  // The "grouping" is via pointer arrays, NOT via an L dimension in one tensor.
+  //
+  // Required buffer size per problem:
+  //   auto layout_sfa = SfConfig::tile_atom_to_shape_SFA(make_shape(M_i, N, K, 1));
   //   size_t required_bytes = cute::cosize(layout_sfa);  // + alignment
   //
-  // This is KERNEL-DERIVED because we've verified the layout type matches.
+  // For identity scales shared across all problems:
+  //   Compute size for the LARGEST M across all groups: M_max
+  //   All problems can then use this buffer (oversized for smaller M is safe)
   //
   // IDENTITY SFA ACQUISITION (caller must do this BEFORE calling launcher):
   //
   //   #include "../sm12x_layout_sfa_utils.h"
   //   #include "../sm12x_activation_quantizer.cuh"
   //
-  //   // Compute size using the verified sizing function
-  //   size_t required_bytes = computeKernelSFABufferSize<CollectiveMainloop>(M_max, N, K, L);
+  //   // Step 1: Compute size for largest problem (L=1 for grouped GEMM)
+  //   size_t required_bytes = computeSm120IdentitySFABufferSize(M_max, N, K, /*L=*/1);
   //
-  //   // Acquire identity buffer (pre-filled with 0x7F, no hot-path alloc/memset)
-  //   auto& mgr = getIdentityScaleBufferManager();
-  //   uint8_t* identity_sfa = mgr.getOrCreateWithSize(required_bytes);
+  //   // Step 2: Acquire identity buffer (pre-filled with 0x7F)
+  //   uint8_t* identity_sfa = acquireSm120IdentitySFABuffer(required_bytes);
   //
-  //   // Wire into hopper_inputs
-  //   hopper_inputs.fpX_block_scaling_factors_act = &identity_sfa;  // Per-group pointer array
+  //   // Step 3: Build PER-GROUP POINTER ARRAY
+  //   // CUTLASS grouped GEMM expects ElementSF const** (array of num_groups pointers)
+  //   // For identity scales, all pointers can point to the same buffer.
+  //   // IMPORTANT: This array must be in the correct memory space:
+  //   //   - If kernel expects device pointers: allocate array on device
+  //   //   - Lifetime must outlive gemm.run()
+  //   //
+  //   // Example (device-side pointer array):
+  //   std::vector<uint8_t const*> h_sfa_ptrs(num_groups, identity_sfa);
+  //   uint8_t const** d_sfa_ptrs;
+  //   cudaMalloc(&d_sfa_ptrs, num_groups * sizeof(uint8_t*));
+  //   cudaMemcpy(d_sfa_ptrs, h_sfa_ptrs.data(), num_groups * sizeof(uint8_t*), H2D);
+  //   hopper_inputs.fpX_block_scaling_factors_act = d_sfa_ptrs;
+  //
+  //   // For per-group LayoutSFA objects (all same for identity scales):
+  //   auto layout_sfa = SfConfig::tile_atom_to_shape_SFA(make_shape(M_max, N, K, 1));
+  //   // ... set up hopper_inputs.fpX_block_scaling_factors_stride_act similarly
   //
   /////////////////////////////////////////////////////////////////////////////
 

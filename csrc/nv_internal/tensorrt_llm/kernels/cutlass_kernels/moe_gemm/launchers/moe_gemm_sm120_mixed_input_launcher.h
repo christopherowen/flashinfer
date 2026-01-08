@@ -77,28 +77,50 @@ using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput
 // Callers MUST use these functions to acquire identity SFA buffers before
 // calling the launcher. The launcher does NOT own SFA allocation.
 //
+// GROUPED GEMM L SEMANTICS:
+// For grouped GEMM with PtrArray, each problem has its own (M_i, N, K) shape.
+// The TMA descriptor is set up per-problem, so L=1 for each problem's SFA layout.
+// The "grouping" is via pointer arrays, NOT via an L dimension in the SFA tensor.
+//
+// Therefore: computeSm120IdentitySFABufferSize(M_max, N, K, L=1) gives the buffer
+// size needed for the LARGEST single problem. All problems can share this buffer.
+//
+// POINTER ARRAY MEMORY SPACE:
+// CUTLASS grouped GEMM expects ElementSF const** (device pointer to device pointers).
+// The pointer array MUST be:
+//   - Allocated on device (cudaMalloc)
+//   - Lifetime outlives gemm.run()
+//   - Contains num_groups pointers (all pointing to the same identity buffer is OK)
+//
 // Usage pattern (in the dispatch code that prepares hopper_inputs):
 //
-//   // Step 1: Compute required SFA buffer size (kernel-derived)
-//   size_t sfa_bytes = computeSm120IdentitySFABufferSize(M_max, N, K, num_experts);
+//   // Step 1: Compute size for largest problem (L=1 for grouped GEMM)
+//   size_t sfa_bytes = computeSm120IdentitySFABufferSize(M_max, N, K, /*L=*/1);
 //
 //   // Step 2: Acquire pre-filled identity buffer (no hot-path alloc/memset)
 //   uint8_t* identity_sfa = acquireSm120IdentitySFABuffer(sfa_bytes);
 //
-//   // Step 3: Set up per-group pointer array (all groups use same identity buffer)
-//   // Note: For grouped GEMM, you need a pointer array with one pointer per group
-//   std::vector<uint8_t const*> sfa_ptrs(num_experts, identity_sfa);
-//   hopper_inputs.fpX_block_scaling_factors_act = sfa_ptrs.data();
+//   // Step 3: Build DEVICE-SIDE per-group pointer array
+//   // All pointers point to the same identity buffer (safe because all 0x7F)
+//   std::vector<uint8_t const*> h_sfa_ptrs(num_groups, identity_sfa);
+//   uint8_t const** d_sfa_ptrs;
+//   cudaMalloc(&d_sfa_ptrs, num_groups * sizeof(uint8_t*));
+//   cudaMemcpyAsync(d_sfa_ptrs, h_sfa_ptrs.data(), num_groups * sizeof(uint8_t*),
+//                   cudaMemcpyHostToDevice, stream);
+//   hopper_inputs.fpX_block_scaling_factors_act = d_sfa_ptrs;
 //
 //   // Step 4: Call launcher
 //   sm120_mixed_input_moe_gemm_kernelLauncher(...);
 //
+//   // NOTE: d_sfa_ptrs lifetime must outlive gemm.run()!
+//   // Consider caching/pooling the pointer array.
+//
 
 // Compute required SFA buffer size for identity scales
 // This is kernel-derived: uses the same Sm1xxBlockScaledConfig as the kernel
-// M_max: Maximum M across all groups in grouped GEMM
+// M_max: Maximum M across all groups (use largest problem size)
 // N, K: Problem dimensions
-// L: Number of groups (experts)
+// L: Should be 1 for grouped GEMM (grouping is via pointer arrays, not L dimension)
 size_t computeSm120IdentitySFABufferSize(int64_t M_max, int64_t N, int64_t K, int64_t L = 1);
 
 // Acquire identity SFA buffer of the given size
