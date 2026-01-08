@@ -20,6 +20,16 @@
  *
  * This kernel is designed for small batch sizes (M<=16) where the grouped GEMM
  * kernel's 128x128 tiles result in poor compute efficiency.
+ *
+ * Uses CUTLASS GemvBlockScaled kernel with:
+ * - ElementA: float_e2m1_t (FP4 e2m1, activations, quantized from BF16)
+ * - ElementB: float_e2m1_t (FP4 e2m1, weights)
+ * - ElementC/D: bfloat16_t (output)
+ * - Block scaling with SFVecSize=16
+ *
+ * CURRENT STATUS:
+ * - Phase 1: Software dequant fallback (IMPLEMENTED, ~7 tok/s)
+ * - Phase 2: CUTLASS GemvBlockScaled native (TODO, target ~58 tok/s)
  */
 
 #include <cuda.h>
@@ -28,6 +38,12 @@
 
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
+
+// For CUTLASS GemvBlockScaled (Phase 2)
+// #include "cutlass/gemm/device/gemv_blockscaled.h"
+// #include "cutlass/gemm/kernel/gemv_blockscaled.h"
+// #include "cutlass/epilogue/threadblock/epilogue_with_scaling_factor.h"
+// #include "cutlass/detail/sm100_blockscaled_layout.hpp"
 
 // TVM FFI bindings
 #include "../tvm_ffi_utils.h"
@@ -39,6 +55,10 @@ namespace gemv {
 
 // Configuration constants
 static constexpr int kBlockSize = 32;  // MXFP4 block size for scale factors
+
+//==============================================================================
+// Software Dequantization Fallback (Phase 1)
+//==============================================================================
 
 /*!
  * \brief Simple FP4 dequantization for GEMV fallback
@@ -103,9 +123,7 @@ __global__ void gemv_fp4_dequant_kernel(
         uint8_t b_scale_bits = B_scales[n_block * num_k_blocks + k_block];
         
         // Simple FP8 e4m3 to float conversion
-        // Format: 1 sign, 4 exponent, 3 mantissa
         auto fp8_to_float = [](uint8_t bits) -> float {
-            // Quick conversion via cuda intrinsic if available
             __nv_fp8_e4m3 fp8;
             memcpy(&fp8, &bits, 1);
             return float(fp8);
@@ -160,8 +178,38 @@ cudaError_t run_gemv_fp4_dequant(
     return cudaGetLastError();
 }
 
+//==============================================================================
+// CUTLASS GemvBlockScaled Native (Phase 2) - TODO
+//==============================================================================
+
+/*
+ * Phase 2 implementation will use CUTLASS GemvBlockScaled directly:
+ *
+ * using ElementA = cutlass::float_e2m1_t;  // FP4
+ * using ElementB = cutlass::float_e2m1_t;  // FP4
+ * using ElementC = cutlass::bfloat16_t;
+ * using ElementD = cutlass::bfloat16_t;
+ * using ElementAccumulator = float;
+ * using ElementSFA = cutlass::float_e4m3_t;  // FP8 scale
+ * using ElementSFB = cutlass::float_e4m3_t;  // FP8 scale
+ * 
+ * static constexpr int kElementsPerAccess = 32;  // Fixed for FP4
+ * static constexpr int kThreadCount = 128;
+ * static constexpr int kThreadsPerRow = 16;
+ * static constexpr int kSFVecSize = 16;
+ *
+ * This requires:
+ * 1. Custom epilogue for BF16 output with scale factor
+ * 2. Proper scale factor layout matching MXFP4 format
+ * 3. Integration with FlashInfer's activation quantization
+ */
+
 }  // namespace gemv
 }  // namespace flashinfer
+
+//==============================================================================
+// TVM FFI Bindings
+//==============================================================================
 
 /*!
  * \brief TVM FFI function for FP4 GEMV
