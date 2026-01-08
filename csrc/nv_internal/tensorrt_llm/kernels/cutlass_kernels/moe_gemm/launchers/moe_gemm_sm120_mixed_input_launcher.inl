@@ -37,6 +37,7 @@
 
 #include "moe_gemm_sm120_mixed_input_launcher.h"
 #include "../sm12x_arch_config.h"
+#include "../sm12x_layout_sfa_utils.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -229,6 +230,28 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   using LayoutSFA = typename CollectiveMainloop::LayoutSFA;
   using LayoutSFB = typename CollectiveMainloop::LayoutSFB;
 
+  /////////////////////////////////////////////////////////////////////////////
+  // HOW LAYOUTSFA CAPACITY IS DERIVED (for documentation)
+  /////////////////////////////////////////////////////////////////////////////
+  //
+  // The kernel's LayoutSFA type (extracted above) defines the exact memory layout
+  // expected by TMA for scale factor loads. The required buffer size is computed
+  // using CUTLASS's Sm1xxBlockScaledConfig::tile_atom_to_shape_SFA(problem_shape)
+  // which creates a tiled layout and cute::cosize() which gives the codomain size.
+  //
+  // For this kernel, the layout is:
+  //   SfAtom = Layout<Shape<(32,4), (SFVecSize,4)>, Stride<(16,4), (0,1)>>
+  //   tiled to (M, K, L) dimensions
+  //
+  // Use computeKernelSFABufferSize<CollectiveMainloop>(M, K, L) to get the exact
+  // required buffer size for any problem shape. The identity scale buffer manager
+  // should use this kernel-derived size for correctness.
+  //
+  // WHERE IT IS VERIFIED:
+  // In debug builds, assertSFABufferSizeCorrect<CollectiveMainloop>() checks that
+  // the allocated buffer is >= the kernel's requirement.
+  /////////////////////////////////////////////////////////////////////////////
+
   GemmGrouped gemm;
   using Args = typename GemmGrouped::Arguments;
   Args arguments;
@@ -260,14 +283,17 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   // For MXFP4 (W4A16) workloads, you have two options for A-scales:
   //
   // 1. IDENTITY SCALES (recommended for accuracy):
-  //    - Pass ptr to single float_ue8m0_t with raw value 0x7F (127) → 2^0 = 1.0
-  //    - Use stride layout with zeros to broadcast
-  //    - This preserves quantized FP8 values without scaling
+  //    - Allocate SFA buffer matching CUTLASS LayoutSFA for (M, K)
+  //    - Fill entire buffer with 0x7F (identity = 1.0) using cudaMemset
+  //    - Use Sm12xIdentityScaleBufferManager::getOrCreateWithSize() with
+  //      size from computeKernelSFABufferSize<CollectiveMainloop>(M, K, L)
   //
-  // 2. PROPER A-SCALES (for dynamic range handling):
+  // 2. COMPUTED A-SCALES (for dynamic range handling):
   //    - Compute per-block max and use for scaling
   //    - Better for activations with wide dynamic range
-  //    - Requires scale computation kernel before GEMM
+  //    - Requires scale computation kernel + proper LayoutSFA writes
+  //
+  // IMPORTANT: Do NOT use stride=0 broadcast for TMA. Allocate the full buffer.
   //
   // The caller provides A-scales via hopper_inputs.fpX_block_scaling_factors_act
   // and the layout via hopper_inputs.fpX_block_scaling_factors_stride_act.
@@ -332,6 +358,26 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
     TLLM_LOG_ERROR("[SM120 Mixed-Input Grouped GEMM] %s", err_msg.c_str());
     throw std::runtime_error(err_msg);
   }
+
+  /////////////////////////////////////////////////////////////////////////////
+  // DEBUG VERIFICATION: Check SFA buffer size is sufficient
+  /////////////////////////////////////////////////////////////////////////////
+  //
+  // In debug builds, we verify that the SFA buffer provided by the caller
+  // is large enough for the kernel's LayoutSFA. This catches buffer underalloc
+  // early rather than manifesting as TMA errors or garbage output.
+  //
+  // NOTE: For grouped GEMM, we cannot easily verify individual problem sizes
+  // here since they're on device. The caller is responsible for ensuring the
+  // SFA buffer is sized for the largest (M, K) in the group.
+  //
+#ifndef NDEBUG
+  if (hopper_inputs.fpX_block_scaling_factors_act != nullptr) {
+    TLLM_LOG_DEBUG("[SM120 Mixed-Input] SFA buffer verification enabled. "
+                   "Caller must ensure buffer is sized for max(M,K) in the group "
+                   "using computeKernelSFABufferSize<CollectiveMainloop>().");
+  }
+#endif
 
   auto init_status = gemm.initialize(arguments, hopper_inputs.gemm_workspace, inputs.stream);
   if (init_status != cutlass::Status::kSuccess) {

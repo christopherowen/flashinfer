@@ -57,12 +57,12 @@
 #include <unordered_map>
 #include <algorithm>
 #include <type_traits>
+#include <cstring>  // For std::memcpy in vectorized kernel
 
 #include "sm12x_arch_config.h"
 
-// CUTLASS headers for LayoutSFA computation
-#include "cutlass/detail/sm100_blockscaled_layout.hpp"
-#include "cute/layout.hpp"
+// SM12x LayoutSFA utilities (CUTLASS-derived sizing)
+#include "sm12x_layout_sfa_utils.h"
 
 namespace tensorrt_llm {
 namespace kernels {
@@ -139,54 +139,49 @@ static constexpr uint8_t kIdentityScaleRaw = kSm12xIdentityScaleRaw;  // 0x7F
 // actual requirement. If you see TMA errors or scale misreads, verify the
 // computed size matches the kernel's actual LayoutSFA capacity.
 
+// =============================================================================
+// Sm12xLayoutSFASizes - Wrapper around CUTLASS-derived LayoutSFA utilities
+// =============================================================================
+//
+// This struct provides backward-compatible sizing APIs that delegate to
+// Sm12xLayoutSFAUtils for CUTLASS-derived buffer sizes.
+//
+// IMPORTANT: For the most accurate sizing, use the launcher's kernel-derived
+// size (computeKernelSFABufferSize<CollectiveMainloop>) when available.
+// This fallback is conservative and should always be >= the kernel's requirement.
+
 struct Sm12xLayoutSFASizes {
-    static constexpr int kSFVecSize = 32;  // Scale factor vector size (K dimension grouping)
-    static constexpr int kBlkMN = 128;     // Block size in M/N dimension
-    static constexpr int kBlkSF = 4;       // Scale factors per K-block in the swizzled layout
-    static constexpr int kAtomSize = 128;  // Size of one SfAtom in bytes (32 * 4)
+    // Constants from the utility header
+    static constexpr int kSFVecSize = kSFVecSize_SM12x;  // 32
+    static constexpr int kBlkMN = kBlkMN_SM12x;          // 128
+    static constexpr int kBlkSF = kBlkSF_SM12x;          // 4
+    static constexpr int kAtomSize = 128;                // Size of one SfAtom in bytes (32 * 4)
     
-    // Compute buffer size for SFA (in bytes)
-    // This MUST match CUTLASS's LayoutSFA capacity for the instantiated kernel!
+    // Compute buffer size for SFA (in bytes) using CUTLASS LayoutSFA APIs
+    // This delegates to Sm12xLayoutSFAUtils for CUTLASS-derived sizing
     static size_t computeSFABufferSize(int M, int K, int L = 1) {
-        // Number of complete 128-element blocks in M
-        int num_m_blocks = (M + kBlkMN - 1) / kBlkMN;
-        
-        // Number of complete 32-element blocks in K  
-        int num_k_blocks = (K + kSFVecSize - 1) / kSFVecSize;
-        
-        // Each (m_block, k_block) pair needs kBlkSF=4 scale factor bytes in the atom
-        // The SfAtom layout packs 32 * 4 = 128 bytes per "atom unit"
-        // Total atoms = ceil(num_m_blocks / 32) * num_k_blocks (due to 32x4 atom shape)
-        //
-        // Actually, from the CUTLASS layout:
-        //   SfAtom shape = ((32,4), (SFVecSize, 4)) 
-        //   Total elements per atom = 32 * 4 = 128 for M, SFVecSize * 4 for K
-        //   But each scale is 1 byte, so atom capacity = 32 * 4 = 128 bytes
-        //
-        // For tile_to_shape(SfAtom, (M, K, L)):
-        //   M dimension tiles by 128 (Blk_MN), each needs 128 bytes
-        //   K dimension tiles by SFVecSize*Blk_SF = 128
-        //   So: ceil(M/128) * ceil(K/128) * 128 bytes
-        
-        int num_k_atoms = (K + (kSFVecSize * kBlkSF) - 1) / (kSFVecSize * kBlkSF);
-        size_t capacity = static_cast<size_t>(num_m_blocks) * num_k_atoms * kAtomSize * L;
-        
-        // Align to 256 bytes for TMA
-        return (capacity + 255) & ~size_t(255);
+        return Sm12xLayoutSFAUtils::computeBufferSize(M, K, L);
     }
     
-    // Stride is complex due to swizzling. For identity mode we don't actually
-    // need the stride since all values are the same, but we provide a compatible
-    // value for the kernel's expected layout.
+    // Stride for the layout (for legacy compatibility)
+    // NOTE: LayoutSFA is complex/swizzled. For identity scales (all same value),
+    // the actual stride doesn't matter for correctness. This returns a compatible
+    // value for APIs that require a stride parameter.
     static int computeSFAStride(int M, int K) {
+        // Each M-block of 128 elements has (K/128) atoms of 128 bytes each
         int num_k_atoms = (K + (kSFVecSize * kBlkSF) - 1) / (kSFVecSize * kBlkSF);
         return num_k_atoms * kAtomSize;  // Stride in bytes between M-blocks
     }
     
-    // Verify buffer size matches expected for known shapes (call at init for sanity check)
+    // Verify buffer size matches expected for known shapes
     static bool verifySizeForShape(int M, int K, size_t expected_bytes) {
         size_t computed = computeSFABufferSize(M, K);
         return computed >= expected_bytes;
+    }
+    
+    // Get a cache key for the given dimensions
+    static uint64_t getCacheKey(int M, int K, int L = 1) {
+        return Sm12xLayoutSFAUtils::getCacheKey(M, K, L);
     }
 };
 
@@ -285,20 +280,16 @@ __global__ void quantize_activation_to_fp8_vectorized_kernel(
     if (vec_idx >= num_vecs) return;
     
     int base_idx = vec_idx * kVecSize;
-    __nv_fp8_e4m3 output_buf[kVecSize];
+    
+    // Use alignas(8) to guarantee 64-bit alignment for vectorized store
+    alignas(8) __nv_fp8_e4m3 output_buf[kVecSize];
     
     // Load directly from global memory and convert
-    // Using if constexpr with cuda type traits for proper dispatch
-    if constexpr (sizeof(InputType) == sizeof(__nv_bfloat16)) {
-        convert_bf16x8_to_fp8x8_global(
-            reinterpret_cast<const __nv_bfloat16*>(input + base_idx),
-            output_buf
-        );
-    } else if constexpr (sizeof(InputType) == sizeof(__half)) {
-        convert_fp16x8_to_fp8x8_global(
-            reinterpret_cast<const __half*>(input + base_idx),
-            output_buf
-        );
+    // Use std::is_same_v for proper type dispatch (not sizeof comparison)
+    if constexpr (std::is_same_v<InputType, __nv_bfloat16>) {
+        convert_bf16x8_to_fp8x8_global(input + base_idx, output_buf);
+    } else if constexpr (std::is_same_v<InputType, __half>) {
+        convert_fp16x8_to_fp8x8_global(input + base_idx, output_buf);
     } else {
         // Generic fallback for other types
         #pragma unroll
@@ -307,11 +298,12 @@ __global__ void quantize_activation_to_fp8_vectorized_kernel(
         }
     }
     
-    // Store 8 bytes (can use 64-bit store)
-    // Use uint2 for aligned 64-bit store
-    uint2* dst64 = reinterpret_cast<uint2*>(output + base_idx);
-    const uint2* src64 = reinterpret_cast<const uint2*>(output_buf);
-    *dst64 = *src64;
+    // Aligned 64-bit store (output_buf is alignas(8) so this is safe)
+    // Output pointer is also 8-byte aligned at base_idx since base_idx = vec_idx * 8
+    // and FP8 is 1 byte, so output + base_idx is at an 8-byte boundary
+    uint64_t packed;
+    std::memcpy(&packed, output_buf, sizeof(uint64_t));
+    *reinterpret_cast<uint64_t*>(output + base_idx) = packed;
 }
 
 // Tail kernel for remaining elements (called after vectorized kernel)
@@ -369,12 +361,68 @@ struct Sm12xIdentityScaleBufferKeyHash {
 
 class Sm12xIdentityScaleBufferManager {
 public:
-    // Get or create an identity scale buffer for given dimensions
-    // Uses CUTLASS LayoutSFA-compatible sizing
-    // Returns pointer to device buffer filled with 0x7F (identity scale)
+    // ==========================================================================
+    // PRIMARY API: getOrCreateWithSize (kernel-derived size)
+    // ==========================================================================
     //
-    // NOTE: Buffer fill uses BLOCKING cudaMemset on default stream (one-time cost).
-    // This ensures the buffer is globally visible without per-call stream sync.
+    // Use this API when you have the kernel-derived buffer size from the launcher.
+    // This is the CORRECT way to allocate SFA buffers that match CUTLASS's LayoutSFA.
+    //
+    // The launcher computes the exact required size using:
+    //   size_t required_bytes = computeKernelSFABufferSize<CollectiveMainloop>(M, K, L);
+    //
+    // Then calls:
+    //   uint8_t* sfa = manager.getOrCreateWithSize(required_bytes);
+    //
+    // The buffer is cached by (device_id, required_bytes) to avoid re-allocation.
+    
+    uint8_t* getOrCreateWithSize(size_t required_bytes) {
+        // Get current device
+        int device_id = 0;
+        cudaGetDevice(&device_id);
+        
+        // Use required_bytes directly as the cache key (no ambiguity)
+        uint64_t cache_key = (static_cast<uint64_t>(device_id) << 48) | required_bytes;
+        
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        auto it = size_based_buffers_.find(cache_key);
+        if (it != size_based_buffers_.end()) {
+            return it->second;
+        }
+        
+        // Ensure we're on the correct device
+        cudaSetDevice(device_id);
+        
+        uint8_t* d_buffer = nullptr;
+        cudaError_t err = cudaMalloc(&d_buffer, required_bytes);
+        if (err != cudaSuccess) {
+            return nullptr;
+        }
+        
+        // Fill with identity scale value (0x7F) using BLOCKING memset
+        // This is a one-time cost at buffer creation and ensures global visibility
+        // without requiring stream synchronization in the hot path.
+        err = cudaMemset(d_buffer, kIdentityScaleRaw, required_bytes);
+        if (err != cudaSuccess) {
+            cudaFree(d_buffer);
+            return nullptr;
+        }
+        
+        size_based_buffers_[cache_key] = d_buffer;
+        return d_buffer;
+    }
+    
+    // ==========================================================================
+    // FALLBACK API: getOrCreate (dimension-based, uses conservative sizing)
+    // ==========================================================================
+    //
+    // Use this when you don't have the kernel-derived size (e.g., pre-warming).
+    // This uses Sm12xLayoutSFASizes::computeSFABufferSize which is conservative.
+    //
+    // NOTE: The buffer may be larger than strictly necessary, but that's safe.
+    // For identity scales (all 0x7F), oversizing has no correctness impact.
+    
     uint8_t* getOrCreate(int M, int K, int sf_vec_size = 32) {
         // Get current device
         int device_id = 0;
@@ -397,7 +445,7 @@ public:
         // Ensure we're on the correct device
         cudaSetDevice(device_id);
         
-        // Use CUTLASS LayoutSFA-compatible sizing
+        // Use CUTLASS LayoutSFA-compatible sizing (conservative)
         size_t buffer_size = Sm12xLayoutSFASizes::computeSFABufferSize(M, K);
         uint8_t* d_buffer = nullptr;
         
@@ -407,8 +455,6 @@ public:
         }
         
         // Fill with identity scale value (0x7F) using BLOCKING memset
-        // This is a one-time cost at buffer creation and ensures global visibility
-        // without requiring stream synchronization in the hot path.
         err = cudaMemset(d_buffer, kIdentityScaleRaw, buffer_size);
         if (err != cudaSuccess) {
             cudaFree(d_buffer);
@@ -425,6 +471,13 @@ public:
     void prewarm(const std::vector<std::pair<int, int>>& shapes, int sf_vec_size = 32) {
         for (const auto& [M, K] : shapes) {
             getOrCreate(M, K, sf_vec_size);
+        }
+    }
+    
+    // Pre-warm with kernel-derived sizes (preferred when you know the exact sizes)
+    void prewarmWithSizes(const std::vector<size_t>& required_sizes) {
+        for (size_t size : required_sizes) {
+            getOrCreateWithSize(size);
         }
     }
     
@@ -456,13 +509,23 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         for (auto& pair : buffers_) {
             if (pair.second) {
-                // Set device before freeing
                 cudaSetDevice(pair.first.device_id);
                 cudaFree(pair.second);
             }
         }
         buffers_.clear();
         buffer_sizes_.clear();
+        
+        // Also clear size-based buffers
+        for (auto& pair : size_based_buffers_) {
+            if (pair.second) {
+                // Extract device_id from cache key
+                int dev = static_cast<int>(pair.first >> 48);
+                cudaSetDevice(dev);
+                cudaFree(pair.second);
+            }
+        }
+        size_based_buffers_.clear();
     }
     
     ~Sm12xIdentityScaleBufferManager() {
@@ -470,8 +533,14 @@ public:
     }
 
 private:
+    // Dimension-based cache (fallback API)
     std::unordered_map<Sm12xIdentityScaleBufferKey, uint8_t*, Sm12xIdentityScaleBufferKeyHash> buffers_;
     std::unordered_map<Sm12xIdentityScaleBufferKey, size_t, Sm12xIdentityScaleBufferKeyHash> buffer_sizes_;
+    
+    // Size-based cache (primary API with kernel-derived sizes)
+    // Key: (device_id << 48) | required_bytes
+    std::unordered_map<uint64_t, uint8_t*> size_based_buffers_;
+    
     std::mutex mutex_;
 };
 
