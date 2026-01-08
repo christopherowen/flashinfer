@@ -782,23 +782,30 @@ SM120_TILE_SHAPES = {
     # More tile shapes = better coverage for different problem sizes
     # Fewer tile shapes = faster JIT compilation and smaller cache
     #
-    # Current config targets ~80 total kernel variants (before swap_ab/fusion):
-    # NVFP4: 3 × 4 × 1 = 12 shapes
-    # FP8xFP4: 2 × 3 × 1 = 6 shapes
-    # Total base: 18 shapes × 2 otypes × 2 fusions × 2 swap_ab = ~144 kernels
+    # IMPORTANT: SM120 block-scaled GEMM has strict tile constraints:
+    # 1. M,N must be MULTIPLES of 128 (Blk_MN) - TMA layout requirement
+    # 2. K dimension in config is BYTES, converted to elements based on dtype:
+    #    - FP4 (4 bits): 128 bytes → 256 elements
+    #    - FP8 (8 bits): 128 bytes → 128 elements
+    # 3. Large tile shapes (M=256 or N=256 with K=256 elements for FP4) may cause
+    #    Stages to drop to 1, which is not supported by the kernel builder.
+    #
+    # Currently only (128, 128, 128B) is validated to work for NVFP4:
+    # - Tile shape becomes (128, 128, 256) in elements for FP4
+    # - This size allows 2+ pipeline stages
     #
     # NVFP4 (FP4 x FP4): Same-type block-scaled GEMM
     "nvfp4": {
-        "M_TILES": [64, 128, 256],  # 64=decode, 128/256=prefill
-        "N_TILES": [64, 128, 192, 256],  # 192 for 2880, reduced from 5 to 4
-        "K_TILES": [128],  # K=128 sufficient for most cases
+        "M_TILES": [128],  # Only 128 currently validated for FP4
+        "N_TILES": [128],  # Only 128 currently validated for FP4
+        "K_TILES": [128],  # 128 bytes = 256 FP4 elements
     },
     # FP8xFP4: Mixed-input with FP8 activations, FP4 weights
     # Also used for MXFP4 after bf16/fp16 -> FP8 quantization
     "fp8xfp4": {
-        "M_TILES": [64, 128],  # 64=decode TPS, 128=prefill
-        "N_TILES": [64, 128, 192],  # 192 for 2880 (2880%192=0)
-        "K_TILES": [128],  # K=128 is the sweet spot
+        "M_TILES": [128],  # Only 128 currently validated
+        "N_TILES": [128],  # Only 128 currently validated
+        "K_TILES": [128],  # 128 bytes = 256 FP4 elements for weight
     },
     # NOTE: MXFP4 is NOT registered at kernel level.
     # SM120 MMA only supports FP8/FP6/FP4 inputs. For MXFP4 (W4A16) with
@@ -839,6 +846,17 @@ def is_gemm_op_valid_sm120(op):
     # Cluster 1x1x1 only in current FlashInfer/CUTLASS SM12x path
     # (software limitation, not necessarily hardware constraint)
     if cga_m != 1 or cga_n != 1 or cga_k != 1:
+        return False
+    
+    # SM120 block-scaled GEMM requires M,N to be multiples of 128 (Blk_MN)
+    # The CUTLASS SM120 builder computes SMEM layout as:
+    #   size<dim>(TileShape) / Blk_MN
+    # When tile is not divisible by 128, the layout construction breaks:
+    # - tile < 128: division yields 0
+    # - tile not divisible by 128: TMA layout composition fails with
+    #   "Shape Divisibility Condition" error
+    SM120_BLK_MN = 128
+    if tile_m % SM120_BLK_MN != 0 or tile_n % SM120_BLK_MN != 0:
         return False
     
     # Determine operation type

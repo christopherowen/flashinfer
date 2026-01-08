@@ -23,6 +23,7 @@
 #include "cute/tensor.hpp"
 #include "cutlass/array.h"
 #include "cutlass/cutlass.h"
+#include "cutlass/float_subbyte.h"  // Required for sizeof_bits<float_e2m1_t> = 4 bits
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/epilogue/collective/default_epilogue.hpp"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -63,6 +64,21 @@
 namespace tensorrt_llm::kernels::cutlass_kernels_oss {
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
+
+/* Helper to get sizeof_bits for a type, with explicit handling for FP4.
+ * This is needed because TllmToCutlassTypeAdapter might fall back to the default
+ * template if the FP4 specialization isn't visible (due to include order issues). */
+template <typename T>
+struct GetSizeofBitsForDispatch {
+  using CutlassT = typename kernels::cutlass_kernels::TllmToCutlassTypeAdapter<T>::type;
+  static constexpr int value = cutlass::sizeof_bits<CutlassT>::value;
+};
+#if defined(ENABLE_FP4)
+template <>
+struct GetSizeofBitsForDispatch<__nv_fp4_e2m1> {
+  static constexpr int value = 4;  // FP4 = 4 bits, explicit to avoid include order issues
+};
+#endif
 
 template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
           EpilogueFusion FUSION, typename TileShape, typename ClusterShape, bool is_wfp4afp8>
@@ -292,10 +308,18 @@ constexpr bool are_tile_shapes_supported_sm120() {
   constexpr auto TileN = size<1>(CtaShape{});
   constexpr auto TileK = size<2>(CtaShape{});
 
-  return (TileM == 128 && TileN == 128 && TileK == 128) ||
-         (TileM == 128 && TileN == 128 && TileK == 256) ||
-         (TileM == 128 && TileN == 256 && TileK == 128) ||
-         (TileM == 256 && TileN == 128 && TileK == 128);
+  // SM120 block-scaled GEMM has strict tile constraints:
+  // 1. M,N must be MULTIPLES of 128 (Blk_MN) - TMA layout requirement
+  // 2. K dimension in TileShape is in ELEMENTS, but the tile config is in BYTES:
+  //    - FP4 (4 bits): 128 bytes → 256 elements
+  //    - FP8 (8 bits): 128 bytes → 128 elements
+  // 3. Large tile shapes (M=256 or N=256 with K=256 for FP4) cause Stages to drop
+  //    to 1, which is not supported by the kernel builder.
+  //
+  // Currently only (128, 128, 128B) is instantiated and validated:
+  // - For FP4: becomes (128, 128, 256) in elements
+  // - For FP8: becomes (128, 128, 128) in elements
+  return (TileM == 128 && TileN == 128 && (TileK == 128 || TileK == 256));
 }
 
 /*
@@ -390,10 +414,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
 
 #define SHAPE_CASE(SMVERSION, M, N, K)                                                            \
   case cutlass_extensions::CutlassTileConfigSM##SMVERSION::CtaShape##M##x##N##x##K##B: {          \
-    constexpr int KtileBytes =                                                                    \
-        (K * 8) /                                                                                 \
-        cutlass::sizeof_bits<                                                                     \
-            typename kernels::cutlass_kernels::TllmToCutlassTypeAdapter<T>::type>::value;         \
+    constexpr int KtileBytes = (K * 8) / GetSizeofBitsForDispatch<T>::value;                      \
     using KTileDim = Int<KtileBytes>;                                                             \
     using TileShape = Shape<_##M, _##N, KTileDim>;                                                \
     dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized<                                          \

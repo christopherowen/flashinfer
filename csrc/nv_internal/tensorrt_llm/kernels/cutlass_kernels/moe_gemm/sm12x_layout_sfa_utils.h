@@ -133,24 +133,23 @@ struct Sm12xLayoutSFAUtils {
     
     // Fallback computation without CUTLASS headers
     // This matches the CUTLASS layout structure based on documentation
+    // 
+    // SfAtom shape: ((32,4), (SFVecSize,4)) with stride ((16,4), (0,1))
+    // The cosize of this atom is 512 bytes (32*16 for K-major layout)
     static size_t computeBufferSizeFallback(int M, int K, int L = 1) {
         // Number of 128-element blocks in M dimension
         int num_m_blocks = (M + kBlkMN_SM12x - 1) / kBlkMN_SM12x;
         
-        // Number of 32-element blocks in K dimension
-        int num_k_blocks = (K + kSFVecSize_SM12x - 1) / kSFVecSize_SM12x;
+        // Number of (SFVecSize * 4 = 128)-element atoms in K dimension
+        // Each K-atom covers 128 K elements
+        int num_k_atoms = (K + (kSFVecSize_SM12x * kBlkSF_SM12x) - 1) / (kSFVecSize_SM12x * kBlkSF_SM12x);
         
-        // Each (m_block, k_block) pair needs 4 scale factors (kBlkSF_SM12x)
-        // The atom structure is (32,4) x (SFVecSize,4) with specific strides
-        // Total elements per atom = 32 * 4 = 128 bytes
-        size_t sfa_elements = static_cast<size_t>(num_m_blocks) * num_k_blocks * 
-                              kBlkSF_SM12x * L;
-        
-        // Multiply by atom factor (32 elements per block in M)
-        sfa_elements *= 32;
+        // SfAtom cosize is 512 bytes per atom (K-major layout)
+        // Total = num_m_blocks * num_k_atoms * 512 * L
+        size_t sfa_bytes = static_cast<size_t>(num_m_blocks) * num_k_atoms * 512 * L;
         
         // Align to 256 bytes for TMA
-        return (sfa_elements + 255) & ~size_t(255);
+        return (sfa_bytes + 255) & ~size_t(255);
     }
     
     // Verify computed size against CUTLASS layout (debug only)

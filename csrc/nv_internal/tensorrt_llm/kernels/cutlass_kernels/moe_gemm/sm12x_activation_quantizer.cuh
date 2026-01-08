@@ -158,8 +158,9 @@ struct Sm12xLayoutSFASizes {
     
     // Compute buffer size for SFA (in bytes) using CUTLASS LayoutSFA APIs
     // This delegates to Sm12xLayoutSFAUtils for CUTLASS-derived sizing
+    // Explicitly use 4-arg version to avoid ambiguity (N=0 for SFA since it doesn't depend on N)
     static size_t computeSFABufferSize(int M, int K, int L = 1) {
-        return Sm12xLayoutSFAUtils::computeBufferSize(M, K, L);
+        return Sm12xLayoutSFAUtils::computeBufferSize(M, 0, K, L);
     }
     
     // Stride for the layout (for legacy compatibility)

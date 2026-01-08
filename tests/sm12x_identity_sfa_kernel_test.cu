@@ -46,6 +46,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <cuda_fp4.h>  // For __nv_fp4_e2m1
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -502,7 +503,7 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     // Step 3: Get device-side pointer arrays for identity scales
     // =========================================================================
     
-    auto& ptr_mgr = getSFAPointerArrayManager();
+    auto& ptr_mgr = tensorrt_llm::kernels::cutlass_kernels::getSFAPointerArrayManager();
     uint8_t const** d_sfa_ptrs_identity = ptr_mgr.getOrCreate(num_groups, identity_sfa);
     uint8_t const** d_sfb_ptrs_identity = ptr_mgr.getOrCreate(num_groups, identity_sfb);
     
@@ -637,7 +638,7 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     size_t workspace_size = 0;
     
     // Query workspace size first
-    GroupedGemmInput<__nv_fp8_e4m3, uint8_t, nv_bfloat16, nv_bfloat16> inputs_query;
+    GroupedGemmInput<__nv_fp8_e4m3, __nv_fp4_e2m1, nv_bfloat16, nv_bfloat16> inputs_query;
     inputs_query.stream = 0;
     inputs_query.num_experts = num_groups;
     inputs_query.num_rows = M_per_group;
@@ -645,10 +646,10 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     inputs_query.k = K;
     
     TmaWarpSpecializedGroupedGemmInput hopper_inputs_query;
-    hopper_inputs_query.shape_info = TmaWarpSpecializedGroupedGemmInput::ProblemShape(
-        cute::make_shape(int64_t(M_per_group), int64_t(N), int64_t(K)),
-        num_groups
-    );
+    // GroupProblemShape is a struct with public members, not constructor-based
+    hopper_inputs_query.shape_info.num_groups = num_groups;
+    hopper_inputs_query.shape_info.problem_shapes = nullptr;  // Set later if needed
+    hopper_inputs_query.shape_info.host_problem_shapes = nullptr;
     
     // Get SM count
     int device;
@@ -658,9 +659,11 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     int sm_count = props.multiProcessorCount;
     
     // Call launcher with workspace_size query mode
+    // NOTE: WeightType must be __nv_fp4_e2m1 (not uint8_t) so TllmToCutlassTypeAdapter
+    // converts it to cutlass::float_e2m1_t, which CUTLASS MMA expects.
     sm120_mixed_input_moe_gemm_kernelLauncher<
         __nv_fp8_e4m3,     // T (ElementAInput, but ptr_act contains FP8)
-        uint8_t,           // WeightType (FP4 packed as uint8)
+        __nv_fp4_e2m1,     // WeightType (NVFP4 type, converted to cutlass::float_e2m1_t)
         nv_bfloat16,       // GemmOutputType
         cutlass::epilogue::NoSmemWarpSpecialized,  // EpilogueTag
         cute::Shape<cute::_64, cute::_128, cute::_128>,  // CTAShape
@@ -696,15 +699,15 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     hopper_inputs.fpX_block_scaling_factors_stride_weight = d_layout_sfb;
     hopper_inputs.fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
     
-    hopper_inputs.shape_info = TmaWarpSpecializedGroupedGemmInput::ProblemShape(
-        cute::make_shape(int64_t(M_per_group), int64_t(N), int64_t(K)),
-        num_groups
-    );
+    // GroupProblemShape is a struct with public members, not constructor-based
+    hopper_inputs.shape_info.num_groups = num_groups;
+    hopper_inputs.shape_info.problem_shapes = nullptr;  // Set later if needed
+    hopper_inputs.shape_info.host_problem_shapes = nullptr;
     
     hopper_inputs.gemm_workspace = d_workspace;
     hopper_inputs.gemm_workspace_size = workspace_size;
     
-    GroupedGemmInput<__nv_fp8_e4m3, uint8_t, nv_bfloat16, nv_bfloat16> inputs;
+    GroupedGemmInput<__nv_fp8_e4m3, __nv_fp4_e2m1, nv_bfloat16, nv_bfloat16> inputs;
     inputs.stream = 0;
     inputs.num_experts = num_groups;
     inputs.num_rows = M_per_group;
@@ -715,12 +718,15 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     // Step 9: INVOKE THE KERNEL WITH IDENTITY SCALES
     // =========================================================================
     
+    // Declare norm_identity before try block to avoid goto-bypasses-init error
+    float norm_identity = 0.0f;
+    
     printf("  Invoking sm120_mixed_input_moe_gemm_kernelLauncher...\n");
     
     try {
         sm120_mixed_input_moe_gemm_kernelLauncher<
             __nv_fp8_e4m3,     // T
-            uint8_t,           // WeightType
+            __nv_fp4_e2m1,     // WeightType (NVFP4 type, converted to cutlass::float_e2m1_t)
             nv_bfloat16,       // GemmOutputType
             cutlass::epilogue::NoSmemWarpSpecialized,  // EpilogueTag
             cute::Shape<cute::_64, cute::_128, cute::_128>,  // CTAShape
@@ -741,7 +747,6 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     // Step 10: Verify output is finite and compute norm (for scale-sensitivity check)
     // =========================================================================
     
-    float norm_identity = 0.0f;
     {
         std::vector<nv_bfloat16> h_output(M_per_group * N);
         
@@ -842,7 +847,7 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
         try {
             sm120_mixed_input_moe_gemm_kernelLauncher<
                 __nv_fp8_e4m3,
-                uint8_t,
+                __nv_fp4_e2m1,  // WeightType (NVFP4 type)
                 nv_bfloat16,
                 cutlass::epilogue::NoSmemWarpSpecialized,
                 cute::Shape<cute::_64, cute::_128, cute::_128>,
@@ -962,7 +967,7 @@ bool test_pointer_array_manager_caching() {
     CUDA_CHECK(cudaMemset(d_identity, 0x7F, 4096));
     
     // Get manager
-    auto& mgr = getSFAPointerArrayManager();
+    auto& mgr = tensorrt_llm::kernels::cutlass_kernels::getSFAPointerArrayManager();
     
     // First call - should allocate
     uint8_t const** ptr1 = mgr.getOrCreate(8, d_identity);

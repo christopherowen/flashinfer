@@ -86,3 +86,4 @@ echo "   find ~/.cache/flashinfer -name '*.so' -path '*fused_moe_120*'"
 echo "3. Disassemble:"
 echo "   cuobjdump --dump-sass <path_to_so> | grep -i 'mma\\|tcgen05'"
 
+

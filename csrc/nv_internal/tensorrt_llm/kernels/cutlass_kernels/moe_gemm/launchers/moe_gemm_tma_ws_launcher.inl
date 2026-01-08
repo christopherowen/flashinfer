@@ -88,6 +88,25 @@ auto deduce_layout_sf() {
   }
 }
 
+// Helper to compute K tile elements from K bytes for SM120 block-scaled GEMM.
+// For SM120:
+//   - FP4 (4 bits): K=128 bytes → 256 elements
+//   - FP8 (8 bits): K=128 bytes → 128 elements
+// For other architectures, K is passed through unchanged.
+// This is needed because:
+//   - Dispatch code computes TileShape with K in elements
+//   - Explicit template instantiation must use the same K value
+template <typename ArchTag, int KBytes, typename DataType>
+struct KBytesToElements {
+  using CutlassT = typename TllmToCutlassTypeAdapter<DataType>::type;
+  static constexpr bool IsSM120 = (ArchTag::kMinComputeCapability == 120 ||
+                                   ArchTag::kMinComputeCapability == 121);
+  // For SM120: convert K from bytes to elements based on data type bit width
+  // For other archs: use K directly (may have other multipliers applied separately)
+  static constexpr int value = IsSM120 ? (KBytes * 8 / cutlass::sizeof_bits<CutlassT>::value)
+                                       : KBytes;
+};
+
 template <typename ArchTag, typename T, typename WeightType, typename OutputType,
           typename EpilogueSchedule, typename EpilogueTag, EpilogueFusion FUSION,
           typename TileShape, typename ClusterShape, bool IsMXFPX, bool DYNAMIC_CGA, bool BIAS,
@@ -215,8 +234,12 @@ using namespace cutlass::epilogue;
     constexpr static bool Is2SM = IsSM10x && cute::size<0>(InputClusterShape{}) == 2;                                                                                                                                                                                                                                   \
     using ClusterShape = std::conditional_t<DYNAMIC_CGA, cute::Shape<int32_t, int32_t, cute::_1>,                                                                                                                                                                                                                       \
                                             InputClusterShape>;                                                                                                                                                                                                                                                         \
-    using MmaTileShape = cute::Shape<cute::Int<CTA_M_*(Is2SM ? 2 : 1)>, cute::Int<CTA_N_>,                                                                                                                                                                                                                              \
-                                     cute::Int<CTA_K_*(IsSM103 ? 3 : 1)>>;                                                                                                                                                                                                                                              \
+    /* For SM120 block-scaled, convert K from bytes to elements: K_elements = (K * 8) / sizeof_bits<T> */                                                                                                                                                              \
+    /* For FP4 (4 bits): 128 bytes -> 256 elements, for FP8 (8 bits): 128 bytes -> 128 elements */                                                                                                                                                                     \
+    using CutlassT = typename TllmToCutlassTypeAdapter<T>::type;                                                                                                                                                                                                        \
+    constexpr int KTileElements = IsSM120 ? (CTA_K_ * 8 / cutlass::sizeof_bits<CutlassT>::value) : (CTA_K_*(IsSM103 ? 3 : 1));                                                                                                                                          \
+    using MmaTileShape = cute::Shape<cute::Int<CTA_M_*(Is2SM ? 2 : 1)>, cute::Int<CTA_N_>,                                                                                                                                                                              \
+                                     cute::Int<KTileElements>>;                                                                                                                                                                                                         \
     using InputEpilogueSchedule = EpilogueSchedule_;                                                                                                                                                                                                                                                                    \
     if constexpr (!COMPILE_HOPPER_TMA_GROUPED_GEMMS_ENABLED &&                                                                                                                                                                                                                                                          \
                   ArchTag::kMinComputeCapability >= 90 && ArchTag::kMinComputeCapability < 100) {                                                                                                                                                                                                                       \
@@ -727,11 +750,16 @@ using namespace cutlass::epilogue;
     return;                                                                                                                                                                                                                                                                                                             \
   }                                                                                                                                                                                                                                                                                                                     \
                                                                                                                                                                                                                                                                                                                         \
+  /* SM120 block-scaled GEMM: K in tile config is in BYTES, but TileShape uses ELEMENTS.           \
+   * For FP4 (4 bits): K=128 bytes -> 256 elements                                                  \
+   * For FP8 (8 bits): K=128 bytes -> 128 elements                                                  \
+   * KBytesToElements computes this conversion for SM120, passes through unchanged for others. */   \
   template <>                                                                                                                                                                                                                                                                                                           \
   struct DispatchToTmaWSFunction<                                                                                                                                                                                                                                                                                       \
       cutlass::arch::ArchTag_, DataType_, WeightType_, OutputType_, EpilogueSchedule_,                                                                                                                                                                                                                                  \
       tensorrt_llm::cutlass_extensions::EpilogueTag_, EpilogueFusion::FUSION_,                                                                                                                                                                                                                                          \
-      cute::Shape<cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>>,                                                                                                                                                                                                                                             \
+      cute::Shape<cute::Int<CTA_M_>, cute::Int<CTA_N_>,                                                                                                                                                                                                                                                                 \
+                  cute::Int<KBytesToElements<cutlass::arch::ArchTag_, CTA_K_, DataType_>::value>>,                                                                                                                                                                                                                      \
       cute::Shape<cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>>, MXFPX_, DYNAMIC_CGA_,                                                                                                                                                                                                                       \
       BIAS_, SWAP_AB_> {                                                                                                                                                                                                                                                                                                \
     constexpr static auto* op = &tma_warp_specialized_generic_moe_gemm_kernelLauncher_##ArchTag_##_##DataType_##_##WeightType_##_##OutputType_##_##EpilogueSchedule_##_##EpilogueTag_##_##FUSION_##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##_##MXFPX_##_##DYNAMIC_CGA_##_##BIAS_##_##SWAP_AB_; \
@@ -739,7 +767,8 @@ using namespace cutlass::epilogue;
   template void tma_warp_specialized_generic_moe_gemm_kernelLauncher<                                                                                                                                                                                                                                                   \
       cutlass::arch::ArchTag_, DataType_, WeightType_, OutputType_, EpilogueSchedule_,                                                                                                                                                                                                                                  \
       tensorrt_llm::cutlass_extensions::EpilogueTag_, EpilogueFusion::FUSION_,                                                                                                                                                                                                                                          \
-      cute::Shape<cute::Int<CTA_M_>, cute::Int<CTA_N_>, cute::Int<CTA_K_>>,                                                                                                                                                                                                                                             \
+      cute::Shape<cute::Int<CTA_M_>, cute::Int<CTA_N_>,                                                                                                                                                                                                                                                                 \
+                  cute::Int<KBytesToElements<cutlass::arch::ArchTag_, CTA_K_, DataType_>::value>>,                                                                                                                                                                                                                      \
       cute::Shape<cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>>, MXFPX_, DYNAMIC_CGA_,                                                                                                                                                                                                                       \
       BIAS_, SWAP_AB_>(TmaWarpSpecializedGroupedGemmInput tma_ws_input, int num_experts,                                                                                                                                                                                                                                \
                        int const multi_processor_count, cudaStream_t stream,                                                                                                                                                                                                                                            \

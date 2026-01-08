@@ -266,9 +266,11 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   static_assert(cute::size<1,1>(OurSfAtom{}) == 4,
       "SfAtom shape[1][1] mismatch: expected 4 for K-block");
   
-  // Check 3: Verify the atom cosize matches expected (128 bytes per atom)
-  static_assert(cute::cosize(OurSfAtom{}) == 128,
-      "SfAtom cosize mismatch: expected 128 bytes per atom");
+  // Check 3: Verify the atom cosize matches expected
+  // Note: SfKMajorAtom with shape ((32,4), (32, 4)) and stride ((16,4), (0,1))
+  // has cosize = max index + 1 = 32*16 - 1 + 1 = 512 bytes
+  static_assert(cute::cosize(OurSfAtom{}) == 512,
+      "SfAtom cosize mismatch: expected 512 bytes per atom for K-major layout");
   
   // These static asserts prove that our sizing uses the SAME layout construction
   // as the kernel. The LayoutSFA type itself is a runtime layout (depends on M,K,L),
@@ -543,6 +545,12 @@ inline size_t computeSm120IdentitySFBBufferSize(int64_t M, int64_t N, int64_t K,
 #endif
 }
 
+// =============================================================================
+// Host-only API: These functions use host-side managers (mutex, unordered_map)
+// and must only be called from host code, not device code.
+// =============================================================================
+#if !defined(__CUDA_ARCH__)
+
 // Acquire identity SFA buffer using the size-based API
 inline uint8_t* acquireSm120IdentitySFABuffer(size_t required_bytes) {
     auto& mgr = tensorrt_llm::kernels::cutlass_kernels::getIdentityScaleBufferManager();
@@ -583,6 +591,8 @@ inline void prewarmSm120SFAPointerArrays(const std::vector<int>& expert_counts,
     auto& mgr = tensorrt_llm::kernels::cutlass_kernels::getSFAPointerArrayManager();
     mgr.prewarm(expert_counts, identity_sfa);
 }
+
+#endif  // !defined(__CUDA_ARCH__)
 
 }  // namespace cutlass_kernels_oss
 }  // namespace kernels
