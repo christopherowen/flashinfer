@@ -56,6 +56,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <algorithm>
+#include <type_traits>
 
 #include "sm12x_arch_config.h"
 
@@ -107,34 +108,36 @@ static constexpr uint8_t kIdentityScaleRaw = kSm12xIdentityScaleRaw;  // 0x7F
 // it must have the correct shape - not a single element with broadcast stride.
 
 // =============================================================================
-// CUTLASS LayoutSFA Size Computation (Using Actual CUTLASS Layout)
+// SFA Buffer Size Estimation (NOT LayoutSFA-derived!)
 // =============================================================================
 //
-// IMPORTANT: CUTLASS's block-scaled layout is NOT simple row-major!
-// The layout is defined by Sm1xxBlockScaledConfig in sm100_blockscaled_layout.hpp:
+// WARNING: This is a SIZE ESTIMATION, not a proper LayoutSFA derivation!
+// 
+// CUTLASS's block-scaled layout is NOT simple row-major. The real layout is
+// defined by Sm1xxBlockScaledConfig in sm100_blockscaled_layout.hpp:
 //
 //   SfAtom = ((32,4), (SFVecSize, 4)) with stride ((16,4), (0, 1))
 //   Blk_MN = 128, Blk_SF = 4, SFVecSize = 32
 //
-// This creates a complex tiled/swizzled layout optimized for TMEM access.
+// The CORRECT way to compute SFA size is in the LAUNCHER where the kernel's
+// LayoutSFA type is known:
+//   using LayoutSFA = typename GemmKernel::CollectiveMainloop::LayoutSFA;
+//   size_t capacity = cute::cosize(LayoutSFA{}, problem_shape);
 //
-// The CORRECT way to compute SFA size is to use CUTLASS's layout helpers:
-//   using Config = cutlass::detail::Sm1xxBlockScaledConfig<SFVecSize>;
-//   auto layout_sfa = Config::tile_atom_to_shape_SFA(problem_shape, LayoutSFA{});
-//   size_t capacity = cute::cosize(layout_sfa);
+// WHY THIS WORKS FOR IDENTITY MODE ONLY:
+// - Identity scales are all 0x7F (same value everywhere)
+// - Layout pattern doesn't matter if every byte is identical
+// - We just need to allocate ENOUGH bytes (buffer >= kernel's requirement)
+// - memset fills the entire buffer with 0x7F
 //
-// For identity scales (all 0x7F), the actual layout pattern doesn't matter
-// because every byte is the same value. However, we MUST allocate the correct
-// number of bytes that the kernel expects.
+// WHY THIS DOES NOT WORK FOR COMPUTED SCALES:
+// - Computed scales must be written in the correct tiled layout
+// - Row-major write to a swizzled buffer = garbage for TMA
+// - Full-scale mode must use proper layout transformation
 //
-// This struct provides a VERIFIED computation that matches CUTLASS's layout
-// capacity for common MoE shapes. If you add new shapes, verify they match!
-//
-// Verified shapes (M, K) -> expected SFA bytes:
-//   (64, 2880)   -> 384 bytes (3 * 128)
-//   (128, 2880)  -> 512 bytes (4 * 128)
-//   (256, 11520) -> 4608 bytes (36 * 128)
-//   (1024, 4096) -> 2048 bytes (16 * 128)
+// This struct provides a CONSERVATIVE size estimate that should be >= CUTLASS's
+// actual requirement. If you see TMA errors or scale misreads, verify the
+// computed size matches the kernel's actual LayoutSFA capacity.
 
 struct Sm12xLayoutSFASizes {
     static constexpr int kSFVecSize = 32;  // Scale factor vector size (K dimension grouping)
@@ -213,27 +216,27 @@ __global__ void quantize_activation_to_fp8_kernel(
 // =============================================================================
 //
 // This kernel processes 8 elements per thread for better memory throughput:
-// - Loads 8 BF16/FP16 values (128 bits) per thread
+// - Loads 8 BF16/FP16 values (128 bits) directly from global memory
 // - Converts to 8 FP8 values
 // - Stores 8 FP8 values (64 bits) per thread
 //
-// For K dimensions not divisible by 8, falls back to scalar handling.
+// IMPORTANT: This kernel ONLY handles the aligned portion (num_vecs * 8).
+// Tail elements MUST be handled by a separate scalar kernel launch.
+// DO NOT try to handle tail in this kernel - the math is error-prone.
 
-__device__ __forceinline__ void convert_bf16x8_to_fp8x8(
-    const __nv_bfloat16* input,
+// Vectorized load + convert for BF16 (loads directly from global memory)
+__device__ __forceinline__ void convert_bf16x8_to_fp8x8_global(
+    const __nv_bfloat16* __restrict__ global_input,
     __nv_fp8_e4m3* output
 ) {
-    // Load 8 BF16 values (use vectorized load)
-    float4 f4_lo, f4_hi;
+    // Load 4 bfloat162 directly from global memory (128 bits = 16 bytes)
+    const __nv_bfloat162* src2 = reinterpret_cast<const __nv_bfloat162*>(global_input);
+    __nv_bfloat162 v0 = src2[0];
+    __nv_bfloat162 v1 = src2[1];
+    __nv_bfloat162 v2 = src2[2];
+    __nv_bfloat162 v3 = src2[3];
     
-    // Convert BF16 to float in groups
-    const __nv_bfloat162* input2 = reinterpret_cast<const __nv_bfloat162*>(input);
-    __nv_bfloat162 v0 = input2[0];
-    __nv_bfloat162 v1 = input2[1];
-    __nv_bfloat162 v2 = input2[2];
-    __nv_bfloat162 v3 = input2[3];
-    
-    // Convert to FP8 and pack
+    // Convert to FP8
     output[0] = __nv_fp8_e4m3(__bfloat162float(__low2bfloat16(v0)));
     output[1] = __nv_fp8_e4m3(__bfloat162float(__high2bfloat16(v0)));
     output[2] = __nv_fp8_e4m3(__bfloat162float(__low2bfloat16(v1)));
@@ -244,18 +247,19 @@ __device__ __forceinline__ void convert_bf16x8_to_fp8x8(
     output[7] = __nv_fp8_e4m3(__bfloat162float(__high2bfloat16(v3)));
 }
 
-__device__ __forceinline__ void convert_fp16x8_to_fp8x8(
-    const __half* input,
+// Vectorized load + convert for FP16 (loads directly from global memory)
+__device__ __forceinline__ void convert_fp16x8_to_fp8x8_global(
+    const __half* __restrict__ global_input,
     __nv_fp8_e4m3* output
 ) {
-    // Load 8 FP16 values (use vectorized load)
-    const __half2* input2 = reinterpret_cast<const __half2*>(input);
-    __half2 v0 = input2[0];
-    __half2 v1 = input2[1];
-    __half2 v2 = input2[2];
-    __half2 v3 = input2[3];
+    // Load 4 half2 directly from global memory (128 bits = 16 bytes)
+    const __half2* src2 = reinterpret_cast<const __half2*>(global_input);
+    __half2 v0 = src2[0];
+    __half2 v1 = src2[1];
+    __half2 v2 = src2[2];
+    __half2 v3 = src2[3];
     
-    // Convert to FP8 and pack
+    // Convert to FP8
     output[0] = __nv_fp8_e4m3(__half2float(__low2half(v0)));
     output[1] = __nv_fp8_e4m3(__half2float(__high2half(v0)));
     output[2] = __nv_fp8_e4m3(__half2float(__low2half(v1)));
@@ -266,61 +270,61 @@ __device__ __forceinline__ void convert_fp16x8_to_fp8x8(
     output[7] = __nv_fp8_e4m3(__half2float(__high2half(v3)));
 }
 
+// Main vectorized kernel - ONLY handles aligned portion
+// Tail elements are handled by separate scalar kernel
 template <typename InputType>
 __global__ void quantize_activation_to_fp8_vectorized_kernel(
     const InputType* __restrict__ input,    // [total_tokens, K]
     __nv_fp8_e4m3* __restrict__ output,     // [total_tokens, K]
-    int total_tokens,
-    int K
+    int num_vecs                             // Number of 8-element vectors to process
 ) {
     constexpr int kVecSize = 8;
     
-    // Each thread handles 8 elements
     int vec_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_vecs = (total_tokens * K) / kVecSize;
     
-    if (vec_idx < total_vecs) {
-        int base_idx = vec_idx * kVecSize;
-        
-        // Temporary buffers (in registers)
-        InputType input_buf[kVecSize];
-        __nv_fp8_e4m3 output_buf[kVecSize];
-        
-        // Vectorized load
-        const InputType* src = input + base_idx;
+    if (vec_idx >= num_vecs) return;
+    
+    int base_idx = vec_idx * kVecSize;
+    __nv_fp8_e4m3 output_buf[kVecSize];
+    
+    // Load directly from global memory and convert
+    // Using if constexpr with cuda type traits for proper dispatch
+    if constexpr (sizeof(InputType) == sizeof(__nv_bfloat16)) {
+        convert_bf16x8_to_fp8x8_global(
+            reinterpret_cast<const __nv_bfloat16*>(input + base_idx),
+            output_buf
+        );
+    } else if constexpr (sizeof(InputType) == sizeof(__half)) {
+        convert_fp16x8_to_fp8x8_global(
+            reinterpret_cast<const __half*>(input + base_idx),
+            output_buf
+        );
+    } else {
+        // Generic fallback for other types
         #pragma unroll
         for (int i = 0; i < kVecSize; i++) {
-            input_buf[i] = src[i];
-        }
-        
-        // Convert
-        if constexpr (std::is_same_v<InputType, __nv_bfloat16>) {
-            convert_bf16x8_to_fp8x8(input_buf, output_buf);
-        } else if constexpr (std::is_same_v<InputType, __half>) {
-            convert_fp16x8_to_fp8x8(input_buf, output_buf);
-        } else {
-            // Generic fallback
-            #pragma unroll
-            for (int i = 0; i < kVecSize; i++) {
-                output_buf[i] = __nv_fp8_e4m3(static_cast<float>(input_buf[i]));
-            }
-        }
-        
-        // Vectorized store (pack into 64-bit)
-        __nv_fp8_e4m3* dst = output + base_idx;
-        #pragma unroll
-        for (int i = 0; i < kVecSize; i++) {
-            dst[i] = output_buf[i];
+            output_buf[i] = __nv_fp8_e4m3(static_cast<float>(input[base_idx + i]));
         }
     }
     
-    // Handle tail elements (total_elements not divisible by 8)
-    int total_elements = total_tokens * K;
-    int handled = total_vecs * kVecSize;
-    int tail_idx = handled + (blockIdx.x * blockDim.x + threadIdx.x) - (total_vecs);
+    // Store 8 bytes (can use 64-bit store)
+    // Use uint2 for aligned 64-bit store
+    uint2* dst64 = reinterpret_cast<uint2*>(output + base_idx);
+    const uint2* src64 = reinterpret_cast<const uint2*>(output_buf);
+    *dst64 = *src64;
+}
+
+// Tail kernel for remaining elements (called after vectorized kernel)
+template <typename InputType>
+__global__ void quantize_activation_to_fp8_tail_kernel(
+    const InputType* __restrict__ input,
+    __nv_fp8_e4m3* __restrict__ output,
+    int start_idx,          // First element to process
+    int total_elements      // Total number of elements
+) {
+    int idx = start_idx + blockIdx.x * blockDim.x + threadIdx.x;
     
-    if (tail_idx >= 0 && tail_idx < (total_elements - handled)) {
-        int idx = handled + tail_idx;
+    if (idx < total_elements) {
         output[idx] = __nv_fp8_e4m3(static_cast<float>(input[idx]));
     }
 }
@@ -574,24 +578,34 @@ cudaError_t quantizeActivationsWithWorkspace(
     }
     // TODO: For full-scale mode, need proper tiled fill kernel respecting LayoutSFA
     
-    // Run VECTORIZED quantization kernel (8 elements per thread)
+    // Run VECTORIZED quantization kernel (8 elements per thread) + TAIL kernel
     int total_elements = total_tokens * K;
     constexpr int kVecSize = 8;
     int num_vecs = total_elements / kVecSize;
+    int tail_start = num_vecs * kVecSize;
+    int tail_count = total_elements - tail_start;
     int block_size = 256;
-    int num_blocks = (num_vecs + block_size - 1) / block_size;
     
-    // Use vectorized kernel for better memory throughput
+    // Step 1: Vectorized kernel for aligned portion
     if (num_vecs > 0) {
+        int num_blocks = (num_vecs + block_size - 1) / block_size;
         quantize_activation_to_fp8_vectorized_kernel<InputType><<<num_blocks, block_size, 0, stream>>>(
-            d_input, output.d_fp8_activations, total_tokens, K
+            d_input, output.d_fp8_activations, num_vecs
         );
-    } else {
-        // Fallback to scalar for small inputs
-        int scalar_blocks = (total_elements + block_size - 1) / block_size;
-        quantize_activation_to_fp8_kernel<InputType><<<scalar_blocks, block_size, 0, stream>>>(
-            d_input, output.d_fp8_activations, total_tokens, K
+    }
+    
+    // Step 2: Tail kernel for remaining elements (separate launch, no complex in-kernel math)
+    if (tail_count > 0) {
+        int tail_blocks = (tail_count + block_size - 1) / block_size;
+        quantize_activation_to_fp8_tail_kernel<InputType><<<tail_blocks, block_size, 0, stream>>>(
+            d_input, output.d_fp8_activations, tail_start, total_elements
         );
+    }
+    
+    // Fallback: if no vectors (very small input), just use scalar
+    if (num_vecs == 0 && tail_count == 0) {
+        // This shouldn't happen (would mean total_elements == 0), but be safe
+        return cudaSuccess;
     }
     
     return cudaGetLastError();
@@ -645,6 +659,23 @@ cudaError_t quantizeActivationsIdentity(
 // =============================================================================
 // Per-Block Scale Factor Computation (Full-Scale Mode)
 // =============================================================================
+//
+// ╔═════════════════════════════════════════════════════════════════════════╗
+// ║  EXPERIMENTAL - NOT FOR PRODUCTION USE                                  ║
+// ║                                                                         ║
+// ║  This full-scale mode writes scales in ROW-MAJOR layout, but CUTLASS's  ║
+// ║  TMA tensor map expects a SWIZZLED/TILED LayoutSFA.                     ║
+// ║                                                                         ║
+// ║  Using this with a real SM12x kernel will produce INCORRECT RESULTS.    ║
+// ║                                                                         ║
+// ║  For production, use IDENTITY mode (quantizeActivationsWithWorkspace    ║
+// ║  with use_identity_scales=true) which works because all values are 0x7F.║
+// ║                                                                         ║
+// ║  Full-scale mode requires:                                              ║
+// ║  - Deriving LayoutSFA from the instantiated kernel                      ║
+// ║  - Writing scales in the proper tiled layout, not row-major             ║
+// ║  - Verifying with actual kernel execution and correctness checks        ║
+// ╚═════════════════════════════════════════════════════════════════════════╝
 //
 // For workloads that need proper per-block scaling:
 // 1. Compute max absolute value per 128-element block
@@ -841,13 +872,21 @@ struct Sm12xFullScaleWorkspaceSizes {
 };
 
 // =============================================================================
-// Full-Scale Mode Quantizer
+// Full-Scale Mode Quantizer (EXPERIMENTAL - DO NOT USE IN PRODUCTION)
 // =============================================================================
 //
 // Computes per-block absmax and uses it to scale activations before FP8 conversion.
 // This provides better numerical range coverage than identity scales.
+//
+// ⚠️  WARNING: Scale layout is ROW-MAJOR, not CUTLASS LayoutSFA!  ⚠️
+// This will produce INCORRECT results with real SM12x block-scaled kernels.
+// See the large warning box above for details.
+
+// Define SM12X_ENABLE_EXPERIMENTAL_FULL_SCALE_MODE=1 to enable full-scale mode at your own risk
+// By default, this function will fail at runtime with cudaErrorNotSupported
 
 template <typename InputType>
+[[deprecated("EXPERIMENTAL: Full-scale mode uses row-major layout, not CUTLASS LayoutSFA. Use identity mode for production.")]]
 cudaError_t quantizeActivationsFullScale(
     const InputType* d_input,           // [total_tokens, K]
     int total_tokens,
@@ -857,6 +896,17 @@ cudaError_t quantizeActivationsFullScale(
     Sm12xQuantizedActivationView& output,
     cudaStream_t stream = 0
 ) {
+#ifndef SM12X_ENABLE_EXPERIMENTAL_FULL_SCALE_MODE
+    // Runtime guard: return error unless explicitly enabled
+    // Full-scale mode writes scales in row-major, but CUTLASS expects LayoutSFA (swizzled).
+    // This will produce incorrect results with real SM12x block-scaled kernels.
+    // To enable anyway: #define SM12X_ENABLE_EXPERIMENTAL_FULL_SCALE_MODE 1
+    (void)d_input; (void)total_tokens; (void)K; (void)d_workspace;
+    (void)workspace_bytes; (void)output; (void)stream;
+    return cudaErrorNotSupported;
+#else
+    // EXPERIMENTAL: Proceed at your own risk!
+    
     auto sizes = Sm12xFullScaleWorkspaceSizes::compute(total_tokens, K);
     
     if (workspace_bytes < sizes.total_bytes) {
@@ -880,6 +930,7 @@ cudaError_t quantizeActivationsFullScale(
     );
     
     return cudaGetLastError();
+#endif  // SM12X_ENABLE_EXPERIMENTAL_FULL_SCALE_MODE
 }
 
 // =============================================================================

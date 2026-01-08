@@ -223,8 +223,12 @@ def run_placeholder(data: Dict) -> torch.Tensor:
     return torch.matmul(data["hidden_states"], data["gemm1_weights"][0, :data["hidden_dim"], :].T)
 
 
-def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: int = 5, num_iters: int = 20):
-    """Benchmark prefill-like workload (large M per group)."""
+def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: int = 5, num_iters: int = 20, require_fp4: bool = False):
+    """Benchmark prefill-like workload (large M per group).
+    
+    Args:
+        require_fp4: If True, fail if FP4 path cannot run (prevents benchmarking fallback)
+    """
     
     print("\n" + "="*60)
     print("PREFILL REGIME BENCHMARK")
@@ -232,6 +236,8 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
     print(f"  Hidden dim: {hidden_dim}")
     print(f"  Num experts: {num_experts}")
     print(f"  FlashInfer fused_moe available: {_HAS_FUSED_MOE}")
+    if require_fp4:
+        print("  Mode: FP4 REQUIRED (will fail if FP4 path unavailable)")
     
     # Prefill workload: larger batch sizes
     batch_sizes = [64, 128, 256, 512, 1024]
@@ -244,6 +250,7 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
         use_fp4 = _HAS_FUSED_MOE
         use_bf16 = False
         mode = "FP4"
+        fp4_error = None
         
         if use_fp4:
             try:
@@ -253,6 +260,10 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
                 _ = run_fn()
                 torch.cuda.synchronize()
             except Exception as e:
+                fp4_error = e
+                if require_fp4:
+                    print(f"  ERROR: FP4 path failed and --require-fp4 is set: {e}")
+                    raise RuntimeError(f"FP4 path required but failed: {e}")
                 print(f"  FP4 path failed: {e}, falling back to BF16")
                 use_fp4 = False
                 use_bf16 = _HAS_FUSED_MOE
@@ -269,6 +280,8 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
                 use_bf16 = False
         
         if not use_fp4 and not use_bf16:
+            if require_fp4:
+                raise RuntimeError("FP4 path required but no path available")
             data = create_moe_test_data(num_tokens, hidden_dim, num_experts, topk, use_fp4_weights=False)
             run_fn = lambda: run_placeholder(data)
             mode = "PLACEHOLDER"
@@ -310,11 +323,14 @@ def benchmark_prefill(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: 
     return results
 
 
-def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: int = 10, num_iters: int = 50):
+def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: int = 10, num_iters: int = 50, require_fp4: bool = False):
     """Benchmark decode-like workload (small M per group).
     
     For decode, tile selection is CRITICAL - wrong tile = massive latency.
     This tests the SM121 FP4 path with small batch sizes (1-32 tokens).
+    
+    Args:
+        require_fp4: If True, fail if FP4 path cannot run (prevents benchmarking fallback)
     """
     
     print("\n" + "="*60)
@@ -323,6 +339,8 @@ def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: i
     print(f"  Hidden dim: {hidden_dim}")
     print(f"  Num experts: {num_experts}")
     print(f"  FlashInfer fused_moe available: {_HAS_FUSED_MOE}")
+    if require_fp4:
+        print("  Mode: FP4 REQUIRED (will fail if FP4 path unavailable)")
     
     # Decode workload: small batch sizes (1-32 tokens)
     batch_sizes = [1, 2, 4, 8, 16, 32]
@@ -344,6 +362,9 @@ def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: i
                 _ = run_fn()
                 torch.cuda.synchronize()
             except Exception as e:
+                if require_fp4:
+                    print(f"  ERROR: FP4 path failed and --require-fp4 is set: {e}")
+                    raise RuntimeError(f"FP4 path required but failed: {e}")
                 print(f"  FP4 path failed for {num_tokens} tokens: {e}, falling back")
                 use_fp4 = False
                 use_bf16 = _HAS_FUSED_MOE
@@ -360,6 +381,8 @@ def benchmark_decode(hidden_dim: int = 4096, num_experts: int = 8, num_warmup: i
                 use_bf16 = False
         
         if not use_fp4 and not use_bf16:
+            if require_fp4:
+                raise RuntimeError("FP4 path required but no path available")
             data = create_moe_test_data(num_tokens, hidden_dim, num_experts, topk, use_fp4_weights=False)
             run_fn = lambda: run_placeholder(data)
             mode = "PLACEHOLDER"
@@ -441,6 +464,16 @@ def main():
     parser.add_argument("--num-experts", type=int, default=8, help="Number of experts")
     parser.add_argument("--warmup", type=int, default=5, help="Warmup iterations")
     parser.add_argument("--iters", type=int, default=20, help="Timed iterations")
+    parser.add_argument(
+        "--require-fp4",
+        action="store_true",
+        help="Fail if FP4 path cannot run (prevents accidentally benchmarking BF16 fallback)"
+    )
+    parser.add_argument(
+        "--require-sm121",
+        action="store_true",
+        help="Fail if not running on SM121 GPU"
+    )
     
     args = parser.parse_args()
     
@@ -458,7 +491,18 @@ def main():
     
     is_sm121 = check_sm121()
     if not is_sm121:
+        if args.require_sm121:
+            print("ERROR: --require-sm121 specified but not running on SM121")
+            return
         print("\nProceeding anyway for comparison purposes...")
+    
+    # Check FP4 availability if required
+    if args.require_fp4:
+        if not _HAS_FUSED_MOE:
+            print("ERROR: --require-fp4 specified but FlashInfer fused_moe not available")
+            print("Install FlashInfer with FP4 support to use this flag")
+            return
+        print("FP4 path required: will fail if FP4 kernel cannot run")
     
     # Print configuration
     print(f"\nConfiguration:")
@@ -468,23 +512,35 @@ def main():
     print(f"  Timed iters: {args.iters}")
     
     # Run benchmarks
-    if args.regime == "prefill" or args.regime == "both":
-        benchmark_prefill(args.hidden_dim, args.num_experts, args.warmup, args.iters)
-    
-    if args.regime == "decode" or args.regime == "both":
-        benchmark_decode(args.hidden_dim, args.num_experts, args.warmup * 2, args.iters * 2)
-    
-    if args.regime == "tiles":
-        benchmark_tile_comparison(args.hidden_dim)
-    
-    print("\n" + "="*60)
-    print("BENCHMARK COMPLETE")
-    print("="*60)
-    print("\nNOTE: This is a placeholder benchmark using torch.matmul.")
-    print("Replace with actual FlashInfer MoE GEMM calls when the SM121")
-    print("native FP4 path is fully integrated.")
-    print("\nTo verify native FP4 usage, run:")
-    print("  python scripts/verify_sm121_fp4_mma.py")
+    try:
+        if args.regime == "prefill" or args.regime == "both":
+            benchmark_prefill(args.hidden_dim, args.num_experts, args.warmup, args.iters, 
+                            require_fp4=args.require_fp4)
+        
+        if args.regime == "decode" or args.regime == "both":
+            benchmark_decode(args.hidden_dim, args.num_experts, args.warmup * 2, args.iters * 2,
+                           require_fp4=args.require_fp4)
+        
+        if args.regime == "tiles":
+            benchmark_tile_comparison(args.hidden_dim)
+        
+        print("\n" + "="*60)
+        print("BENCHMARK COMPLETE")
+        print("="*60)
+        
+        if not _HAS_FUSED_MOE:
+            print("\nNOTE: FlashInfer fused_moe not available - used placeholder.")
+            print("Install FlashInfer with FP4 support for real SM121 benchmarks.")
+        
+        print("\nTo verify native FP4 usage, run:")
+        print("  python scripts/verify_sm121_fp4_mma.py")
+        
+    except RuntimeError as e:
+        if args.require_fp4:
+            print(f"\nFATAL: --require-fp4 was set but FP4 path failed: {e}")
+            print("This prevents accidentally benchmarking a fallback path.")
+            return
+        raise
 
 
 if __name__ == "__main__":
