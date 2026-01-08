@@ -529,6 +529,19 @@ inline void prewarmSm120IdentitySFABuffers(
     mgr.prewarmWithSizes(sizes);
 }
 
+// Get device-side SFA pointer array (cached, no hot-path allocation)
+inline uint8_t const** acquireSm120SFAPointerArray(int num_groups, uint8_t const* identity_sfa) {
+    auto& mgr = tensorrt_llm::kernels::cutlass_kernels::getSFAPointerArrayManager();
+    return mgr.getOrCreate(num_groups, identity_sfa);
+}
+
+// Prewarm SFA pointer arrays for common expert counts
+inline void prewarmSm120SFAPointerArrays(const std::vector<int>& expert_counts, 
+                                          uint8_t const* identity_sfa) {
+    auto& mgr = tensorrt_llm::kernels::cutlass_kernels::getSFAPointerArrayManager();
+    mgr.prewarm(expert_counts, identity_sfa);
+}
+
 }  // namespace cutlass_kernels_oss
 }  // namespace kernels
 }  // namespace tensorrt_llm

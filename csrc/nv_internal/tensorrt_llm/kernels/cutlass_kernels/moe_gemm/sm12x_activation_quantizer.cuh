@@ -281,7 +281,7 @@ __global__ void quantize_activation_to_fp8_vectorized_kernel(
     int base_idx = vec_idx * kVecSize;
     
     // Aligned buffer for 8 FP8 values (64 bits total)
-    // alignas(8) ensures we can safely reinterpret_cast to uint2
+    // alignas(8) ensures proper alignment for 64-bit operations
     alignas(8) __nv_fp8_e4m3 output_buf[kVecSize];
     
     // Load directly from global memory and convert
@@ -298,11 +298,16 @@ __global__ void quantize_activation_to_fp8_vectorized_kernel(
         }
     }
     
-    // Aligned 64-bit store using reinterpret_cast
-    // Safe because: output_buf is alignas(8), output + base_idx is 8-byte aligned
-    // (base_idx = vec_idx * 8, FP8 is 1 byte, so output + base_idx is at 8-byte boundary)
-    auto packed = *reinterpret_cast<const uint2*>(output_buf);
-    *reinterpret_cast<uint2*>(output + base_idx) = packed;
+    // Strict-aliasing-safe 64-bit store using __builtin_memcpy
+    // __builtin_memcpy is optimized away by nvcc to a single 64-bit store
+    // This avoids UB from reinterpret_cast type-punning
+    uint2 packed;
+    __builtin_memcpy(&packed, output_buf, sizeof(packed));
+    
+    // Store to output (output + base_idx is 8-byte aligned because
+    // base_idx = vec_idx * 8 and FP8 is 1 byte)
+    uint2* out_ptr = reinterpret_cast<uint2*>(output + base_idx);
+    *out_ptr = packed;
 }
 
 // Tail kernel for remaining elements (called after vectorized kernel)
@@ -546,6 +551,124 @@ private:
 // Global singleton for identity scale buffer management
 inline Sm12xIdentityScaleBufferManager& getIdentityScaleBufferManager() {
     static Sm12xIdentityScaleBufferManager manager;
+    return manager;
+}
+
+// =============================================================================
+// SFA Pointer Array Manager
+// =============================================================================
+//
+// For grouped GEMM, CUTLASS expects ElementSF const** (device pointer to device
+// pointers). This manager caches device-side pointer arrays to avoid hot-path
+// allocations.
+//
+// Key insight: For identity scales, all groups use the SAME identity buffer,
+// so the pointer array just contains N copies of the same pointer.
+//
+// USAGE:
+//   auto& ptr_mgr = getSFAPointerArrayManager();
+//   uint8_t const** d_sfa_ptrs = ptr_mgr.getOrCreate(num_groups, identity_sfa_ptr);
+//   hopper_inputs.fpX_block_scaling_factors_act = d_sfa_ptrs;
+//
+// The manager caches by (device_id, num_groups, identity_ptr) so repeated calls
+// with the same parameters return the cached array without allocation.
+//
+
+class Sm12xSFAPointerArrayManager {
+public:
+    // Get or create a device-side pointer array where all entries point to identity_sfa
+    // Returns device pointer to array of num_groups pointers
+    uint8_t const** getOrCreate(int num_groups, uint8_t const* identity_sfa_ptr) {
+        int device_id = 0;
+        cudaGetDevice(&device_id);
+        
+        // Cache key: (device_id, num_groups, identity_sfa_ptr)
+        CacheKey key{device_id, num_groups, identity_sfa_ptr};
+        
+        std::lock_guard<std::mutex> lock(mutex_);
+        
+        auto it = cache_.find(key);
+        if (it != cache_.end()) {
+            return it->second;
+        }
+        
+        // Allocate and fill on this device
+        cudaSetDevice(device_id);
+        
+        // Allocate device-side pointer array
+        uint8_t const** d_ptr_array = nullptr;
+        cudaError_t err = cudaMalloc(&d_ptr_array, num_groups * sizeof(uint8_t*));
+        if (err != cudaSuccess) {
+            return nullptr;
+        }
+        
+        // Fill host array with identity pointers
+        std::vector<uint8_t const*> h_ptrs(num_groups, identity_sfa_ptr);
+        
+        // Copy to device (blocking - one-time init cost)
+        err = cudaMemcpy(d_ptr_array, h_ptrs.data(), 
+                         num_groups * sizeof(uint8_t*), cudaMemcpyHostToDevice);
+        if (err != cudaSuccess) {
+            cudaFree(d_ptr_array);
+            return nullptr;
+        }
+        
+        cache_[key] = d_ptr_array;
+        return d_ptr_array;
+    }
+    
+    // Prewarm for common group counts
+    void prewarm(const std::vector<int>& group_counts, uint8_t const* identity_sfa_ptr) {
+        for (int num_groups : group_counts) {
+            getOrCreate(num_groups, identity_sfa_ptr);
+        }
+    }
+    
+    // Clear all cached arrays (for cleanup)
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& [key, ptr] : cache_) {
+            if (ptr) {
+                cudaSetDevice(key.device_id);
+                cudaFree(const_cast<uint8_t**>(ptr));
+            }
+        }
+        cache_.clear();
+    }
+    
+    ~Sm12xSFAPointerArrayManager() {
+        clear();
+    }
+
+private:
+    struct CacheKey {
+        int device_id;
+        int num_groups;
+        uint8_t const* identity_ptr;
+        
+        bool operator==(const CacheKey& other) const {
+            return device_id == other.device_id &&
+                   num_groups == other.num_groups &&
+                   identity_ptr == other.identity_ptr;
+        }
+    };
+    
+    struct CacheKeyHash {
+        size_t operator()(const CacheKey& key) const {
+            size_t h = std::hash<int>()(key.device_id);
+            h ^= std::hash<int>()(key.num_groups) << 8;
+            h ^= std::hash<uintptr_t>()(reinterpret_cast<uintptr_t>(key.identity_ptr)) << 16;
+            return h;
+        }
+    };
+    
+    std::unordered_map<CacheKey, uint8_t const**, CacheKeyHash> cache_;
+    std::mutex mutex_;
+};
+
+// Global singleton for SFA pointer array management
+inline Sm12xSFAPointerArrayManager& getSFAPointerArrayManager() {
+    static Sm12xSFAPointerArrayManager manager;
     return manager;
 }
 

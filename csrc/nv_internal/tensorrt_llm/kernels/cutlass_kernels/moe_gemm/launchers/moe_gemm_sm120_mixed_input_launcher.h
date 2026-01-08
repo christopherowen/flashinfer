@@ -133,6 +133,14 @@ uint8_t* acquireSm120IdentitySFABuffer(size_t required_bytes);
 // Call at engine initialization to avoid first-call allocation latency
 void prewarmSm120IdentitySFABuffers(const std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>& shapes);
 
+// Get device-side SFA pointer array (all pointers point to same identity buffer)
+// Cached by (device_id, num_groups, identity_ptr) - no hot-path allocation
+// Returns nullptr on failure
+uint8_t const** acquireSm120SFAPointerArray(int num_groups, uint8_t const* identity_sfa);
+
+// Prewarm SFA pointer arrays for common expert counts
+void prewarmSm120SFAPointerArrays(const std::vector<int>& expert_counts, uint8_t const* identity_sfa);
+
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag,
           typename CTAShape, typename ClusterShape, bool IsMXFP4 = false>
 void sm120_mixed_input_moe_gemm_kernelLauncher(
