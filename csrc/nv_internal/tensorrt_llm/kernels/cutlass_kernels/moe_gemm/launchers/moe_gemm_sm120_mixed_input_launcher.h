@@ -116,18 +116,28 @@ using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput
 //   // Consider caching/pooling the pointer array.
 //
 
-// Compute required SFA buffer size for identity scales
-// This is kernel-derived: uses the same Sm1xxBlockScaledConfig as the kernel
+// Compute required SFA buffer size for A-scales (activation scales)
+// This is kernel-derived: uses tile_atom_to_shape_SFA with Sm1xxBlockScaledConfig
 // M_max: Maximum M across all groups (use largest problem size)
 // N, K: Problem dimensions
 // L: Should be 1 for grouped GEMM (grouping is via pointer arrays, not L dimension)
 size_t computeSm120IdentitySFABufferSize(int64_t M_max, int64_t N, int64_t K, int64_t L = 1);
 
-// Acquire identity SFA buffer of the given size
+// Compute required SFB buffer size for B-scales (weight scales)
+// This is kernel-derived: uses tile_atom_to_shape_SFB (NOT SFA!)
+// M, N, K: Problem dimensions (same shape as passed to the kernel)
+// L: Should be 1 for grouped GEMM
+size_t computeSm120IdentitySFBBufferSize(int64_t M, int64_t N, int64_t K, int64_t L = 1);
+
+// Acquire identity SFA buffer of the given size (A-scales)
 // Uses Sm12xIdentityScaleBufferManager::getOrCreateWithSize internally
 // Returns pre-filled buffer (all 0x7F), cached per (device, size)
 // No allocation or memset in steady-state (after first call for each size)
 uint8_t* acquireSm120IdentitySFABuffer(size_t required_bytes);
+
+// Acquire identity SFB buffer of the given size (B-scales / weight scales)
+// Same manager as SFA, just different sizing function
+uint8_t* acquireSm120IdentitySFBBuffer(size_t required_bytes);
 
 // Prewarm identity SFA buffers for common MoE shapes
 // Call at engine initialization to avoid first-call allocation latency

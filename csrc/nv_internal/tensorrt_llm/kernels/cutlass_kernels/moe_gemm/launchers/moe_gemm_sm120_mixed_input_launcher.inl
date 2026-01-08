@@ -478,7 +478,7 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
 // Identity SFA Buffer Acquisition API Implementation
 // =============================================================================
 
-// Compute required SFA buffer size for identity scales (kernel-derived)
+// Compute required SFA buffer size for A-scales (kernel-derived using tile_atom_to_shape_SFA)
 inline size_t computeSm120IdentitySFABufferSize(int64_t M_max, int64_t N, int64_t K, int64_t L) {
 #if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4)
     // Use the same SfConfig that the kernel uses (verified by static_assert in launcher)
@@ -508,8 +508,49 @@ inline size_t computeSm120IdentitySFABufferSize(int64_t M_max, int64_t N, int64_
 #endif
 }
 
+// Compute required SFB buffer size for B-scales (kernel-derived using tile_atom_to_shape_SFB)
+// IMPORTANT: This uses tile_atom_to_shape_SFB, NOT SFA! They have different layouts.
+inline size_t computeSm120IdentitySFBBufferSize(int64_t M, int64_t N, int64_t K, int64_t L) {
+#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4)
+    // Use the same SfConfig that the kernel uses
+    using SfConfig = cutlass::detail::Sm1xxBlockScaledConfig<kSFVecSize_SM12x>;
+    
+    // Create problem shape - use the SAME shape as passed to the kernel
+    // No dimension remapping needed - SFB uses (M, N, K, L) directly
+    auto problem_shape = cute::make_shape(
+        static_cast<int>(M),
+        static_cast<int>(N),
+        static_cast<int>(K),
+        static_cast<int>(L)
+    );
+    
+    // Get the SFB layout for this problem shape (different from SFA!)
+    auto layout_sfb = SfConfig::tile_atom_to_shape_SFB(problem_shape);
+    
+    // cosize gives the maximum linear index + 1 (the required buffer capacity)
+    size_t sfb_elements = cute::cosize(layout_sfb);
+    
+    // Align to 256 bytes for TMA requirements
+    return (sfb_elements + 255) & ~size_t(255);
+#else
+    // Fallback when FP4 is not enabled - estimate based on N and K dimensions
+    // SFB scales the B matrix which has shape (K, N) in column-major
+    int num_n_blocks = (N + 127) / 128;
+    int k_atoms = (K + 127) / 128;
+    size_t sfb_elements = static_cast<size_t>(num_n_blocks) * k_atoms * 128;
+    return (sfb_elements + 255) & ~size_t(255);
+#endif
+}
+
 // Acquire identity SFA buffer using the size-based API
 inline uint8_t* acquireSm120IdentitySFABuffer(size_t required_bytes) {
+    auto& mgr = tensorrt_llm::kernels::cutlass_kernels::getIdentityScaleBufferManager();
+    return mgr.getOrCreateWithSize(required_bytes);
+}
+
+// Acquire identity SFB buffer using the size-based API (same manager, different sizing)
+inline uint8_t* acquireSm120IdentitySFBBuffer(size_t required_bytes) {
+    // Uses the same manager - it's just a cache by (device, size)
     auto& mgr = tensorrt_llm::kernels::cutlass_kernels::getIdentityScaleBufferManager();
     return mgr.getOrCreateWithSize(required_bytes);
 }

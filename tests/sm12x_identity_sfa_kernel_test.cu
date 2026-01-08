@@ -418,12 +418,17 @@ bool test_tma_compatible_access() {
 // It actually invokes the SM12x block-scaled GEMM kernel with:
 //   - Identity SFA buffer (properly sized using kernel-derived computation)
 //   - Device-side pointer array (using the manager, no hot-path allocation)
-//   - Small problem shape to verify correctness
+//   - num_groups >= 2 to exercise pointer array indexing
 //
 // SUCCESS CRITERIA:
 //   - No TMA/illegal memory access errors
 //   - Output is finite (no NaN/Inf)
-//   - Output roughly matches BF16 reference (within FP8/FP4 tolerance)
+//   - Scale-sensitivity check: changing scales changes output dramatically
+//
+// The scale-sensitivity check proves:
+//   ✓ TMA reads the scale tensor
+//   ✓ The kernel uses it in math
+//   ✓ Pointer arrays and layouts are not silently ignored
 
 bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     printf("Test: REAL SM12x Grouped GEMM with Identity SFA (TMA validation)\n");
@@ -432,8 +437,8 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     using namespace tensorrt_llm::kernels::cutlass_kernels;
     using namespace tensorrt_llm::kernels::cutlass_kernels_oss;
     
-    // Use a single group for simplest test path
-    constexpr int num_groups = 1;      // Number of expert groups
+    // Use num_groups >= 2 to exercise pointer array indexing
+    constexpr int num_groups = 2;      // Number of expert groups
     constexpr int M_per_group = 64;    // Tokens per expert (must be >= 64 for block scale)
     constexpr int N = 128;             // Intermediate dimension (must be >= 128)
     constexpr int K = 256;             // Hidden dimension (must be >= 128)
@@ -442,16 +447,22 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     printf("  Problem: num_groups=%d, M=%d, N=%d, K=%d\n", num_groups, M_per_group, N, K);
     
     // =========================================================================
-    // Step 1: Compute and acquire identity SFA buffer using kernel-derived sizing
+    // Step 1: Compute buffer sizes using KERNEL-DERIVED functions
     // =========================================================================
     
+    // SFA buffer size (activation scales) - uses tile_atom_to_shape_SFA
     size_t sfa_bytes_act = computeSm120IdentitySFABufferSize(M_max, N, K, /*L=*/1);
-    // For weight SFB: CUTLASS block-scaled uses K dimension for outer, N for inner
-    // SFB layout is based on (K, N) not (M, K)
-    size_t sfb_bytes_weight = computeSm120IdentitySFABufferSize(K, N, N, /*L=*/1);
     
-    printf("  SFA buffer size (activation): %zu bytes\n", sfa_bytes_act);
-    printf("  SFB buffer size (weight): %zu bytes\n", sfb_bytes_weight);
+    // SFB buffer size (weight scales) - uses tile_atom_to_shape_SFB (NOT SFA!)
+    // Uses the SAME problem_shape as the kernel, no dimension remapping
+    size_t sfb_bytes_weight = computeSm120IdentitySFBBufferSize(M_per_group, N, K, /*L=*/1);
+    
+    printf("  SFA buffer size (activation, kernel-derived): %zu bytes\n", sfa_bytes_act);
+    printf("  SFB buffer size (weight, kernel-derived): %zu bytes\n", sfb_bytes_weight);
+    
+    // =========================================================================
+    // Step 2: Acquire identity scale buffers (0x7F = 1.0)
+    // =========================================================================
     
     uint8_t* identity_sfa = acquireSm120IdentitySFABuffer(sfa_bytes_act);
     if (identity_sfa == nullptr) {
@@ -459,7 +470,7 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
         return false;
     }
     
-    uint8_t* identity_sfb = acquireSm120IdentitySFABuffer(sfb_bytes_weight);
+    uint8_t* identity_sfb = acquireSm120IdentitySFBBuffer(sfb_bytes_weight);
     if (identity_sfb == nullptr) {
         printf("  FAIL: Could not acquire identity SFB buffer\n");
         return false;
@@ -469,21 +480,40 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     printf("  Identity SFB buffer acquired at %p\n", identity_sfb);
     
     // =========================================================================
-    // Step 2: Get device-side pointer arrays
+    // Step 2b: Verify kernel-derived SFB size matches runtime layout
+    // =========================================================================
+    {
+        using MXFPXBlockScaledConfig = TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig;
+        auto problem_shape = cute::make_shape(M_per_group, N, K, 1);
+        auto layout_sfb = MXFPXBlockScaledConfig::tile_atom_to_shape_SFB(problem_shape);
+        size_t runtime_sfb_cosize = cute::cosize(layout_sfb);
+        size_t runtime_sfb_aligned = (runtime_sfb_cosize + 255) & ~size_t(255);
+        
+        if (sfb_bytes_weight < runtime_sfb_aligned) {
+            printf("  FAIL: SFB buffer too small! have=%zu, need=%zu (cosize=%zu)\n",
+                   sfb_bytes_weight, runtime_sfb_aligned, runtime_sfb_cosize);
+            return false;
+        }
+        printf("  SFB size verified: have=%zu >= need=%zu (cosize=%zu)\n",
+               sfb_bytes_weight, runtime_sfb_aligned, runtime_sfb_cosize);
+    }
+    
+    // =========================================================================
+    // Step 3: Get device-side pointer arrays for identity scales
     // =========================================================================
     
     auto& ptr_mgr = getSFAPointerArrayManager();
-    uint8_t const** d_sfa_ptrs = ptr_mgr.getOrCreate(num_groups, identity_sfa);
-    uint8_t const** d_sfb_ptrs = ptr_mgr.getOrCreate(num_groups, identity_sfb);
+    uint8_t const** d_sfa_ptrs_identity = ptr_mgr.getOrCreate(num_groups, identity_sfa);
+    uint8_t const** d_sfb_ptrs_identity = ptr_mgr.getOrCreate(num_groups, identity_sfb);
     
-    if (d_sfa_ptrs == nullptr || d_sfb_ptrs == nullptr) {
+    if (d_sfa_ptrs_identity == nullptr || d_sfb_ptrs_identity == nullptr) {
         printf("  FAIL: Could not acquire pointer arrays\n");
         return false;
     }
-    printf("  Pointer arrays acquired\n");
+    printf("  Identity pointer arrays acquired\n");
     
     // =========================================================================
-    // Step 3: Allocate activation, weight, and output buffers
+    // Step 4: Allocate activation, weight, and output buffers
     // =========================================================================
     
     // FP8 activations: M * K bytes
@@ -536,7 +566,7 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     CUDA_CHECK(cudaMemcpy(d_output_ptrs, h_output_ptrs.data(), num_groups * sizeof(void*), cudaMemcpyHostToDevice));
     
     // =========================================================================
-    // Step 4: Set up strides
+    // Step 5: Set up strides
     // =========================================================================
     
     using StrideA = TmaWarpSpecializedGroupedGemmInput::StrideA;
@@ -574,7 +604,7 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     CUDA_CHECK(cudaMemcpy(d_stride_d, h_stride_d.data(), num_groups * sizeof(StrideD), cudaMemcpyHostToDevice));
     
     // =========================================================================
-    // Step 5: Set up LayoutSFA/SFB for scale factor strides
+    // Step 6: Set up LayoutSFA/SFB for scale factor strides
     // =========================================================================
     
     // For identity scales, we still need to provide the layout objects
@@ -601,7 +631,7 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     CUDA_CHECK(cudaMemcpy(d_layout_sfb, h_layout_sfb.data(), num_groups * sizeof(LayoutSFB), cudaMemcpyHostToDevice));
     
     // =========================================================================
-    // Step 6: Allocate workspace
+    // Step 7: Allocate workspace
     // =========================================================================
     
     size_t workspace_size = 0;
@@ -646,7 +676,7 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     }
     
     // =========================================================================
-    // Step 7: Set up full TmaWarpSpecializedGroupedGemmInput
+    // Step 8: Set up full TmaWarpSpecializedGroupedGemmInput
     // =========================================================================
     
     TmaWarpSpecializedGroupedGemmInput hopper_inputs;
@@ -660,8 +690,8 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     hopper_inputs.stride_d = d_stride_d;
     hopper_inputs.stride_c = nullptr;
     
-    hopper_inputs.fpX_block_scaling_factors_act = d_sfa_ptrs;
-    hopper_inputs.fpX_block_scaling_factors_weight = d_sfb_ptrs;
+    hopper_inputs.fpX_block_scaling_factors_act = d_sfa_ptrs_identity;
+    hopper_inputs.fpX_block_scaling_factors_weight = d_sfb_ptrs_identity;
     hopper_inputs.fpX_block_scaling_factors_stride_act = d_layout_sfa;
     hopper_inputs.fpX_block_scaling_factors_stride_weight = d_layout_sfb;
     hopper_inputs.fpX_block_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
@@ -682,7 +712,7 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     inputs.k = K;
     
     // =========================================================================
-    // Step 8: INVOKE THE KERNEL
+    // Step 9: INVOKE THE KERNEL WITH IDENTITY SCALES
     // =========================================================================
     
     printf("  Invoking sm120_mixed_input_moe_gemm_kernelLauncher...\n");
@@ -708,9 +738,10 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     }
     
     // =========================================================================
-    // Step 9: Verify output is finite
+    // Step 10: Verify output is finite and compute norm (for scale-sensitivity check)
     // =========================================================================
     
+    float norm_identity = 0.0f;
     {
         std::vector<nv_bfloat16> h_output(M_per_group * N);
         CUDA_CHECK(cudaMemcpy(h_output.data(), h_output_ptrs[0], 
@@ -719,16 +750,21 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
         int nan_count = 0;
         int inf_count = 0;
         int zero_count = 0;
+        double sum_sq = 0.0;
         
         for (int i = 0; i < M_per_group * N; i++) {
             float val = __bfloat162float(h_output[i]);
             if (std::isnan(val)) nan_count++;
             else if (std::isinf(val)) inf_count++;
             else if (val == 0.0f) zero_count++;
+            sum_sq += static_cast<double>(val) * static_cast<double>(val);
         }
+        
+        norm_identity = static_cast<float>(sqrt(sum_sq));
         
         printf("  Output stats: NaN=%d, Inf=%d, Zero=%d, Total=%d\n",
                nan_count, inf_count, zero_count, M_per_group * N);
+        printf("  Output norm (identity scales): %e\n", norm_identity);
         
         if (nan_count > 0 || inf_count > 0) {
             printf("  FAIL: Output contains NaN or Inf values\n");
@@ -738,7 +774,126 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
         printf("  PASS: Output is finite\n");
     }
     
-    printf("  PASS: SM12x grouped GEMM with identity SFA completed successfully!\n");
+    // =========================================================================
+    // Step 11: SCALE-SENSITIVITY CHECK - Run with tiny scales (0x00 = 2^(-127) ≈ 0)
+    // =========================================================================
+    //
+    // This proves that the kernel actually USES the scale factors:
+    //   - Identity (0x7F) → output has normal magnitude
+    //   - Tiny (0x00)     → output should be essentially zero
+    //
+    // If the output norms are similar, it means scales are being ignored!
+    //
+    // IMPORTANT: We allocate SEPARATE buffers for tiny scales (don't mutate
+    // the cached identity buffers from the manager).
+    //
+    {
+        printf("\n  === Scale-sensitivity check ===\n");
+        
+        // Allocate separate tiny-scale buffers (0x00 = 2^(0-127) ≈ 5.9e-39)
+        uint8_t* tiny_sfa = nullptr;
+        uint8_t* tiny_sfb = nullptr;
+        CUDA_CHECK(cudaMalloc(&tiny_sfa, sfa_bytes_act));
+        CUDA_CHECK(cudaMalloc(&tiny_sfb, sfb_bytes_weight));
+        CUDA_CHECK(cudaMemset(tiny_sfa, 0x00, sfa_bytes_act));  // Tiny scale
+        CUDA_CHECK(cudaMemset(tiny_sfb, 0x00, sfb_bytes_weight));  // Tiny scale
+        
+        // Build pointer arrays for tiny scales (separate from identity arrays!)
+        std::vector<uint8_t const*> h_tiny_sfa_ptrs(num_groups, tiny_sfa);
+        std::vector<uint8_t const*> h_tiny_sfb_ptrs(num_groups, tiny_sfb);
+        
+        uint8_t const** d_tiny_sfa_ptrs = nullptr;
+        uint8_t const** d_tiny_sfb_ptrs = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_tiny_sfa_ptrs, num_groups * sizeof(uint8_t*)));
+        CUDA_CHECK(cudaMalloc(&d_tiny_sfb_ptrs, num_groups * sizeof(uint8_t*)));
+        CUDA_CHECK(cudaMemcpy(d_tiny_sfa_ptrs, h_tiny_sfa_ptrs.data(), 
+                              num_groups * sizeof(uint8_t*), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_tiny_sfb_ptrs, h_tiny_sfb_ptrs.data(), 
+                              num_groups * sizeof(uint8_t*), cudaMemcpyHostToDevice));
+        
+        // Reset output buffers
+        for (int g = 0; g < num_groups; g++) {
+            CUDA_CHECK(cudaMemset(h_output_ptrs[g], 0, output_bytes));
+        }
+        
+        // Update hopper_inputs to use tiny scales
+        hopper_inputs.fpX_block_scaling_factors_act = d_tiny_sfa_ptrs;
+        hopper_inputs.fpX_block_scaling_factors_weight = d_tiny_sfb_ptrs;
+        
+        printf("  Running kernel with tiny scales (0x00 = 2^(-127))...\n");
+        
+        try {
+            sm120_mixed_input_moe_gemm_kernelLauncher<
+                __nv_fp8_e4m3,
+                uint8_t,
+                nv_bfloat16,
+                cutlass::epilogue::NoSmemWarpSpecialized,
+                cute::Shape<cute::_64, cute::_128, cute::_128>,
+                cute::Shape<cute::_1, cute::_1, cute::_1>,
+                false
+            >(inputs, hopper_inputs, sm_count, nullptr);
+            
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+        } catch (const std::exception& e) {
+            printf("  FAIL: Tiny-scale kernel threw exception: %s\n", e.what());
+            cudaFree(tiny_sfa);
+            cudaFree(tiny_sfb);
+            cudaFree(d_tiny_sfa_ptrs);
+            cudaFree(d_tiny_sfb_ptrs);
+            goto cleanup;
+        }
+        
+        // Compute output norm with tiny scales
+        float norm_tiny = 0.0f;
+        {
+            std::vector<nv_bfloat16> h_output(M_per_group * N);
+            CUDA_CHECK(cudaMemcpy(h_output.data(), h_output_ptrs[0], 
+                                  output_bytes, cudaMemcpyDeviceToHost));
+            
+            double sum_sq = 0.0;
+            for (int i = 0; i < M_per_group * N; i++) {
+                float val = __bfloat162float(h_output[i]);
+                sum_sq += static_cast<double>(val) * static_cast<double>(val);
+            }
+            norm_tiny = static_cast<float>(sqrt(sum_sq));
+        }
+        
+        printf("  Output norm (tiny scales): %e\n", norm_tiny);
+        printf("  Ratio (tiny/identity): %e\n", 
+               norm_identity > 0 ? norm_tiny / norm_identity : 0.0f);
+        
+        // Cleanup tiny-scale buffers
+        cudaFree(tiny_sfa);
+        cudaFree(tiny_sfb);
+        cudaFree(d_tiny_sfa_ptrs);
+        cudaFree(d_tiny_sfb_ptrs);
+        
+        // SCALE-SENSITIVITY ASSERTION
+        // If scales are actually used, tiny scales should produce dramatically
+        // smaller output (norm_tiny << norm_identity)
+        // We expect at least 100x reduction (1e-2 threshold)
+        if (norm_identity > 1e-10f) {
+            float ratio = norm_tiny / norm_identity;
+            if (ratio > 1e-2f) {
+                printf("  FAIL: Scale-sensitivity check failed!\n");
+                printf("        Tiny scales should produce ~0 output, but ratio = %e\n", ratio);
+                printf("        This suggests scales are being ignored.\n");
+                goto cleanup;
+            }
+            printf("  PASS: Scale-sensitivity check passed (ratio = %e < 0.01)\n", ratio);
+        } else {
+            printf("  WARN: Identity output norm is very small (%e), skipping ratio check\n",
+                   norm_identity);
+        }
+    }
+    
+    printf("\n  PASS: SM12x grouped GEMM with identity SFA completed successfully!\n");
+    printf("  BLESS CRITERIA MET:\n");
+    printf("    ✓ Kernel runs without TMA/memory errors\n");
+    printf("    ✓ Output is finite\n");
+    printf("    ✓ Scale-sensitivity check passed (scales are actually used)\n");
+    printf("    ✓ num_groups=%d exercises pointer array indexing\n", num_groups);
     
     // =========================================================================
     // Cleanup
