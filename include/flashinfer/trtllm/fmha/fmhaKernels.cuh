@@ -56,9 +56,6 @@ constexpr bool isSMCompatible(int gpuSM, int kernelSM) {
     return kernelSM == kSM_100f || kernelSM == kSM_103;
   } else if (gpuSM == kSM_100) {
     return kernelSM == kSM_100f || kernelSM == kSM_100;
-  } else if (gpuSM == kSM_120 || gpuSM == 121) {
-    // SM120/SM121 (GB10 DGX Spark) uses SM100 kernels (same Blackwell class)
-    return kernelSM == kSM_100f || kernelSM == kSM_100;
   }
 
   return gpuSM == kernelSM;
