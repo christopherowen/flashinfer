@@ -326,7 +326,7 @@ __global__ void quantize_activation_to_fp8_tail_kernel(
 }
 
 // =============================================================================
-// Identity Scale Buffer Manager
+// Identity Scale Buffer Manager (HOST-ONLY)
 // =============================================================================
 //
 // Manages pre-allocated identity scale buffers in the correct CUTLASS layout.
@@ -337,6 +337,11 @@ __global__ void quantize_activation_to_fp8_tail_kernel(
 //
 // IMPORTANT: This manager does NOT use cudaStreamSynchronize inside getOrCreate
 // to avoid stalling user streams or breaking CUDA graph capture.
+//
+// NOTE: This class uses std::mutex and std::unordered_map which are HOST-ONLY.
+// It is guarded with !defined(__CUDA_ARCH__) to prevent device compilation issues.
+
+#if !defined(__CUDA_ARCH__)  // HOST-ONLY: uses std::mutex, std::unordered_map
 
 struct Sm12xIdentityScaleBufferKey {
     int device_id;    // CUDA device ID (critical for multi-GPU)
@@ -671,6 +676,8 @@ inline Sm12xSFAPointerArrayManager& getSFAPointerArrayManager() {
     static Sm12xSFAPointerArrayManager manager;
     return manager;
 }
+
+#endif  // !defined(__CUDA_ARCH__)  // End HOST-ONLY section
 
 // =============================================================================
 // Activation Quantizer API
