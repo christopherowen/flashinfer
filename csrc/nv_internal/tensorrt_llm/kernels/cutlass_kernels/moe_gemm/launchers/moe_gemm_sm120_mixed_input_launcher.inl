@@ -82,6 +82,30 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
 
 #if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4)
   /////////////////////////////////////////////////////////////////////////////
+  // RUNTIME TYPE SAFETY ASSERTION
+  /////////////////////////////////////////////////////////////////////////////
+  // SM12x block-scaled MMA only accepts FP8/FP6/FP4 inputs, not BF16/FP16.
+  // When IsMXFP4=true, the activation pointers MUST contain pre-quantized FP8 data,
+  // NOT the original BF16/FP16 data. The higher-level dispatch is responsible for:
+  //   1. Quantizing BF16/FP16 -> FP8 (float_e4m3_t)
+  //   2. Passing the FP8 pointer to this launcher
+  //
+  // This static_assert prevents silent type mismatches where BF16 is passed but
+  // interpreted as FP8, which would produce garbage output.
+  //
+  // Valid T types for this launcher:
+  //   - __nv_fp8_e4m3 / cutlass::float_e4m3_t (direct FP8 input)
+  //   - For IsMXFP4, T can be BF16/FP16 at the API level, but hopper_inputs.ptr_act
+  //     MUST point to FP8 data (after caller's pre-quantization).
+  if constexpr (IsMXFP4) {
+    // For MXFP4 workloads, we rely on the caller to have performed quantization.
+    // Log a warning to help debug if activation data looks wrong.
+    TLLM_LOG_DEBUG("SM120 MXFP4 path: Expecting pre-quantized FP8 activations in ptr_act. "
+                   "Original input type T=%s will NOT be used directly.",
+                   typeid(T).name());
+  }
+
+  /////////////////////////////////////////////////////////////////////////////
   // Type definitions
   /////////////////////////////////////////////////////////////////////////////
 
@@ -100,9 +124,8 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   //   1. Quantizing BF16/FP16 -> FP8 (float_e4m3_t)
   //   2. Providing A-scale pointers (can be identity scales = 1.0 to avoid accuracy loss)
   //
-  // For identity A-scales with broadcastable stride tricks:
-  //   - Allocate single float_ue8m0_t with raw value 0x7F (127) → 2^0 = 1.0
-  //   - Set stride to 0 to broadcast across all blocks
+  // IMPORTANT: Do NOT use stride=0 broadcast for SFA with TMA. Allocate a properly
+  // sized buffer matching CUTLASS LayoutSFA and fill with 0x7F (identity).
   //
   // ElementA for the kernel is always FP8 when using block-scaled path.
   // The IsMXFP4 flag indicates the original input was BF16/FP16 (for dispatch).

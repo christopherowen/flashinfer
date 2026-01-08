@@ -138,8 +138,40 @@ def find_cuda_tools():
     return None
 
 
-def get_sass_dump(cubin_path, tool):
-    """Get SASS dump from a cubin file."""
+def get_function_names(cubin_path, tool):
+    """Get list of function/kernel names in the cubin."""
+    if 'nvdisasm' in tool:
+        # nvdisasm -ndf shows function names
+        cmd = [tool, '-ndf', cubin_path]
+    else:  # cuobjdump
+        # cuobjdump --list-elf shows sections/symbols
+        cmd = [tool, '--list-elf', cubin_path]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+    
+    # Parse function names from output
+    functions = []
+    for line in result.stdout.split('\n'):
+        # nvdisasm format: "Function : _Z..."
+        if 'Function' in line or '.text.' in line:
+            # Extract function name
+            match = re.search(r'(\w+_\w+|_Z\S+)', line)
+            if match:
+                functions.append(match.group(1))
+    return functions
+
+
+def get_sass_dump(cubin_path, tool, function_filter=None):
+    """Get SASS dump from a cubin file.
+    
+    Args:
+        cubin_path: Path to the cubin/object file
+        tool: Path to nvdisasm or cuobjdump
+        function_filter: Optional regex pattern to filter functions by name.
+                        Only SASS from matching functions will be returned.
+    """
     if 'nvdisasm' in tool:
         cmd = [tool, '-c', cubin_path]
     else:  # cuobjdump
@@ -149,7 +181,37 @@ def get_sass_dump(cubin_path, tool):
     if result.returncode != 0:
         raise RuntimeError(f"Failed to disassemble: {result.stderr}")
     
-    return result.stdout
+    sass_output = result.stdout
+    
+    # If function filter provided, only return SASS for matching functions
+    if function_filter:
+        filtered_lines = []
+        in_target_function = False
+        current_function = None
+        
+        for line in sass_output.split('\n'):
+            # Detect function start (common patterns in nvdisasm/cuobjdump output)
+            # nvdisasm: "Function : _ZN7cutlass..."
+            # cuobjdump: ".text._ZN7cutlass..." or "Function"
+            if 'Function' in line or re.search(r'\.text\.(\S+)', line):
+                func_match = re.search(r'(\S+gemm\S+|_ZN7cutlass\S+|sm120\S+|sm121\S+)', line, re.IGNORECASE)
+                if func_match:
+                    current_function = func_match.group(1)
+                    in_target_function = bool(re.search(function_filter, current_function, re.IGNORECASE))
+                else:
+                    in_target_function = False
+            
+            # Include lines from target functions
+            if in_target_function:
+                filtered_lines.append(line)
+        
+        if filtered_lines:
+            return '\n'.join(filtered_lines)
+        else:
+            # If no matches found with filter, return full output with warning
+            print(f"WARNING: No functions matching '{function_filter}' found. Scanning all SASS.")
+    
+    return sass_output
 
 
 def analyze_sass(sass_output):
@@ -361,7 +423,7 @@ def build_test_kernel(kernel_type, flashinfer_root):
         return persistent_cubin
 
 
-def verify_kernel(cubin_path, tool):
+def verify_kernel(cubin_path, tool, kernel_name_filter=None):
     """Verify a kernel uses native FP4 MMA instructions.
     
     Verification hierarchy:
@@ -369,11 +431,33 @@ def verify_kernel(cubin_path, tool):
     2. STRONG: Good indicators (TCGEN05+FP4 or TCGEN05+BLOCK_SCALE) → LIKELY PASS
     3. WEAK: Individual patterns → needs manual review
     4. FALLBACK only: BF16/FP16 MMA without FP4 → FAIL
+    
+    Args:
+        cubin_path: Path to the compiled cubin/object file
+        tool: Path to nvdisasm or cuobjdump
+        kernel_name_filter: Optional regex to filter kernel functions by name.
+                           Only SASS from matching kernels will be analyzed.
+                           This prevents false positives from unrelated kernels.
     """
     
     print(f"\n=== Analyzing SASS for {cubin_path} ===")
     
-    sass = get_sass_dump(cubin_path, tool)
+    # If a kernel filter is provided, list available functions first
+    if kernel_name_filter:
+        functions = get_function_names(cubin_path, tool)
+        if functions:
+            matching = [f for f in functions if re.search(kernel_name_filter, f, re.IGNORECASE)]
+            print(f"Found {len(functions)} functions, {len(matching)} matching filter '{kernel_name_filter}'")
+            if matching:
+                for f in matching[:5]:
+                    print(f"  → {f}")
+                if len(matching) > 5:
+                    print(f"  ... and {len(matching) - 5} more")
+        else:
+            print("Could not list functions, scanning all SASS")
+    
+    # Get SASS with optional function filter
+    sass = get_sass_dump(cubin_path, tool, kernel_name_filter)
     definitive, strong, weak, fallback = analyze_sass(sass)
     
     print(f"\n=== Pattern Match Summary ===")
@@ -464,6 +548,19 @@ def main():
         default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         help='Path to FlashInfer root directory'
     )
+    parser.add_argument(
+        '--kernel-filter',
+        type=str,
+        default=r'gemm|moe|block_scale|fp4',
+        help='Regex pattern to filter kernel functions by name (default: gemm|moe|block_scale|fp4). '
+             'Only SASS from matching kernels will be analyzed, preventing false positives '
+             'from unrelated kernels in the same binary.'
+    )
+    parser.add_argument(
+        '--no-filter',
+        action='store_true',
+        help='Disable kernel function filtering (scan all SASS in binary)'
+    )
     
     args = parser.parse_args()
     
@@ -484,8 +581,15 @@ def main():
             print("ERROR: Failed to build test kernel")
             sys.exit(1)
     
+    # Determine kernel filter
+    kernel_filter = None if args.no_filter else args.kernel_filter
+    if kernel_filter:
+        print(f"Kernel function filter: '{kernel_filter}'")
+    else:
+        print("Scanning all kernel functions (no filter)")
+    
     # Verify
-    success = verify_kernel(cubin_path, tool)
+    success = verify_kernel(cubin_path, tool, kernel_filter)
     
     # Cleanup temp cubin if we built it
     if not args.cubin and os.path.exists(cubin_path):
