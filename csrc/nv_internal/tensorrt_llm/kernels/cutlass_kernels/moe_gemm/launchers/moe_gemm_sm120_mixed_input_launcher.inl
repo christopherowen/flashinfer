@@ -528,10 +528,11 @@ inline size_t computeSm120IdentitySFBBufferSize(int64_t M, int64_t N, int64_t K,
     auto layout_sfb = SfConfig::tile_atom_to_shape_SFB(problem_shape);
     
     // cosize gives the maximum linear index + 1 (the required buffer capacity)
-    size_t sfb_elements = cute::cosize(layout_sfb);
+    // Since ElementSF is byte-sized (uint8_t), cosize == bytes
+    size_t sfb_bytes = cute::cosize(layout_sfb);
     
     // Align to 256 bytes for TMA requirements
-    return (sfb_elements + 255) & ~size_t(255);
+    return (sfb_bytes + 255) & ~size_t(255);
 #else
     // Fallback when FP4 is not enabled - estimate based on N and K dimensions
     // SFB scales the B matrix which has shape (K, N) in column-major

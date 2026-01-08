@@ -744,34 +744,51 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
     float norm_identity = 0.0f;
     {
         std::vector<nv_bfloat16> h_output(M_per_group * N);
-        CUDA_CHECK(cudaMemcpy(h_output.data(), h_output_ptrs[0], 
-                              output_bytes, cudaMemcpyDeviceToHost));
         
-        int nan_count = 0;
-        int inf_count = 0;
-        int zero_count = 0;
-        double sum_sq = 0.0;
+        int total_nan_count = 0;
+        int total_inf_count = 0;
+        int total_zero_count = 0;
+        double total_sum_sq = 0.0;
         
-        for (int i = 0; i < M_per_group * N; i++) {
-            float val = __bfloat162float(h_output[i]);
-            if (std::isnan(val)) nan_count++;
-            else if (std::isinf(val)) inf_count++;
-            else if (val == 0.0f) zero_count++;
-            sum_sq += static_cast<double>(val) * static_cast<double>(val);
+        // Check ALL groups to verify pointer array indexing works
+        for (int g = 0; g < num_groups; g++) {
+            CUDA_CHECK(cudaMemcpy(h_output.data(), h_output_ptrs[g], 
+                                  output_bytes, cudaMemcpyDeviceToHost));
+            
+            int nan_count = 0;
+            int inf_count = 0;
+            int zero_count = 0;
+            double sum_sq = 0.0;
+            
+            for (int i = 0; i < M_per_group * N; i++) {
+                float val = __bfloat162float(h_output[i]);
+                if (std::isnan(val)) nan_count++;
+                else if (std::isinf(val)) inf_count++;
+                else if (val == 0.0f) zero_count++;
+                sum_sq += static_cast<double>(val) * static_cast<double>(val);
+            }
+            
+            float group_norm = static_cast<float>(sqrt(sum_sq));
+            printf("  Group %d: NaN=%d, Inf=%d, Zero=%d, Norm=%e\n",
+                   g, nan_count, inf_count, zero_count, group_norm);
+            
+            total_nan_count += nan_count;
+            total_inf_count += inf_count;
+            total_zero_count += zero_count;
+            total_sum_sq += sum_sq;
         }
         
-        norm_identity = static_cast<float>(sqrt(sum_sq));
+        norm_identity = static_cast<float>(sqrt(total_sum_sq));
         
-        printf("  Output stats: NaN=%d, Inf=%d, Zero=%d, Total=%d\n",
-               nan_count, inf_count, zero_count, M_per_group * N);
-        printf("  Output norm (identity scales): %e\n", norm_identity);
+        printf("  Total: NaN=%d, Inf=%d, Zero=%d, Combined norm=%e\n",
+               total_nan_count, total_inf_count, total_zero_count, norm_identity);
         
-        if (nan_count > 0 || inf_count > 0) {
+        if (total_nan_count > 0 || total_inf_count > 0) {
             printf("  FAIL: Output contains NaN or Inf values\n");
             goto cleanup;
         }
         
-        printf("  PASS: Output is finite\n");
+        printf("  PASS: All %d groups have finite output\n", num_groups);
     }
     
     // =========================================================================
@@ -844,22 +861,29 @@ bool test_real_sm12x_grouped_gemm_with_identity_sfa() {
             goto cleanup;
         }
         
-        // Compute output norm with tiny scales
+        // Compute output norm with tiny scales (sum over ALL groups)
         float norm_tiny = 0.0f;
         {
             std::vector<nv_bfloat16> h_output(M_per_group * N);
-            CUDA_CHECK(cudaMemcpy(h_output.data(), h_output_ptrs[0], 
-                                  output_bytes, cudaMemcpyDeviceToHost));
+            double total_sum_sq = 0.0;
             
-            double sum_sq = 0.0;
-            for (int i = 0; i < M_per_group * N; i++) {
-                float val = __bfloat162float(h_output[i]);
-                sum_sq += static_cast<double>(val) * static_cast<double>(val);
+            for (int g = 0; g < num_groups; g++) {
+                CUDA_CHECK(cudaMemcpy(h_output.data(), h_output_ptrs[g], 
+                                      output_bytes, cudaMemcpyDeviceToHost));
+                
+                double sum_sq = 0.0;
+                for (int i = 0; i < M_per_group * N; i++) {
+                    float val = __bfloat162float(h_output[i]);
+                    sum_sq += static_cast<double>(val) * static_cast<double>(val);
+                }
+                float group_norm = static_cast<float>(sqrt(sum_sq));
+                printf("  Group %d (tiny): Norm=%e\n", g, group_norm);
+                total_sum_sq += sum_sq;
             }
-            norm_tiny = static_cast<float>(sqrt(sum_sq));
+            norm_tiny = static_cast<float>(sqrt(total_sum_sq));
         }
         
-        printf("  Output norm (tiny scales): %e\n", norm_tiny);
+        printf("  Combined output norm (tiny scales): %e\n", norm_tiny);
         printf("  Ratio (tiny/identity): %e\n", 
                norm_identity > 0 ? norm_tiny / norm_identity : 0.0f);
         
