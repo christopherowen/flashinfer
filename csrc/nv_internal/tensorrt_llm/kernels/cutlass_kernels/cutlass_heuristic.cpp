@@ -601,18 +601,13 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm120(
   if (config & CutlassGemmConfig::GROUPED_GEMM) {
     std::vector<CutlassGemmConfig> candidate_configs;
     if ((config & CutlassGemmConfig::FP4_ONLY) != 0) {
+      // NOTE: Only CtaShape128x128x128B is currently validated for SM120 FP4.
+      // Other tile shapes (K=64, M=256, N=256) cause CUTLASS "Stages < 2" or
+      // TMA layout errors. Adding more shapes requires updating the kernel
+      // generator (generate_kernels.py) and validating with CUTLASS.
       candidate_configs.push_back(CutlassGemmConfig{
           CutlassTileConfigSM120::CtaShape128x128x128B, MainloopScheduleType::AUTO,
           EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x128x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape128x256x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-      candidate_configs.push_back(
-          CutlassGemmConfig{CutlassTileConfigSM120::CtaShape256x128x64B, MainloopScheduleType::AUTO,
-                            EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
       return candidate_configs;
     } else {
       TLLM_THROW("Not Implemented: SM120 group GEMM only supports nvfp4.");

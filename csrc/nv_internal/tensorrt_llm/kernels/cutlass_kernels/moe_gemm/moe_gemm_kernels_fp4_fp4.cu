@@ -16,6 +16,24 @@
 
 #include "moe_gemm_template_dispatch.h"
 
+// ============================================================================
+// DEBUG: Verify ENABLE_FP4 is defined in this translation unit
+// This file should ALWAYS have ENABLE_FP4 defined, otherwise FP4 kernels won't compile
+// ============================================================================
+#ifndef ENABLE_FP4
+#error "ENABLE_FP4 is not defined in moe_gemm_kernels_fp4_fp4.cu - FP4 kernels will not be compiled!"
+#endif
+
+// DEBUG: Verify SM12x support is enabled (if targeting SM120/SM121)
+#ifdef DEBUG_SM120_K_CONV
+#ifndef CUTLASS_ARCH_MMA_SM12x_SUPPORTED
+#warning "CUTLASS_ARCH_MMA_SM12x_SUPPORTED is not defined - SM120/SM121 kernels will not be available"
+#endif
+#ifndef COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS
+#warning "COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS is not defined - SM120 grouped GEMM will throw at runtime"
+#endif
+#endif
+
 namespace tensorrt_llm::kernels::cutlass_kernels {
 #ifdef ENABLE_FP4
 template class MoeGemmRunner<__nv_fp4_e2m1, __nv_fp4_e2m1, half>;

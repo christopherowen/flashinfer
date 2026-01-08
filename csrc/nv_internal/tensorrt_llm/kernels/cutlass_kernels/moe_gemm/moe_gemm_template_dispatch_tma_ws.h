@@ -48,10 +48,14 @@
 
 #include <cuda.h>
 #include <cuda_fp16.h>
+#ifdef ENABLE_FP4
+#include <cuda_fp4.h>  // Required for __nv_fp4_e2m1 type in FP4 specialization
+#endif
 #include <math.h>
 
 #include <mutex>
 #include <sstream>
+#include <type_traits>
 
 #include "../include/moe_gemm_kernels.h"
 #include "./launchers/moe_gemm_tma_ws_launcher.h"
@@ -65,20 +69,47 @@ namespace tensorrt_llm::kernels::cutlass_kernels_oss {
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
-/* Helper to get sizeof_bits for a type, with explicit handling for FP4.
- * This is needed because TllmToCutlassTypeAdapter might fall back to the default
- * template if the FP4 specialization isn't visible (due to include order issues). */
+// ============================================================================
+// Helper to get sizeof_bits for dispatch, robust against include-order issues.
+// Uses if constexpr instead of template specialization to avoid
+// "specialization wasn't visible at first instantiation" bugs.
+// ============================================================================
 template <typename T>
-struct GetSizeofBitsForDispatch {
-  using CutlassT = typename kernels::cutlass_kernels::TllmToCutlassTypeAdapter<T>::type;
-  static constexpr int value = cutlass::sizeof_bits<CutlassT>::value;
-};
+constexpr int dispatch_sizeof_bits() {
 #if defined(ENABLE_FP4)
-template <>
-struct GetSizeofBitsForDispatch<__nv_fp4_e2m1> {
-  static constexpr int value = 4;  // FP4 = 4 bits, explicit to avoid include order issues
-};
+  if constexpr (std::is_same_v<T, __nv_fp4_e2m1>) {
+    return 4;  // FP4 = 4 bits
+  }
 #endif
+  using CutlassT = typename kernels::cutlass_kernels::TllmToCutlassTypeAdapter<T>::type;
+  return cutlass::sizeof_bits<CutlassT>::value;
+}
+
+// ============================================================================
+// DEBUG: Compile-time trap to verify dispatch type and bitwidth
+// Enable with: -DDEBUG_SM120_K_CONV
+// ============================================================================
+#ifdef DEBUG_SM120_K_CONV
+template <typename T>
+constexpr void debug_assert_fp4_bits() {
+  // If we think this is FP4 dispatch, prove it.
+#if defined(ENABLE_FP4)
+  if constexpr (std::is_same_v<T, __nv_fp4_e2m1>) {
+    static_assert(dispatch_sizeof_bits<T>() == 4,
+                  "Dispatch sees __nv_fp4_e2m1 but bits != 4");
+  }
+#endif
+
+  // Catch the most common failure mode: dispatch uses uint8_t instead of __nv_fp4_e2m1
+  if constexpr (std::is_same_v<T, uint8_t>) {
+    static_assert(!std::is_same_v<T, uint8_t>,
+                  "Dispatch T is uint8_t. You are NOT dispatching on __nv_fp4_e2m1; K conversion will be wrong.");
+  }
+}
+#define IF_DEBUG_SM120_K_CONV(x) x
+#else
+#define IF_DEBUG_SM120_K_CONV(x)
+#endif  // DEBUG_SM120_K_CONV
 
 template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
           EpilogueFusion FUSION, typename TileShape, typename ClusterShape, bool is_wfp4afp8>
@@ -414,9 +445,14 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
 
 #define SHAPE_CASE(SMVERSION, M, N, K)                                                            \
   case cutlass_extensions::CutlassTileConfigSM##SMVERSION::CtaShape##M##x##N##x##K##B: {          \
-    constexpr int KtileBytes = (K * 8) / GetSizeofBitsForDispatch<T>::value;                      \
-    using KTileDim = Int<KtileBytes>;                                                             \
-    using TileShape = Shape<_##M, _##N, KTileDim>;                                                \
+    /* DEBUG: Verify dispatch type when enabled */                                                \
+    /* Rebuild with -DDEBUG_SM120_K_CONV to catch type mismatches at compile time */              \
+    IF_DEBUG_SM120_K_CONV(debug_assert_fp4_bits<T>();)                                            \
+    /* Convert K from bytes to elements: K_elements = (K_bytes * 8) / bits_per_element */         \
+    /* For FP4 (4 bits): 128 bytes -> 256 elements */                                             \
+    /* For FP8/INT8 (8 bits): 128 bytes -> 128 elements */                                        \
+    constexpr int KtileElems = (K * 8) / dispatch_sizeof_bits<T>();                               \
+    using TileShape = Shape<_##M, _##N, Int<KtileElems>>;                                         \
     dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized<                                          \
         cutlass::arch::Sm##SMVERSION, T, WeightType, OutputType, EpilogueTag, FUSION, TileShape>( \
         hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy,         \
@@ -496,10 +532,11 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
     if constexpr (kernels::cutlass_kernels::isValidSM12xMOESpecialisation<T, WeightType,
                                                                           EpilogueTag, FUSION>()) {
       switch (gemm_config.tile_config_sm120) {
-        SHAPE_CASE(120, 128, 128, 64)
+        // NOTE: Only CtaShape128x128x128B is currently validated for SM120 FP4.
+        // Other tile shapes (K=64, M=256, N=256) cause CUTLASS "Stages < 2" or
+        // TMA layout errors. The heuristic in cutlass_heuristic.cpp should only
+        // return CtaShape128x128x128B for FP4 workloads.
         SHAPE_CASE(120, 128, 128, 128)
-        SHAPE_CASE(120, 128, 256, 64)
-        SHAPE_CASE(120, 256, 128, 64)
         DEFAULT_CASE(120)
       }
     }

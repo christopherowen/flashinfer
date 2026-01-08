@@ -795,17 +795,21 @@ SM120_TILE_SHAPES = {
     # - This size allows 2+ pipeline stages
     #
     # NVFP4 (FP4 x FP4): Same-type block-scaled GEMM
+    # NOTE: Only (128, 128, 128B) is currently validated to work.
+    # Larger tiles cause CUTLASS "Stages < 2" or TMA layout errors.
+    # The heuristic should be updated to only return this config for FP4.
     "nvfp4": {
-        "M_TILES": [128],  # Only 128 currently validated for FP4
-        "N_TILES": [128],  # Only 128 currently validated for FP4
-        "K_TILES": [128],  # 128 bytes = 256 FP4 elements
+        "M_TILES": [128],       # Only 128 currently validated for FP4
+        "N_TILES": [128],       # Only 128 currently validated for FP4
+        "K_TILES": [128],       # 128 bytes = 256 FP4 elements
     },
     # FP8xFP4: Mixed-input with FP8 activations, FP4 weights
     # Also used for MXFP4 after bf16/fp16 -> FP8 quantization
+    # NOTE: Only (128, 128, 128B) is currently validated to work.
     "fp8xfp4": {
-        "M_TILES": [128],  # Only 128 currently validated
-        "N_TILES": [128],  # Only 128 currently validated
-        "K_TILES": [128],  # 128 bytes = 256 FP4 elements for weight
+        "M_TILES": [128],       # Only 128 currently validated
+        "N_TILES": [128],       # Only 128 currently validated
+        "K_TILES": [128],       # 128 bytes = 256 FP4 elements for weight
     },
     # NOTE: MXFP4 is NOT registered at kernel level.
     # SM120 MMA only supports FP8/FP6/FP4 inputs. For MXFP4 (W4A16) with
