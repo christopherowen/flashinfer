@@ -915,6 +915,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        # Guard against calling plan() during CUDA graph capture
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FlashInfer BatchDecodeWithPagedKVCacheWrapper.plan() was called during "
+                "CUDA graph capture. Call plan() BEFORE capture begins."
+            )
+
         self._workspace_size = (
             self._float_workspace_buffer.numel()
             * self._float_workspace_buffer.element_size()
@@ -1707,7 +1714,16 @@ class BatchDecodeMlaWithPagedKVCacheWrapper:
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
         during this call and cached for multiple run calls.
+
+        The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        # Guard against calling plan() during CUDA graph capture
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FlashInfer BatchMLAPagedDecodeWrapper.plan() was called during "
+                "CUDA graph capture. Call plan() BEFORE capture begins."
+            )
+
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0

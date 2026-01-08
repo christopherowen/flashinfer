@@ -401,7 +401,17 @@ def get_batch_prefill_attention_sink_module(backend, dtype_q, dtype_kv, dtype_o,
     
     This module supports attention sinks for models like GPT-OSS-120B.
     The sink parameter is an additional value per head in the softmax denominator.
+    
+    Note: This function performs JIT compilation on first call. It must NOT be
+    called during CUDA graph capture.
     """
+    # Guard against JIT compilation during CUDA graph capture
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "FlashInfer get_batch_prefill_attention_sink_module() was called during "
+            "CUDA graph capture. Ensure sink modules are pre-loaded before capture."
+        )
+    
     uri = get_batch_prefill_attention_sink_uri(
         backend, dtype_q, dtype_kv, dtype_o, dtype_idx,
         head_dim_qk, head_dim_vo, pos_encoding_mode, use_sliding_window
@@ -1781,6 +1791,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        # Guard against calling plan() during CUDA graph capture
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FlashInfer BatchPrefillWithPagedKVCacheWrapper.plan() was called during "
+                "CUDA graph capture. Call plan() BEFORE capture begins."
+            )
+
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -2759,6 +2776,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        # Guard against calling plan() during CUDA graph capture
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FlashInfer BatchPrefillWithRaggedKVCacheWrapper.plan() was called during "
+                "CUDA graph capture. Call plan() BEFORE capture begins."
+            )
+
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
