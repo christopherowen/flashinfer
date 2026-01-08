@@ -21,15 +21,9 @@
  * This kernel is designed for small batch sizes (M<=16) where the grouped GEMM
  * kernel's 128x128 tiles result in poor compute efficiency.
  *
- * Uses CUTLASS GemvBlockScaled kernel with:
- * - ElementA: float_e2m1_t (FP4 e2m1, activations, quantized from BF16)
- * - ElementB: float_e2m1_t (FP4 e2m1, weights)
- * - ElementC/D: bfloat16_t (output)
- * - Block scaling with SFVecSize=16
- *
- * CURRENT STATUS:
- * - Phase 1: Software dequant fallback (IMPLEMENTED, ~7 tok/s)
- * - Phase 2: CUTLASS GemvBlockScaled native (TODO, target ~58 tok/s)
+ * Implementations:
+ * 1. Software dequant fallback (ACTIVE) - ~7 tok/s
+ * 2. CUTLASS GemvBlockScaled native (WIP) - target ~58 tok/s
  */
 
 #include <cuda.h>
@@ -39,16 +33,21 @@
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
 
-// For CUTLASS GemvBlockScaled (Phase 2)
-// #include "cutlass/gemm/device/gemv_blockscaled.h"
-// #include "cutlass/gemm/kernel/gemv_blockscaled.h"
-// #include "cutlass/epilogue/threadblock/epilogue_with_scaling_factor.h"
-// #include "cutlass/detail/sm100_blockscaled_layout.hpp"
-
 // TVM FFI bindings
 #include "../tvm_ffi_utils.h"
 
 using tvm::ffi::TensorView;
+
+//==============================================================================
+// Feature flags - enable when ready
+//==============================================================================
+// #define USE_CUTLASS_GEMV_NATIVE  // Enable CUTLASS native path
+
+#ifdef USE_CUTLASS_GEMV_NATIVE
+#include "cutlass/gemm/device/gemv_blockscaled.h"
+#include "cutlass/gemm/kernel/gemv_blockscaled.h"
+#include "gemv_epilogue_bf16.h"
+#endif
 
 namespace flashinfer {
 namespace gemv {
@@ -57,17 +56,11 @@ namespace gemv {
 static constexpr int kBlockSize = 32;  // MXFP4 block size for scale factors
 
 //==============================================================================
-// Software Dequantization Fallback (Phase 1)
+// Software Dequantization Fallback
 //==============================================================================
 
 /*!
  * \brief Simple FP4 dequantization for GEMV fallback
- *
- * This is a simple implementation that dequantizes FP4 weights and performs
- * a standard GEMV in BF16. It's not optimal but serves as a baseline and
- * fallback path.
- *
- * For production, we should integrate the actual CUTLASS GemvBlockScaled kernel.
  */
 __global__ void gemv_fp4_dequant_kernel(
     const uint8_t* __restrict__ A_packed,   // [M, K/2] packed FP4 activations
@@ -102,7 +95,6 @@ __global__ void gemv_fp4_dequant_kernel(
         int b_hi = (b_byte >> 4) & 0x0F;
         
         // Simple FP4 e2m1 dequantization (approximate)
-        // FP4 e2m1 has values: ±{0, 0.5, 1, 1.5, 2, 3, 4, 6}
         auto dequant_fp4 = [](int val) -> float {
             static const float lut[16] = {
                 0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
@@ -117,12 +109,9 @@ __global__ void gemv_fp4_dequant_kernel(
         int n_block = n / kBlockSize;
         int num_k_blocks = (K + kBlockSize - 1) / kBlockSize;
         
-        // Scale factor indexing (simplified - FP8 e4m3 stored as uint8)
-        // Convert FP8 to float via __nv_cvt_fp8_to_fp32
         uint8_t a_scale_bits = A_scales[m_block * num_k_blocks + k_block];
         uint8_t b_scale_bits = B_scales[n_block * num_k_blocks + k_block];
         
-        // Simple FP8 e4m3 to float conversion
         auto fp8_to_float = [](uint8_t bits) -> float {
             __nv_fp8_e4m3 fp8;
             memcpy(&fp8, &bits, 1);
@@ -132,7 +121,6 @@ __global__ void gemv_fp4_dequant_kernel(
         float a_scale = fp8_to_float(a_scale_bits);
         float b_scale = fp8_to_float(b_scale_bits);
         
-        // Dequantize and multiply
         float a_val_lo = dequant_fp4(a_lo) * a_scale;
         float a_val_hi = dequant_fp4(a_hi) * a_scale;
         float b_val_lo = dequant_fp4(b_lo) * b_scale;
@@ -149,9 +137,6 @@ __global__ void gemv_fp4_dequant_kernel(
     D[m * N + n] = __float2bfloat16(result);
 }
 
-/*!
- * \brief Run FP4 GEMV with dequantization fallback
- */
 cudaError_t run_gemv_fp4_dequant(
     int m, int k, int n,
     float alpha, float beta,
@@ -179,30 +164,141 @@ cudaError_t run_gemv_fp4_dequant(
 }
 
 //==============================================================================
-// CUTLASS GemvBlockScaled Native (Phase 2) - TODO
+// CUTLASS GemvBlockScaled Native Implementation
 //==============================================================================
 
-/*
- * Phase 2 implementation will use CUTLASS GemvBlockScaled directly:
- *
- * using ElementA = cutlass::float_e2m1_t;  // FP4
- * using ElementB = cutlass::float_e2m1_t;  // FP4
- * using ElementC = cutlass::bfloat16_t;
- * using ElementD = cutlass::bfloat16_t;
- * using ElementAccumulator = float;
- * using ElementSFA = cutlass::float_e4m3_t;  // FP8 scale
- * using ElementSFB = cutlass::float_e4m3_t;  // FP8 scale
- * 
- * static constexpr int kElementsPerAccess = 32;  // Fixed for FP4
- * static constexpr int kThreadCount = 128;
- * static constexpr int kThreadsPerRow = 16;
- * static constexpr int kSFVecSize = 16;
- *
- * This requires:
- * 1. Custom epilogue for BF16 output with scale factor
- * 2. Proper scale factor layout matching MXFP4 format
- * 3. Integration with FlashInfer's activation quantization
- */
+#ifdef USE_CUTLASS_GEMV_NATIVE
+
+// Type definitions for CUTLASS GEMV
+using ElementA = cutlass::float_e2m1_t;  // FP4 e2m1
+using ElementSFA = cutlass::float_e4m3_t;  // FP8 scale
+using LayoutA = cutlass::layout::RowMajor;
+
+using ElementB = cutlass::float_e2m1_t;  // FP4 e2m1
+using ElementSFB = cutlass::float_e4m3_t;  // FP8 scale
+
+using ElementC = cutlass::bfloat16_t;  // BF16 output
+using ElementD = cutlass::bfloat16_t;
+using LayoutD = cutlass::layout::ColumnMajor;
+
+using ElementAccumulatorMainloop = cutlass::half_t;
+using ElementAccumulator = float;
+using ElementCompute = float;
+
+static constexpr int kVectorSize = 16;
+static constexpr int kElementsPerAccess = 32;  // Fixed for FP4
+
+using ThreadShape = cutlass::gemm::GemmShape<16, 8>;
+
+// Custom epilogue for BF16 output
+using EpilogueOp = flashinfer::epilogue::GemvEpilogueBF16<
+    kVectorSize,
+    ThreadShape,
+    ElementCompute,
+    ElementAccumulator,
+    ElementC,
+    ElementD,
+    LayoutD
+>;
+
+// GEMV kernel type
+using GemvKernel = cutlass::gemm::kernel::GemvBlockScaled<
+    ElementA, LayoutA, ElementB, ElementD,
+    ElementAccumulatorMainloop, EpilogueOp, kElementsPerAccess
+>;
+
+// Device wrapper
+using GemvDevice = cutlass::gemm::device::GemvBlockScaled<GemvKernel>;
+
+cudaError_t run_gemv_fp4_native(
+    int m, int k, int n,
+    float alpha, float beta,
+    const void* ptr_A,
+    const void* ptr_B,
+    void* ptr_D,
+    const void* ptr_SFA,
+    const void* ptr_SFB,
+    cudaStream_t stream
+) {
+    // Problem size (M rows, K cols, N=1 for GEMV)
+    cutlass::MatrixCoord problem_size(m, k);
+    int batch_count = n;  // Handle N>1 as batched GEMV
+
+    // Construct arguments
+    typename GemvDevice::Arguments arguments{
+        problem_size,
+        batch_count,
+        typename EpilogueOp::Params{
+            cutlass::TensorRef<ElementD, LayoutD>(
+                reinterpret_cast<ElementD*>(ptr_D),
+                LayoutD(m)
+            ),
+            ElementCompute(alpha),
+            ElementCompute(beta),
+            m * sizeof(ElementD),  // batch_stride_d
+            m                      // stride_d
+        },
+        cutlass::TensorRef<const ElementA, LayoutA>(
+            reinterpret_cast<const ElementA*>(ptr_A),
+            LayoutA(k)
+        ),
+        reinterpret_cast<const ElementB*>(ptr_B),
+        nullptr,  // ptr_C (no bias)
+        reinterpret_cast<ElementD*>(ptr_D),
+        reinterpret_cast<const ElementSFA*>(ptr_SFA),
+        reinterpret_cast<const ElementSFB*>(ptr_SFB),
+        k,              // stride_A
+        m * k,          // batch_stride_A
+        k,              // batch_stride_B
+        m,              // batch_stride_C
+        m,              // batch_stride_D
+        0,              // batch_stride_SFA (computed internally)
+        0,              // batch_stride_SFB
+        0               // batch_stride_SFD (not used)
+    };
+
+    // Instantiate and run
+    GemvDevice gemv_op;
+
+    cutlass::Status status = gemv_op.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+        return cudaErrorInvalidValue;
+    }
+
+    size_t workspace_size = GemvDevice::get_workspace_size(arguments);
+    cutlass::device_memory::allocation<uint8_t> workspace(workspace_size);
+
+    status = gemv_op.initialize(arguments, workspace.get(), stream);
+    if (status != cutlass::Status::kSuccess) {
+        return cudaErrorInvalidConfiguration;
+    }
+
+    status = gemv_op(stream);
+    return status == cutlass::Status::kSuccess ? cudaSuccess : cudaErrorLaunchFailure;
+}
+
+#endif  // USE_CUTLASS_GEMV_NATIVE
+
+//==============================================================================
+// Main dispatch function
+//==============================================================================
+
+cudaError_t run_gemv_fp4(
+    int m, int k, int n,
+    float alpha, float beta,
+    const void* ptr_A,
+    const void* ptr_B,
+    void* ptr_D,
+    const void* ptr_SFA,
+    const void* ptr_SFB,
+    cudaStream_t stream
+) {
+#ifdef USE_CUTLASS_GEMV_NATIVE
+    return run_gemv_fp4_native(m, k, n, alpha, beta, ptr_A, ptr_B, ptr_D, ptr_SFA, ptr_SFB, stream);
+#else
+    return run_gemv_fp4_dequant(m, k, n, alpha, beta, ptr_A, ptr_B, ptr_D, ptr_SFA, ptr_SFB, stream);
+#endif
+}
 
 }  // namespace gemv
 }  // namespace flashinfer
@@ -211,16 +307,6 @@ cudaError_t run_gemv_fp4_dequant(
 // TVM FFI Bindings
 //==============================================================================
 
-/*!
- * \brief TVM FFI function for FP4 GEMV
- *
- * D = alpha * A @ B + beta * D
- * A: [M, K/2] packed FP4 (uint8)
- * B: [K/2, N] packed FP4 (uint8)
- * D: [M, N] bfloat16
- * SFA: activation scale factors (FP8 as uint8)
- * SFB: weight scale factors (FP8 as uint8)
- */
 void gemv_fp4_blockscaled(
     int64_t m,
     int64_t k,
@@ -233,9 +319,9 @@ void gemv_fp4_blockscaled(
     TensorView SFA,
     TensorView SFB
 ) {
-    cudaStream_t stream = nullptr;  // Default stream
+    cudaStream_t stream = nullptr;
 
-    cudaError_t err = flashinfer::gemv::run_gemv_fp4_dequant(
+    cudaError_t err = flashinfer::gemv::run_gemv_fp4(
         static_cast<int>(m),
         static_cast<int>(k),
         static_cast<int>(n),
@@ -253,9 +339,6 @@ void gemv_fp4_blockscaled(
         << "GEMV FP4 kernel failed: " << cudaGetErrorString(err);
 }
 
-/*!
- * \brief TVM FFI function for batched FP4 GEMV
- */
 void batched_gemv_fp4(
     int64_t num_experts,
     int64_t m,
@@ -270,7 +353,6 @@ void batched_gemv_fp4(
 ) {
     cudaStream_t stream = nullptr;
 
-    // For now, loop over experts (can be optimized with batched kernel later)
     size_t a_stride = m * (k / 2);
     size_t b_stride = (k / 2) * n;
     size_t d_stride = m * n * sizeof(__nv_bfloat16);
@@ -278,12 +360,12 @@ void batched_gemv_fp4(
     size_t sfb_stride = ((n + 31) / 32) * ((k + 31) / 32);
     
     for (int64_t e = 0; e < num_experts; e++) {
-        cudaError_t err = flashinfer::gemv::run_gemv_fp4_dequant(
+        cudaError_t err = flashinfer::gemv::run_gemv_fp4(
             static_cast<int>(m),
             static_cast<int>(k),
             static_cast<int>(n),
             static_cast<float>(alpha),
-            0.0f,  // beta = 0 for batched
+            0.0f,
             reinterpret_cast<const uint8_t*>(A.data_ptr()) + e * a_stride,
             reinterpret_cast<const uint8_t*>(B.data_ptr()) + e * b_stride,
             reinterpret_cast<uint8_t*>(D.data_ptr()) + e * d_stride,
@@ -298,6 +380,5 @@ void batched_gemv_fp4(
     }
 }
 
-// Export functions
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemv_fp4_blockscaled, gemv_fp4_blockscaled);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(batched_gemv_fp4, batched_gemv_fp4);
