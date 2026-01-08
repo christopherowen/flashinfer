@@ -69,6 +69,48 @@ using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput
 // WARNING: CUTLASS header says "exp_bias: 8" but convert_to_float uses FP32's
 // bias of 127. Always use 0x7F for identity, NOT 8!
 //
+
+// =============================================================================
+// Identity SFA Buffer Acquisition API
+// =============================================================================
+//
+// Callers MUST use these functions to acquire identity SFA buffers before
+// calling the launcher. The launcher does NOT own SFA allocation.
+//
+// Usage pattern (in the dispatch code that prepares hopper_inputs):
+//
+//   // Step 1: Compute required SFA buffer size (kernel-derived)
+//   size_t sfa_bytes = computeSm120IdentitySFABufferSize(M_max, N, K, num_experts);
+//
+//   // Step 2: Acquire pre-filled identity buffer (no hot-path alloc/memset)
+//   uint8_t* identity_sfa = acquireSm120IdentitySFABuffer(sfa_bytes);
+//
+//   // Step 3: Set up per-group pointer array (all groups use same identity buffer)
+//   // Note: For grouped GEMM, you need a pointer array with one pointer per group
+//   std::vector<uint8_t const*> sfa_ptrs(num_experts, identity_sfa);
+//   hopper_inputs.fpX_block_scaling_factors_act = sfa_ptrs.data();
+//
+//   // Step 4: Call launcher
+//   sm120_mixed_input_moe_gemm_kernelLauncher(...);
+//
+
+// Compute required SFA buffer size for identity scales
+// This is kernel-derived: uses the same Sm1xxBlockScaledConfig as the kernel
+// M_max: Maximum M across all groups in grouped GEMM
+// N, K: Problem dimensions
+// L: Number of groups (experts)
+size_t computeSm120IdentitySFABufferSize(int64_t M_max, int64_t N, int64_t K, int64_t L = 1);
+
+// Acquire identity SFA buffer of the given size
+// Uses Sm12xIdentityScaleBufferManager::getOrCreateWithSize internally
+// Returns pre-filled buffer (all 0x7F), cached per (device, size)
+// No allocation or memset in steady-state (after first call for each size)
+uint8_t* acquireSm120IdentitySFABuffer(size_t required_bytes);
+
+// Prewarm identity SFA buffers for common MoE shapes
+// Call at engine initialization to avoid first-call allocation latency
+void prewarmSm120IdentitySFABuffers(const std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>& shapes);
+
 template <typename T, typename WeightType, typename GemmOutputType, typename EpilogueTag,
           typename CTAShape, typename ClusterShape, bool IsMXFP4 = false>
 void sm120_mixed_input_moe_gemm_kernelLauncher(

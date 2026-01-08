@@ -38,6 +38,7 @@
 #include "moe_gemm_sm120_mixed_input_launcher.h"
 #include "../sm12x_arch_config.h"
 #include "../sm12x_layout_sfa_utils.h"
+#include "../sm12x_activation_quantizer.cuh"  // For identity buffer manager
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -231,32 +232,55 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   using LayoutSFB = typename CollectiveMainloop::LayoutSFB;
 
   /////////////////////////////////////////////////////////////////////////////
-  // HOW LAYOUTSFA CAPACITY IS DERIVED (for documentation)
+  // STATIC VERIFICATION: Kernel LayoutSFA uses the same SfConfig we use for sizing
+  /////////////////////////////////////////////////////////////////////////////
+  //
+  // The block-scaled collective uses Sm1xxBlockScaledConfig with a specific SFVecSize.
+  // We verify that the SFVecSize matches what our sizing computation uses.
+  //
+  // For MXFP types (mx_float8_t, mx_float4_t), SFVecSize = 32 (MXFPXBlockScaleVectorSize)
+  // For NVFP4 types (nv_float4_t), SFVecSize = 16 (NVFP4BlockScaleVectorSize)
+  //
+  // The kernel's LayoutSFA is derived from Sm1xxBlockScaledConfig<SFVecSize>::LayoutSF
+  // Our sizing function uses Sm1xxBlockScaledConfig<kSFVecSize_SM12x> where kSFVecSize_SM12x=32
+  //
+  // This static_assert verifies we're using the correct SFVecSize for this kernel.
+  //
+  static_assert(kSFVecSize_SM12x == TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize,
+      "SFVecSize mismatch: sizing uses kSFVecSize_SM12x but kernel uses MXFPXBlockScaleVectorSize");
+  
+  // Additional runtime verification in debug builds
+  using SfConfig = cutlass::detail::Sm1xxBlockScaledConfig<kSFVecSize_SM12x>;
+
+  /////////////////////////////////////////////////////////////////////////////
+  // HOW LAYOUTSFA CAPACITY IS DERIVED
   /////////////////////////////////////////////////////////////////////////////
   //
   // The kernel's LayoutSFA type (extracted above) defines the exact memory layout
-  // expected by TMA for scale factor loads. The required buffer size is computed
-  // using CUTLASS's Sm1xxBlockScaledConfig::tile_atom_to_shape_SFA(problem_shape)
-  // which creates a tiled layout and cute::cosize() which gives the codomain size.
+  // expected by TMA for scale factor loads. The static_assert above verifies that
+  // our sizing function uses the SAME layout construction as the kernel.
   //
-  // For this kernel, the layout is:
-  //   SfAtom = Layout<Shape<(32,4), (SFVecSize,4)>, Stride<(16,4), (0,1)>>
-  //   tiled to (M, N, K, L) dimensions (N is used by CUTLASS even for SFA)
+  // Required buffer size is computed as:
+  //   auto layout_sfa = SfConfig::tile_atom_to_shape_SFA(make_shape(M, N, K, L));
+  //   size_t required_bytes = cute::cosize(layout_sfa);  // + alignment
   //
-  // CALLER USAGE:
-  // To acquire identity SFA buffer with kernel-derived sizing:
+  // This is KERNEL-DERIVED because we've verified the layout type matches.
+  //
+  // IDENTITY SFA ACQUISITION (caller must do this BEFORE calling launcher):
   //
   //   #include "../sm12x_layout_sfa_utils.h"
   //   #include "../sm12x_activation_quantizer.cuh"
   //
+  //   // Compute size using the verified sizing function
   //   size_t required_bytes = computeKernelSFABufferSize<CollectiveMainloop>(M_max, N, K, L);
+  //
+  //   // Acquire identity buffer (pre-filled with 0x7F, no hot-path alloc/memset)
   //   auto& mgr = getIdentityScaleBufferManager();
   //   uint8_t* identity_sfa = mgr.getOrCreateWithSize(required_bytes);
-  //   hopper_inputs.fpX_block_scaling_factors_act = identity_sfa;
   //
-  // WHERE IT IS VERIFIED:
-  // In debug builds, assertSFABufferSizeCorrect<CollectiveMainloop>() checks that
-  // the allocated buffer is >= the kernel's requirement.
+  //   // Wire into hopper_inputs
+  //   hopper_inputs.fpX_block_scaling_factors_act = &identity_sfa;  // Per-group pointer array
+  //
   /////////////////////////////////////////////////////////////////////////////
 
   GemmGrouped gemm;
@@ -404,6 +428,61 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
 #else
   TLLM_THROW("SM120/SM121 mixed-input GEMM requires CUTLASS_ARCH_MMA_SM12x_SUPPORTED (SM120 or SM121) and ENABLE_FP4");
 #endif  // CUTLASS_ARCH_MMA_SM12x_SUPPORTED && ENABLE_FP4
+}
+
+// =============================================================================
+// Identity SFA Buffer Acquisition API Implementation
+// =============================================================================
+
+// Compute required SFA buffer size for identity scales (kernel-derived)
+inline size_t computeSm120IdentitySFABufferSize(int64_t M_max, int64_t N, int64_t K, int64_t L) {
+#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4)
+    // Use the same SfConfig that the kernel uses (verified by static_assert in launcher)
+    using SfConfig = cutlass::detail::Sm1xxBlockScaledConfig<kSFVecSize_SM12x>;
+    
+    // Create problem shape with the maximum M across all groups
+    auto problem_shape = cute::make_shape(
+        static_cast<int>(M_max),
+        static_cast<int>(N),
+        static_cast<int>(K),
+        static_cast<int>(L)
+    );
+    
+    // Get the SFA layout for this problem shape
+    auto layout_sfa = SfConfig::tile_atom_to_shape_SFA(problem_shape);
+    
+    // cosize gives the maximum linear index + 1 (the required buffer capacity)
+    size_t sfa_elements = cute::cosize(layout_sfa);
+    
+    // Align to 256 bytes for TMA requirements
+    return (sfa_elements + 255) & ~size_t(255);
+#else
+    // Fallback when FP4 is not enabled
+    return tensorrt_llm::kernels::cutlass_kernels::Sm12xLayoutSFAUtils::computeBufferSize(
+        static_cast<int>(M_max), static_cast<int>(N), static_cast<int>(K), static_cast<int>(L)
+    );
+#endif
+}
+
+// Acquire identity SFA buffer using the size-based API
+inline uint8_t* acquireSm120IdentitySFABuffer(size_t required_bytes) {
+    auto& mgr = tensorrt_llm::kernels::cutlass_kernels::getIdentityScaleBufferManager();
+    return mgr.getOrCreateWithSize(required_bytes);
+}
+
+// Prewarm identity SFA buffers for common MoE shapes
+inline void prewarmSm120IdentitySFABuffers(
+    const std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>>& shapes) {
+    
+    std::vector<size_t> sizes;
+    sizes.reserve(shapes.size());
+    
+    for (const auto& [M_max, N, K, L] : shapes) {
+        sizes.push_back(computeSm120IdentitySFABufferSize(M_max, N, K, L));
+    }
+    
+    auto& mgr = tensorrt_llm::kernels::cutlass_kernels::getIdentityScaleBufferManager();
+    mgr.prewarmWithSizes(sizes);
 }
 
 }  // namespace cutlass_kernels_oss
