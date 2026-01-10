@@ -51,8 +51,10 @@
 
 #include <mutex>
 #include <sstream>
+#include <type_traits>
 
 #include "../include/moe_gemm_kernels.h"
+#include "sm12x_arch_config.h"
 #include "./launchers/moe_gemm_tma_ws_launcher.h"
 #include "./moe_tma_warp_specialized_traits.h"
 #include "tensorrt_llm/common/assert.h"
@@ -63,6 +65,9 @@
 namespace tensorrt_llm::kernels::cutlass_kernels_oss {
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
+
+// SM12x K bytes→elements conversion is defined in sm12x_arch_config.h
+// Use: kernels::cutlass_kernels::Sm12xKBytesToElements<T, KBytes>()
 
 template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
           EpilogueFusion FUSION, typename TileShape, typename ClusterShape, bool is_wfp4afp8>
@@ -283,19 +288,24 @@ constexpr bool are_tile_shapes_supported_sm100() {
 template <typename CtaShape, typename ClusterShape, typename DataType>
 constexpr bool are_tile_shapes_supported_sm120() {
   using namespace cute;
+  // SM12x only supports 1x1x1 cluster shape
   if constexpr (cute::size<0>(ClusterShape{}) != 1 || cute::size<1>(ClusterShape{}) != 1 ||
                 cute::size<2>(ClusterShape{}) != 1) {
     return false;
   }
-  // This is the epilogue shape. The MMA shape will be twice this for 2SM
   constexpr auto TileM = size<0>(CtaShape{});
   constexpr auto TileN = size<1>(CtaShape{});
   constexpr auto TileK = size<2>(CtaShape{});
 
-  return (TileM == 128 && TileN == 128 && TileK == 128) ||
-         (TileM == 128 && TileN == 128 && TileK == 256) ||
-         (TileM == 128 && TileN == 256 && TileK == 128) ||
-         (TileM == 256 && TileN == 128 && TileK == 128);
+  // SM12x block-scaled GEMM constraints:
+  // - M,N must be multiples of 128 (Blk_MN) for TMA layout
+  // - K dimension in TileShape is in ELEMENTS (not bytes):
+  //   * FP4 (4 bits): 128 bytes → 256 elements
+  //   * FP8 (8 bits): 128 bytes → 128 elements
+  // - Only (128, 128, 128B) is validated; larger tiles cause CUTLASS builder errors
+  //
+  // Accept K=128 (FP8 path) or K=256 (FP4 path with 128 bytes)
+  return (TileM == 128 && TileN == 128 && (TileK == 128 || TileK == 256));
 }
 
 /*
@@ -470,17 +480,32 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
       TLLM_THROW("Unsupported SM100 configuration requested");
     }
   } else if (gemm_config.sm_version == 120 || gemm_config.sm_version == 121) {
-    TLLM_LOG_TRACE("At %s, SM120 config=%d", __PRETTY_FUNCTION__,
+    TLLM_LOG_TRACE("At %s, SM12x config=%d", __PRETTY_FUNCTION__,
                    (int)gemm_config.tile_config_sm120);
-    if constexpr (kernels::cutlass_kernels::isValidSM120MOESpecialisation<T, WeightType,
+    // Use SM12x validation which covers both SM120 and SM121
+    if constexpr (kernels::cutlass_kernels::isValidSM12xMOESpecialisation<T, WeightType,
                                                                           EpilogueTag, FUSION>()) {
+      // SM12x-specific SHAPE_CASE using single-source-of-truth K conversion
+      // K is in BYTES in the config name, converted to ELEMENTS for TileShape
+      // Uses kernels::cutlass_kernels::Sm12xKBytesToElements from sm12x_arch_config.h
+#define SM12x_SHAPE_CASE(M, N, K)                                                                 \
+  case cutlass_extensions::CutlassTileConfigSM120::CtaShape##M##x##N##x##K##B: {                   \
+    /* K conversion: FP4 weights -> K*2 elements, else K elements */                              \
+    constexpr int KtileElems = kernels::cutlass_kernels::Sm12xKBytesToElements<T, K>::value; \
+    using TileShape = cute::Shape<cute::_##M, cute::_##N, cute::Int<KtileElems>>;                 \
+    dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized<                                          \
+        cutlass::arch::Sm120, T, WeightType, OutputType, EpilogueTag, FUSION, TileShape>(         \
+        hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy,         \
+        workspace_size);                                                                          \
+    break;                                                                                        \
+  }
       switch (gemm_config.tile_config_sm120) {
-        SHAPE_CASE(120, 128, 128, 64)
-        SHAPE_CASE(120, 128, 128, 128)
-        SHAPE_CASE(120, 128, 256, 64)
-        SHAPE_CASE(120, 256, 128, 64)
+        // Only 128x128x128B is validated for SM12x FP4
+        // K=64B shapes cause CUTLASS builder "Stages < 2" errors
+        SM12x_SHAPE_CASE(128, 128, 128)
         DEFAULT_CASE(120)
       }
+#undef SM12x_SHAPE_CASE
     }
   }
 #undef SHAPE_CASE

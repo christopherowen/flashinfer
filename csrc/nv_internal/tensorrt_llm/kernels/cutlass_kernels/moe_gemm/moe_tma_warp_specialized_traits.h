@@ -19,6 +19,7 @@
 #include "../include/moe_gemm_kernels.h"
 #include "cutlass/arch/mma_sm90.h"
 #include "cutlass_extensions/epilogue_helpers.h"
+#include "sm12x_arch_config.h"
 
 #ifdef ENABLE_FP4
 #include <cuda_fp4.h>
@@ -26,13 +27,53 @@
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
 
-// Blackwell arch
+// =============================================================================
+// SM12x (SM120 + SM121) Support
+// =============================================================================
+//
+// SM12x kernel-level support (what the CUTLASS kernel accepts):
+// - NVFP4: FP4 x FP4 (same type)
+// - FP8xFP4: FP8 activations x FP4 weights
+//
+// NOTE: MXFP4 (BF16/FP16 x FP4) is NOT directly supported by the kernel.
+// vLLM's MXFP4 layer quantizes BF16→FP8 first, then calls the FP8xFP4 kernel.
+// See AGENTS.md: "MXFP4 Path: BF16 activations → quantize to FP8 → FP8×FP4 kernel"
+//
+
+// Check if configuration is valid for SM12x MoE (covers SM120 and SM121)
+template <typename T, typename WeightType,
+          typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,
+          TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
+              TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
+constexpr bool isValidSM12xMOESpecialisation() {
+#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED)
+#if defined(ENABLE_FP4)
+  // NVFP4: FP4 x FP4
+  constexpr bool IsNVFP4 = cutlass::platform::is_same<T, __nv_fp4_e2m1>::value &&
+                           cutlass::platform::is_same<T, WeightType>::value;
+  // FP8xFP4: FP8 activations x FP4 weights (also used by MXFP4 after BF16→FP8 quant)
+  constexpr bool IsFP8xFP4 = cutlass::platform::is_same<T, __nv_fp8_e4m3>::value &&
+                             cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value;
+
+  return (IsNVFP4 || IsFP8xFP4) &&
+         cutlass::platform::is_same<EpilogueTag, cutlass_extensions::EpilogueOpDefault>::value;
+#else
+  return false;
+#endif
+#else
+  return false;
+#endif
+}
+
+// =============================================================================
+// Legacy SM120-only check (kept for backward compatibility)
+// =============================================================================
 template <typename T, typename WeightType,
           typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,
           TmaWarpSpecializedGroupedGemmInput::EpilogueFusion Fusion =
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidSM120MOESpecialisation() {
-#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)  // TODO Is there a better choice
+#if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
 #if defined(ENABLE_FP4)
   return ((cutlass::platform::is_same<T, __nv_fp4_e2m1>::value &&
            cutlass::platform::is_same<T, WeightType>::value) ||
@@ -43,7 +84,7 @@ constexpr bool isValidSM120MOESpecialisation() {
   return false;
 #endif
 #else
-  return false;  // CUTLASS_ARCH_MMA_SM100_SUPPORTED is set when Blackwell kernels are enabled
+  return false;
 #endif
 }
 
@@ -103,7 +144,8 @@ template <typename T, typename WeightType,
               TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE>
 constexpr bool isValidTmaWarpSpecializedMOESpecialisation() {
   // Check at least one of the implementations are valid
-  return isValidSM120MOESpecialisation<T, WeightType>() ||
+  // Note: isValidSM12xMOESpecialisation covers both SM120 and SM121
+  return isValidSM12xMOESpecialisation<T, WeightType, EpilogueTag, Fusion>() ||
          isValidBlackwellMOESpecialisation<T, WeightType, EpilogueTag, Fusion>() ||
          isValidHopperMOESpecialisation<T, WeightType, EpilogueTag, Fusion>();
 }
