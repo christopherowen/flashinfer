@@ -46,6 +46,7 @@ from .page import get_seq_lens
 from .prefill import (
     get_batch_prefill_jit_module,
     get_batch_prefill_module,
+    get_batch_prefill_attention_sink_module,
     get_single_prefill_module,
 )
 from .utils import (
@@ -845,6 +846,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         seq_lens: Optional[torch.Tensor] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        use_sinks: bool = False,
     ) -> None:
         r"""Plan batch decode for given problem specification.
 
@@ -903,6 +905,16 @@ class BatchDecodeWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        use_sinks : bool
+            Whether to enable attention sinks for this attention computation. Defaults to ``False``.
+            When enabled, requires:
+            - use_tensor_cores=True (only tensor-core decode supports sinks)
+            - backend='fa2' (only FA2 supports sinks)
+            - Non-FP8 inputs (BF16/FP16 only)
+            - The ``sinks`` parameter must be passed to :meth:`run` with shape ``[num_qo_heads]``
+            Attention sinks add an additional term to the softmax denominator per head,
+            as used by models like GPT-OSS-120B.
+
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -945,17 +957,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 indices, non_blocking=(indices.device == self.device) and non_blocking
             )
         else:
+            # Ensure non_blocking is a boolean (older PyTorch accepts None, newer versions don't)
+            nb = non_blocking if non_blocking is not None else True
             self._paged_kv_indptr_buf = indptr.to(
-                self.device, non_blocking=non_blocking
+                self.device, non_blocking=nb
             )
             self._paged_kv_indices_buf = indices.to(
-                self.device, non_blocking=non_blocking
+                self.device, non_blocking=nb
             )
             self._paged_kv_last_page_len_buf = last_page_len.to(
-                self.device, non_blocking=non_blocking
+                self.device, non_blocking=nb
             )
             self._qo_indptr_buf = qo_indptr_host.to(
-                self.device, non_blocking=non_blocking
+                self.device, non_blocking=nb
             )
 
         indptr_host = indptr.to("cpu")
@@ -1038,6 +1052,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._max_kv_len = max(kv_lens_arr_host).item()
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
+                self._use_sinks = False
             else:
                 if self._backend == "auto":
                     self._backend = determine_attention_backend(
@@ -1048,19 +1063,49 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         q_data_type,
                         kv_data_type,
                     )
-                self._cached_module = get_batch_prefill_module(
-                    self._backend,
-                    q_data_type,
-                    kv_data_type,
-                    o_data_type,
-                    indptr.dtype,
-                    head_dim,  # head_dim_qk
-                    head_dim,  # head_dim_vo
-                    PosEncodingMode[pos_encoding_mode].value,
-                    window_left != -1,  # use_sliding_window
-                    logits_soft_cap > 0,  # use_logits_soft_cap
-                    False,  # use_fp16_qk_reduction
-                )
+                if use_sinks:
+                    if self._backend != "fa2":
+                        raise NotImplementedError(
+                            f"Attention sinks are only supported with backend='fa2', "
+                            f"got backend='{self._backend}'. Either use backend='fa2' or "
+                            f"set use_sinks=False."
+                        )
+                    # Check for FP8 dtypes - sink module is compiled with fp8_enabled=False
+                    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+                    if q_data_type in fp8_dtypes or kv_data_type in fp8_dtypes:
+                        raise NotImplementedError(
+                            "Attention sinks are not supported with FP8 inputs. "
+                            "Use BF16/FP16 inputs or set use_sinks=False."
+                        )
+                    self._cached_module = get_batch_prefill_attention_sink_module(
+                        self._backend,
+                        q_data_type,
+                        kv_data_type,
+                        o_data_type,
+                        indptr.dtype,
+                        head_dim,  # head_dim_qk
+                        head_dim,  # head_dim_vo
+                        PosEncodingMode[pos_encoding_mode].value,
+                        window_left != -1,  # use_sliding_window
+                        logits_soft_cap > 0,  # use_logits_soft_cap
+                        False,  # use_fp16_qk_reduction
+                    )
+                    self._use_sinks = True
+                else:
+                    self._cached_module = get_batch_prefill_module(
+                        self._backend,
+                        q_data_type,
+                        kv_data_type,
+                        o_data_type,
+                        indptr.dtype,
+                        head_dim,  # head_dim_qk
+                        head_dim,  # head_dim_vo
+                        PosEncodingMode[pos_encoding_mode].value,
+                        window_left != -1,  # use_sliding_window
+                        logits_soft_cap > 0,  # use_logits_soft_cap
+                        False,  # use_fp16_qk_reduction
+                    )
+                    self._use_sinks = False
 
             args = [
                 self._float_workspace_buffer,
@@ -1088,6 +1133,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 *args,
             )
         else:
+            if use_sinks:
+                raise NotImplementedError(
+                    "Attention sinks require use_tensor_cores=True for decode. "
+                    "Either set use_tensor_cores=True or set use_sinks=False."
+                )
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
@@ -1102,6 +1152,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     window_left != -1,  # use_sliding_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                 )
+            self._use_sinks = False
             self._plan_info = self._cached_module.plan(
                 self._float_workspace_buffer,
                 self._int_workspace_buffer,
@@ -1239,8 +1290,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        sinks : Optional[torch.Tensor]
+            The attention sink values per head, shape: ``[num_qo_heads]``, dtype: ``float32``.
+            Required when ``use_sinks=True`` was passed to :meth:`plan`.
+            These values are added to the softmax denominator (in log space) for each head.
+            Raises ``ValueError`` if ``use_sinks=True`` in plan but ``sinks`` is not provided here.
         q_len_per_req : int
             The number of query tokens per request, if not provided, will be set to ``1``.
+
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -1337,6 +1394,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
             if self._jit_module is not None:
                 run_args.extend(list(args))
+            elif getattr(self, '_use_sinks', False) and self._backend == "fa2":
+                # FA2 attention sink module: expects sink and sm_scale as extra params
+                if sinks is None:
+                    raise ValueError("sinks must be provided when use_sinks=True in plan()")
+                run_args += [
+                    sinks,
+                    sm_scale,
+                ]
             else:
                 # Extract FP8 scale tensors from *args if q is FP8
                 fp8_scale_q = None

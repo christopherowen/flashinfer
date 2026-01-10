@@ -25,10 +25,12 @@ import torch
 from .api_logging import flashinfer_api
 from .jit import (
     gen_batch_prefill_module,
+    gen_batch_prefill_attention_sink_module,
     gen_customize_batch_prefill_module,
     gen_fmha_cutlass_sm100a_module,
     gen_single_prefill_module,
     get_batch_prefill_uri,
+    get_batch_prefill_attention_sink_uri,
     get_single_prefill_uri,
     setup_cubin_loader,
     gen_trtllm_gen_fmha_module,
@@ -798,6 +800,36 @@ def get_batch_prefill_module(backend, *args):
         plan=plan_func,
         ragged_run=ragged_run,
         paged_run=paged_run,
+    )
+
+
+@functools.cache
+def get_batch_prefill_attention_sink_module(backend, dtype_q, dtype_kv, dtype_o, dtype_idx,
+                                             head_dim_qk, head_dim_vo, pos_encoding_mode,
+                                             use_sliding_window,
+                                             use_logits_soft_cap=False,
+                                             use_fp16_qk_reduction=False):
+    """Get the attention sink variant of the batch prefill module.
+
+    This module supports attention sinks for models like GPT-OSS-120B.
+    The sink parameter is an additional value per head in the softmax denominator.
+    """
+    uri = get_batch_prefill_attention_sink_uri(
+        backend, dtype_q, dtype_kv, dtype_o, dtype_idx,
+        head_dim_qk, head_dim_vo, pos_encoding_mode, use_sliding_window,
+        use_logits_soft_cap, use_fp16_qk_reduction
+    )
+    module = gen_batch_prefill_attention_sink_module(
+        backend, dtype_q, dtype_kv, dtype_o, dtype_idx,
+        head_dim_qk, head_dim_vo, pos_encoding_mode, use_sliding_window,
+        use_logits_soft_cap, use_fp16_qk_reduction
+    ).build_and_load()
+
+    return SimpleNamespace(
+        plan=module.plan,
+        paged_run=module.paged_run,
+        ragged_run=module.ragged_run,
+        uri=uri,
     )
 
 
@@ -1628,6 +1660,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        use_sinks: bool = False,
     ) -> None:
         r"""Plan batch prefill/append attention on Paged KV-Cache for given problem specification.
 
@@ -1738,6 +1771,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
+        use_sinks : bool
+            Whether to enable attention sinks for this attention computation. Defaults to ``False``.
+            When enabled, requires:
+            - backend='fa2' (only FA2 supports sinks)
+            - Non-FP8 inputs (BF16/FP16 only)
+            - The ``sinks`` parameter must be passed to :meth:`run` with shape ``[num_qo_heads]``
+            Attention sinks add an additional term to the softmax denominator per head,
+            as used by models like GPT-OSS-120B.
+
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1915,9 +1957,39 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     use_fp16_qk_reduction,
                 )
 
-                self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
-                )
+                if use_sinks:
+                    if self._backend != "fa2":
+                        raise NotImplementedError(
+                            f"Attention sinks are only supported with backend='fa2', "
+                            f"got backend='{self._backend}'. Either use backend='fa2' or "
+                            f"set use_sinks=False."
+                        )
+                    # Check for FP8 dtypes - sink module is compiled with fp8_enabled=False
+                    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+                    if q_data_type in fp8_dtypes or kv_data_type in fp8_dtypes:
+                        raise NotImplementedError(
+                            "Attention sinks are not supported with FP8 inputs. "
+                            "Use BF16/FP16 inputs or set use_sinks=False."
+                        )
+                    self._cached_module = get_batch_prefill_attention_sink_module(
+                        self._backend,
+                        q_data_type,
+                        kv_data_type,
+                        o_data_type,
+                        paged_kv_indptr.dtype,
+                        head_dim_qk,
+                        head_dim_vo,
+                        PosEncodingMode[pos_encoding_mode].value,
+                        window_left >= 0,  # use_sliding_window
+                        logits_soft_cap > 0,  # use_logits_soft_cap
+                        use_fp16_qk_reduction,
+                    )
+                    self._use_sinks = True
+                else:
+                    self._cached_module = get_batch_prefill_module(
+                        self._backend, *get_module_args
+                    )
+                    self._use_sinks = False
 
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
@@ -2098,6 +2170,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
             Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+        sinks : Optional[torch.Tensor]
+            The attention sink values per head, shape: ``[num_qo_heads]``, dtype: ``float32``.
+            Required when ``use_sinks=True`` was passed to :meth:`plan`.
+            These values are added to the softmax denominator (in log space) for each head.
+            Raises ``ValueError`` if ``use_sinks=True`` in plan but ``sinks`` is not provided here.
+
         Returns
         -------
         Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
@@ -2236,6 +2314,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ]
             if self._jit_module is not None:
                 run_args.extend(list(args))
+            elif getattr(self, '_use_sinks', False) and self._backend == "fa2":
+                # FA2 attention sink module: expects sink and sm_scale as extra params
+                if sinks is None:
+                    raise ValueError("sinks must be provided when use_sinks=True in plan()")
+                run_args += [
+                    sinks,
+                    sm_scale,
+                ]
             else:
                 # Extract FP8 scale tensors from *args if q is FP8
                 fp8_scale_q = None

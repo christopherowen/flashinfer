@@ -30,6 +30,12 @@ from .attention import gen_batch_decode_module as gen_batch_decode_module
 from .attention import gen_batch_mla_module as gen_batch_mla_module
 from .attention import gen_batch_prefill_module as gen_batch_prefill_module
 from .attention import (
+    gen_batch_prefill_attention_sink_module as gen_batch_prefill_attention_sink_module,
+)
+from .attention import (
+    get_batch_prefill_attention_sink_uri as get_batch_prefill_attention_sink_uri,
+)
+from .attention import (
     gen_customize_batch_decode_module as gen_customize_batch_decode_module,
 )
 from .attention import (
