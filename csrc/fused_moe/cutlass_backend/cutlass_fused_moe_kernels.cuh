@@ -1250,28 +1250,49 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
   auto const num_tokens_to_expert = num_tokens_including_expert - num_tokens_before_expert;
   auto const gemm_m = num_tokens_to_expert;
 
+  // For block-scaled operations (MXFP4/NVFP4), the problem shape's M dimension must match
+  // the scale factor alignment (128 for SM120). If gemm_m=0, we still need a valid M
+  // because the scale factor TMA descriptor requires consistent dimensions.
+  // This ensures the problem shape and scale factor layouts are consistent.
+  bool const has_block_scale_fc1 =
+      quant_params.fp4.fc1.weight_block_scale ||
+      quant_params.fp8_mxfp4.fc1.weight_block_scale ||
+      quant_params.mxfp8_mxfp4.fc1.weight_block_scale;
+  bool const has_block_scale_fc2 =
+      quant_params.fp4.fc2.weight_block_scale ||
+      quant_params.fp8_mxfp4.fc2.weight_block_scale ||
+      quant_params.mxfp8_mxfp4.fc2.weight_block_scale;
+  
+  // When block scaling is enabled and gemm_m=0, use the alignment (128) for problem shape
+  // to match the scale factor layout. This prevents TMA descriptor creation failures.
+  constexpr int64_t kBlockScaleAlignment = 128;
+  auto const gemm_m_for_problem = (has_block_scale_fc1 || has_block_scale_fc2) && gemm_m == 0
+      ? kBlockScaleAlignment : gemm_m;
+
   // M and N transposed since we are using the #tokens as the N dimension
   layout_info1.shape_info.problem_shapes[expert] =
       TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(
-          layout_info1.swap_ab ? gemm1_n : gemm_m, layout_info1.swap_ab ? gemm_m : gemm1_n,
+          layout_info1.swap_ab ? gemm1_n : gemm_m_for_problem, 
+          layout_info1.swap_ab ? gemm_m_for_problem : gemm1_n,
           gemm1_k);
   layout_info2.shape_info.problem_shapes[expert] =
       TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(
-          layout_info2.swap_ab ? gemm2_n : gemm_m, layout_info2.swap_ab ? gemm_m : gemm2_n,
+          layout_info2.swap_ab ? gemm2_n : gemm_m_for_problem, 
+          layout_info2.swap_ab ? gemm_m_for_problem : gemm2_n,
           gemm2_k);
 
   if (layout_info1.int4_groupwise_params.enabled) {
     layout_info1.int4_groupwise_params.shape.problem_shapes[expert] =
         TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt::
-            UnderlyingProblemShape(layout_info1.swap_ab ? gemm1_n : gemm_m,
-                                   layout_info1.swap_ab ? gemm_m : gemm1_n, gemm1_k);
+            UnderlyingProblemShape(layout_info1.swap_ab ? gemm1_n : gemm_m_for_problem,
+                                   layout_info1.swap_ab ? gemm_m_for_problem : gemm1_n, gemm1_k);
   }
 
   if (layout_info2.int4_groupwise_params.enabled) {
     layout_info2.int4_groupwise_params.shape.problem_shapes[expert] =
         TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::ProblemShapeInt::
-            UnderlyingProblemShape(layout_info2.swap_ab ? gemm2_n : gemm_m,
-                                   layout_info2.swap_ab ? gemm_m : gemm2_n, gemm2_k);
+            UnderlyingProblemShape(layout_info2.swap_ab ? gemm2_n : gemm_m_for_problem,
+                                   layout_info2.swap_ab ? gemm_m_for_problem : gemm2_n, gemm2_k);
   }
 
   if (alpha_scale_flat1 && alpha_scale_flat2) {
@@ -1280,14 +1301,25 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
   }
 
   auto setupIfSelected = [&](auto bs_config, auto quant_type) {
+    // IMPORTANT:
+    // LayoutSFA/LayoutSFB shapes must match the per-expert GEMM problem shapes (M/N/K).
+    // The scale-factor *buffers* may be internally padded/offset per-expert, but that padding is
+    // handled by the base-pointer offset computations (e.g. getOffsetActivationSF / getOffsetWeightSF),
+    // not by lying about the logical M dimension here.
+    //
+    // For empty experts (gemm_m == 0), some CUTLASS/TMA paths still require valid layouts.
+    // Use a minimal logical M=1 for scale-factor layout construction; the GEMM problem shape
+    // remains M=0 so no output rows are produced for this expert.
+    int const gemm_m_for_sf = (gemm_m == 0) ? 1 : static_cast<int>(gemm_m);
+
     if (quant_type.fc1.weight_block_scale) {
       setupFP4BlockScalingFactors<decltype(bs_config)>(
-          layout_info1, expert, gemm_m, gemm1_n, gemm1_k, fp4_act_flat1,
+          layout_info1, expert, gemm_m_for_sf, gemm1_n, gemm1_k, fp4_act_flat1,
           quant_type.fc1.weight_block_scale, num_tokens_before_expert);
     }
     if (quant_type.fc2.weight_block_scale) {
       setupFP4BlockScalingFactors<decltype(bs_config)>(
-          layout_info2, expert, gemm_m, gemm2_n, gemm2_k, fp4_act_flat2,
+          layout_info2, expert, gemm_m_for_sf, gemm2_n, gemm2_k, fp4_act_flat2,
           quant_type.fc2.weight_block_scale, num_tokens_before_expert);
     }
   };
@@ -1303,6 +1335,14 @@ __global__ void computeStridesTmaWarpSpecializedKernel(
   assert(gemm1_k > 0 && gemm1_k <= INT32_MAX);
   assert(gemm2_n > 0 && gemm2_n <= INT32_MAX);
   assert(gemm2_k > 0 && gemm2_k <= INT32_MAX);
+  // IMPORTANT:
+  // Scale-factor layouts (SFA/SFB) for SM12x block-scaled kernels use 128-element granularity in
+  // the M/N dimension, and we handle that inside setupFP4BlockScalingFactors() via aligned_gemm_m.
+  //
+  // However, the *activation/output* buffers are NOT padded per-expert: expert_first_token_offset
+  // is a prefix-sum over real tokens. Therefore, StrideA/StrideD and ptr_act/ptr_d must be built
+  // from the TRUE gemm_m (which may be 0 for inactive experts), or else the packed buffers will be
+  // described incorrectly and TMA descriptor creation can fail.
   computeTmaWarpSpecializedInputStrides(layout_info1, gemm_m, gemm1_n, gemm1_k, expert);
   computeTmaWarpSpecializedInputStrides(layout_info2, gemm_m, gemm2_n, gemm2_k, expert);
 

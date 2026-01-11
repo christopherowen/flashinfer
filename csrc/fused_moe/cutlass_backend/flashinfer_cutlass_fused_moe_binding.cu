@@ -379,10 +379,20 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     // TODO: support lora in the future
     ::tensorrt_llm::kernels::LoraParams lora_params{};
     // HACK Define default values for parameters we don't have good values for
-    bool const swizzled_input_sf = true;               // Assume input_sf is swizzled by default
+    //
+    // For the MXFP8-activation scaling path, vLLM passes input_sf produced by
+    // flashinfer.mxfp8_quantize(..., is_sf_swizzled_layout=True) (the default).
+    // To avoid ever misinterpreting that tensor (which can cause CUTLASS init failures),
+    // we treat any provided input_sf as being in the swizzled layout
+    // (QuantizationSFLayout::SWIZZLED_128x4).
+    bool const swizzled_input_sf = input_sf.has_value();
     int64_t const unpadded_hidden_size = hidden_size;  // Assume no padding by default
     bool const use_lora = false;                       // No lora support yet
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
+    if (mUseMxfp8ActScaling) {
+      TVM_FFI_ICHECK(input_sf.has_value())
+          << "use_mxfp8_act_scaling=True requires input_sf (swizzled scale factors) to be provided";
+    }
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
         swizzled_input_sf, reinterpret_cast<int const*>(token_selected_experts.data_ptr()),

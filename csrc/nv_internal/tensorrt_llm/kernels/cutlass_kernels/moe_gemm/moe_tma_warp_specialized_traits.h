@@ -40,6 +40,30 @@ namespace tensorrt_llm::kernels::cutlass_kernels {
 // See AGENTS.md: "MXFP4 Path: BF16 activations → quantize to FP8 → FP8×FP4 kernel"
 //
 
+// =============================================================================
+// Type Trait: Detect mixed-input path (FP4 weights with non-FP4 activations)
+// =============================================================================
+// Returns true when:
+//   - WeightType is FP4 (__nv_fp4_e2m1)
+//   - T (activation type) is NOT FP4 (could be BF16, FP16, FP8, etc.)
+//
+// This covers the vLLM MXFP4 path where:
+//   - API receives BF16/FP16 activations
+//   - Activations are pre-quantized to FP8 before the kernel
+//   - Kernel executes FP8×FP4
+//
+// Note: This is NOT the same as NVFP4 (where both T and WeightType are FP4).
+template <typename T, typename WeightType>
+constexpr bool isFP4WeightMixedInputPath() {
+#if defined(ENABLE_FP4)
+  constexpr bool IsWeightFP4 = cutlass::platform::is_same<WeightType, __nv_fp4_e2m1>::value;
+  constexpr bool IsActivationFP4 = cutlass::platform::is_same<T, __nv_fp4_e2m1>::value;
+  return IsWeightFP4 && !IsActivationFP4;
+#else
+  return false;
+#endif
+}
+
 // Check if configuration is valid for SM12x MoE (covers SM120 and SM121)
 template <typename T, typename WeightType,
           typename EpilogueTag = cutlass_extensions::EpilogueOpDefault,

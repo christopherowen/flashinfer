@@ -106,15 +106,29 @@ constexpr int kSm12xBlockScaleGranularity = 128;
 //   launcher: constexpr int K = Sm12xKBytesToElements<T, CTA_K_>::value;
 //
 
-// Primary template: use cutlass::sizeof_bits for standard types
+// Primary template: compute K elements from K bytes using sizeof_bits
+// K_elements = K_bytes * 8 / bits_per_element
+//
+// For MXFP4 (W4A16): T is BF16/FP16 at dispatch time (16 bits)
+//   K = (128 * 8) / 16 = 64 elements
+//
+// For NVFP4 (W4A4): T is FP4 at dispatch time (4 bits)
+//   K = (128 * 8) / 4 = 256 elements (or use specialization below)
+//
+// For FP8xFP8: T is FP8 at dispatch time (8 bits)
+//   K = (128 * 8) / 8 = 128 elements
 template <typename T, int KBytes>
 struct Sm12xKBytesToElements {
-  // K_elements = K_bytes * 8 / bits_per_element
-  static constexpr int value = KBytes;  // Fallback for unknown types
+  // Use sizeof(T) to get bytes, then convert to bits
+  // BF16/FP16 = 2 bytes = 16 bits
+  // FP8 = 1 byte = 8 bits
+  static constexpr int BitsPerElement = sizeof(T) * 8;
+  static constexpr int value = (KBytes * 8) / BitsPerElement;
 };
 
 #if defined(ENABLE_FP4)
 // Specialization for FP4 activation: 4 bits per element
+// Note: __nv_fp4_e2m1 is a byte-sized container but represents 4-bit values
 template <int KBytes>
 struct Sm12xKBytesToElements<__nv_fp4_e2m1, KBytes> {
   static constexpr int value = KBytes * 2;  // 8 bits/byte ÷ 4 bits/elem
@@ -122,10 +136,10 @@ struct Sm12xKBytesToElements<__nv_fp4_e2m1, KBytes> {
 #endif
 
 #if defined(ENABLE_FP8)
-// Specialization for FP8 activation: 8 bits per element
+// Explicit specialization for FP8 to be clear (matches general formula)
 template <int KBytes>
 struct Sm12xKBytesToElements<__nv_fp8_e4m3, KBytes> {
-  static constexpr int value = KBytes;  // 8 bits/byte ÷ 8 bits/elem = 1
+  static constexpr int value = KBytes;  // (KBytes * 8) / 8 = KBytes
 };
 #endif
 

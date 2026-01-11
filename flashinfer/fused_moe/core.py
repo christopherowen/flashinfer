@@ -883,6 +883,11 @@ def cutlass_fused_moe(
         enable_pdl = device_support_pdl(input.device)
 
     num_rows = input.shape[0]
+    # Safety: tuning/profile buckets must cover the actual runtime token count.
+    # vLLM (or other callers) may pass a too-small value during engine init.
+    # If tune_max_num_tokens < num_rows, CUTLASS runner initialization can fail
+    # internally even when can_implement() succeeds.
+    tune_max_num_tokens = max(int(tune_max_num_tokens), int(num_rows), 1)
     if min_latency_mode:
         num_rows *= fc2_expert_weights.shape[0]
     hidden_size = fc2_expert_weights.shape[1]

@@ -55,7 +55,11 @@
 
 #include "../include/moe_gemm_kernels.h"
 #include "sm12x_arch_config.h"
+#include "sm12x_layout_sfa_utils.h"
 #include "./launchers/moe_gemm_tma_ws_launcher.h"
+#include "./launchers/moe_gemm_sm120_mixed_input_launcher.h"
+// Include .inl for SM120 template definition (template is instantiated on-demand, not via JIT codegen)
+#include "./launchers/moe_gemm_sm120_mixed_input_launcher.inl"
 #include "./moe_tma_warp_specialized_traits.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -67,7 +71,8 @@ using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
 // SM12x K bytes→elements conversion is defined in sm12x_arch_config.h
-// Use: kernels::cutlass_kernels::Sm12xKBytesToElements<T, KBytes>()
+// Use: kernels::cutlass_kernels::Sm12xKBytesToElements<T, KBytes>::value
+// Note: T is the activation type (FP8 for MXFP4, FP4 for NVFP4)
 
 template <typename Arch, typename T, typename WeightType, typename OutputType, typename EpilogueTag,
           EpilogueFusion FUSION, typename TileShape, typename ClusterShape, bool is_wfp4afp8>
@@ -209,7 +214,15 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
               gemm_config.epilogue_schedule, dynamic_cga, swap_ab);
       selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy,
                     workspace_size, cluster_shape_cute, cluster_shape_cute_fallback);
-    } else if constexpr (Arch::kMinComputeCapability >= 120 || Arch::kMinComputeCapability == 90) {
+    } else if constexpr (Arch::kMinComputeCapability >= 120) {
+      // SM12x (120/121): Use dedicated SM120 launcher for FP4 block-scaled operations
+      // This launcher uses OpClassTensorOp + KernelScheduleSm120Blockwise pattern
+      // that is proven to work in FlashInfer's group_gemm_fp8_groupwise_sm120.cuh
+      kernels::cutlass_kernels_oss::sm120_mixed_input_moe_gemm_kernelLauncher<
+          T, WeightType, OutputType, EpilogueTag, TileShape, ClusterShape, is_wfp4afp8>(
+          hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
+    } else if constexpr (Arch::kMinComputeCapability == 90) {
+      // SM90 (Hopper): Use generic launcher
       using EpilogueSchedule = void;  // These are hardcoded in the launcher
       constexpr bool dynamic_cga = false;
       auto selected_func =
@@ -299,13 +312,11 @@ constexpr bool are_tile_shapes_supported_sm120() {
 
   // SM12x block-scaled GEMM constraints:
   // - M,N must be multiples of 128 (Blk_MN) for TMA layout
-  // - K dimension in TileShape is in ELEMENTS (not bytes):
-  //   * FP4 (4 bits): 128 bytes → 256 elements
-  //   * FP8 (8 bits): 128 bytes → 128 elements
-  // - Only (128, 128, 128B) is validated; larger tiles cause CUTLASS builder errors
+  // - K dimension in TileShape is in ELEMENTS
+  // - Only (128, 128, 128) is validated and working for MXFP4
+  // - K=256 tiles are disabled until further testing confirms correctness
   //
-  // Accept K=128 (FP8 path) or K=256 (FP4 path with 128 bytes)
-  return (TileM == 128 && TileN == 128 && (TileK == 128 || TileK == 256));
+  return (TileM == 128 && TileN == 128 && TileK == 128);
 }
 
 /*
@@ -485,18 +496,32 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(
     // Use SM12x validation which covers both SM120 and SM121
     if constexpr (kernels::cutlass_kernels::isValidSM12xMOESpecialisation<T, WeightType,
                                                                           EpilogueTag, FUSION>()) {
-      // SM12x-specific SHAPE_CASE using single-source-of-truth K conversion
+      // SM12x uses a dedicated launcher that:
+      // 1. Uses SM120-specific block-scaled kernel schedule
+      // 2. Properly handles pipeline stage configuration (Stages >= 2)
+      // 3. Supports FP8xFP4 mixed-precision (MXFP4 with pre-quantized activations)
+      //
       // K is in BYTES in the config name, converted to ELEMENTS for TileShape
-      // Uses kernels::cutlass_kernels::Sm12xKBytesToElements from sm12x_arch_config.h
+      // FP8 (8 bits/elem): 128 bytes -> 128 elements
+      // FP4 (4 bits/elem): 128 bytes -> 256 elements
 #define SM12x_SHAPE_CASE(M, N, K)                                                                 \
   case cutlass_extensions::CutlassTileConfigSM120::CtaShape##M##x##N##x##K##B: {                   \
-    /* K conversion: FP4 weights -> K*2 elements, else K elements */                              \
-    constexpr int KtileElems = kernels::cutlass_kernels::Sm12xKBytesToElements<T, K>::value; \
+    /* K conversion uses activation type T (consistent with existing CUTLASS conventions) */      \
+    constexpr int KtileElems = kernels::cutlass_kernels::Sm12xKBytesToElements<T, K>::value;      \
     using TileShape = cute::Shape<cute::_##M, cute::_##N, cute::Int<KtileElems>>;                 \
-    dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized<                                          \
-        cutlass::arch::Sm120, T, WeightType, OutputType, EpilogueTag, FUSION, TileShape>(         \
-        hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy,         \
-        workspace_size);                                                                          \
+    using ClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;  /* SM12x only supports 1x1x1 */ \
+    /* Use robust type-trait-based detection instead of checking T against specific types */      \
+    constexpr bool IsMXFP4 = kernels::cutlass_kernels::isFP4WeightMixedInputPath<T, WeightType>();      \
+    /* Guard: Only instantiate SM120 launcher for MXFP4 (FP8xFP4).                          */    \
+    /* NVFP4 (FP4xFP4) is not yet supported on SM120 and should not trigger template       */     \
+    /* instantiation which would cause compilation to fail on static_assert in launcher.    */    \
+    if constexpr (IsMXFP4) {                                                                      \
+      sm120_mixed_input_moe_gemm_kernelLauncher<T, WeightType, OutputType, EpilogueTag,           \
+                                                TileShape, ClusterShape, IsMXFP4>(                \
+          hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);   \
+    } else {                                                                                      \
+      TLLM_THROW("SM120 NVFP4 (FP4xFP4) is not yet implemented. Use MXFP4 (FP8xFP4) instead.");   \
+    }                                                                                             \
     break;                                                                                        \
   }
       switch (gemm_config.tile_config_sm120) {
