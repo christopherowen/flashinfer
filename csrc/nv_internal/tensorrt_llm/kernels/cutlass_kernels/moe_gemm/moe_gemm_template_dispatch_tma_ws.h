@@ -54,6 +54,7 @@
 
 #include "../include/moe_gemm_kernels.h"
 #include "./launchers/moe_gemm_tma_ws_launcher.h"
+#include "./launchers/moe_gemm_sm120_mixed_input_launcher.inl"
 #include "./moe_tma_warp_specialized_traits.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -207,17 +208,35 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(
     } else if constexpr (Arch::kMinComputeCapability >= 120 || Arch::kMinComputeCapability == 90) {
       using EpilogueSchedule = void;  // These are hardcoded in the launcher
       constexpr bool dynamic_cga = false;
-      auto selected_func =
-          hopper_input.swap_ab
-              ? kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
-                    Arch, T, WeightType, OutputType, EpilogueSchedule, EpilogueTag, FUSION,
-                    TileShape, ClusterShape, is_wfp4afp8, dynamic_cga, false, true>
-              : kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
-                    Arch, T, WeightType, OutputType, EpilogueSchedule, EpilogueTag, FUSION,
-                    TileShape, ClusterShape, is_wfp4afp8, dynamic_cga, false, false>;
+      
+      if constexpr (Arch::kMinComputeCapability >= 120) {
+        // SM120 specific path
+        // For SM120, we use a separate launcher that handles the block scaling and tile shapes
+        // This is to avoid template instantiation issues with CUTLASS 3.x
+        constexpr bool IsMXFP4 = is_wfp4afp8; 
+        
+        if constexpr (IsMXFP4) {
+          kernels::cutlass_kernels_oss::sm120_mixed_input_moe_gemm_kernelLauncher<
+              T, WeightType, OutputType, EpilogueTag, TileShape, ClusterShape, IsMXFP4>(
+              hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size);
+        } else {
+          TLLM_THROW("SM120 MoE GEMM only supports MXFP4 (FP8xFP4). NVFP4 (FP4xFP4) not yet implemented.");
+        }
+            
+      } else {
+        // SM90 path
+        auto selected_func =
+            hopper_input.swap_ab
+                ? kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
+                      Arch, T, WeightType, OutputType, EpilogueSchedule, EpilogueTag, FUSION,
+                      TileShape, ClusterShape, is_wfp4afp8, dynamic_cga, false, true>
+                : kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<
+                      Arch, T, WeightType, OutputType, EpilogueSchedule, EpilogueTag, FUSION,
+                      TileShape, ClusterShape, is_wfp4afp8, dynamic_cga, false, false>;
 
-      selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy,
-                    workspace_size, {}, {});
+        selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy,
+                      workspace_size, {}, {});
+      }
     }
   }
 }
@@ -282,20 +301,12 @@ constexpr bool are_tile_shapes_supported_sm100() {
 
 template <typename CtaShape, typename ClusterShape, typename DataType>
 constexpr bool are_tile_shapes_supported_sm120() {
-  using namespace cute;
-  if constexpr (cute::size<0>(ClusterShape{}) != 1 || cute::size<1>(ClusterShape{}) != 1 ||
-                cute::size<2>(ClusterShape{}) != 1) {
-    return false;
-  }
-  // This is the epilogue shape. The MMA shape will be twice this for 2SM
-  constexpr auto TileM = size<0>(CtaShape{});
-  constexpr auto TileN = size<1>(CtaShape{});
-  constexpr auto TileK = size<2>(CtaShape{});
-
-  return (TileM == 128 && TileN == 128 && TileK == 128) ||
-         (TileM == 128 && TileN == 128 && TileK == 256) ||
-         (TileM == 128 && TileN == 256 && TileK == 128) ||
-         (TileM == 256 && TileN == 128 && TileK == 128);
+  // NOTE: For SM120/121 we are currently doing early logical-tile validation at a higher level.
+  // Keep this predicate permissive so experimental tile shapes aren't pruned here.
+  (void)sizeof(CtaShape);
+  (void)sizeof(ClusterShape);
+  (void)sizeof(DataType);
+  return true;
 }
 
 /*

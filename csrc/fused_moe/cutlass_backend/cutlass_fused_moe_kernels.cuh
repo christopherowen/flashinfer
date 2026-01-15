@@ -1097,25 +1097,50 @@ __device__ void setupFP4BlockScalingFactors(
       layout_info.fpX_block_scaling_factors_stride_act);
   auto stride_weight_ptr = reinterpret_cast<typename BSConfig::LayoutSF*>(
       layout_info.fpX_block_scaling_factors_stride_weight);
+
+  // IMPORTANT: The scale-factor (SF) tensors are conceptually defined over a *padded/aligned*
+  // (M,N,K) space. Our flat SF buffer sizing and per-expert offsets (see getOffset{Weight,Activation}SF)
+  // use aligned dimensions:
+  // - outer dims (M or N) padded to MinNDimAlignment{MXFPX|NVFP4} (typically 128)
+  // - inner dim (K) padded to MinKDimAlignment{MXFPX|NVFP4} (typically block_size*4)
+  //
+  // The CUTLASS block-scaled mainloop uses the per-expert LayoutSF objects to interpret SF memory.
+  // If we build LayoutSF from unpadded (gemm_m, gemm_n, gemm_k), kernel indexing will not match
+  // the padded offsets and buffer sizes, leading to "scale sizes not working" (OOB/incorrect reads).
+  constexpr bool kIsNVFP4 =
+      std::is_same_v<BSConfig, TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaledConfig>;
+  constexpr int64_t kMinMNAlign = kIsNVFP4 ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4
+                                          : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX;
+  constexpr int64_t kMinKAlign = kIsNVFP4 ? TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4
+                                         : TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX;
+
+  int const padded_gemm_m =
+      (int)TmaWarpSpecializedGroupedGemmInput::alignToSfDim((int64_t)gemm_m, kMinMNAlign);
+  int const padded_gemm_n =
+      (int)TmaWarpSpecializedGroupedGemmInput::alignToSfDim((int64_t)gemm_n, kMinMNAlign);
+  int const padded_gemm_k =
+      (int)TmaWarpSpecializedGroupedGemmInput::alignToSfDim((int64_t)gemm_k, kMinKAlign);
+
   if (layout_info.swap_ab) {
     // M & N swapped for transpose
     stride_act_ptr[expert] = BSConfig::tile_atom_to_shape_SFB(
-        cute::make_shape((int)gemm_n, (int)gemm_m, (int)gemm_k, (int)1));
+        cute::make_shape((int)padded_gemm_n, (int)padded_gemm_m, (int)padded_gemm_k, (int)1));
     stride_weight_ptr[expert] = BSConfig::tile_atom_to_shape_SFA(
-        cute::make_shape((int)gemm_n, (int)gemm_m, (int)gemm_k, (int)1));
+        cute::make_shape((int)padded_gemm_n, (int)padded_gemm_m, (int)padded_gemm_k, (int)1));
   } else {
     stride_act_ptr[expert] = BSConfig::tile_atom_to_shape_SFA(
-        cute::make_shape((int)gemm_m, (int)gemm_n, (int)gemm_k, (int)1));
+        cute::make_shape((int)padded_gemm_m, (int)padded_gemm_n, (int)padded_gemm_k, (int)1));
     stride_weight_ptr[expert] = BSConfig::tile_atom_to_shape_SFB(
-        cute::make_shape((int)gemm_m, (int)gemm_n, (int)gemm_k, (int)1));
+        cute::make_shape((int)padded_gemm_m, (int)padded_gemm_n, (int)padded_gemm_k, (int)1));
   }
 
   // This assert validates our current assumption that A&B can be safely transposed without needing
   // to modify
   assert(
       BSConfig::tile_atom_to_shape_SFB(
-          cute::make_shape((int)gemm_n, (int)gemm_m, (int)gemm_k, 1)) ==
-      BSConfig::tile_atom_to_shape_SFA(cute::make_shape((int)gemm_m, (int)gemm_n, (int)gemm_k, 1)));
+          cute::make_shape((int)padded_gemm_n, (int)padded_gemm_m, (int)padded_gemm_k, 1)) ==
+      BSConfig::tile_atom_to_shape_SFA(
+          cute::make_shape((int)padded_gemm_m, (int)padded_gemm_n, (int)padded_gemm_k, 1)));
 
   auto scaling_type =
       std::is_same_v<BSConfig, TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaledConfig>

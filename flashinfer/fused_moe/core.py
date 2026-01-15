@@ -310,10 +310,90 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
     return input_tensor.view(M, K // blockK, blockK).permute(1, 0, 2).contiguous()
 
 
+
+# =============================================================================
+# SM120 Tile Configuration
+# =============================================================================
+# Logical (M,N) tiles for D = A @ W on SM120/121.
+# Some logical tiles may be implemented via internal swap/transpose tricks.
+# SM120/121 supported logical tile shapes.
+# Constraints from CUTLASS block-scaled MXFP4:
+#   - M must be multiple of 64 (tcgen05 hardware minimum)
+#   - N must be multiple of 64 (TMA alignment, internally padded to 128)
+#
+# The CUTLASS SM120 block-scaled code has been patched to handle M < 128 and N < 128:
+#   - TileM_SFA/TileN_SFB use ceil_div to pad dimensions to 128 for TMA and SmemLayout
+#   - TileShape_SFA/TileShape_SFB provide padded dimensions for TMA descriptors
+#   - IsCtaM64/IsCtaN64 flags skip size assertions that don't apply to padded layouts
+# Note: SWAP_AB is no longer needed - tcgen05 hardware natively supports M=64.
+SM120_SUPPORTED_TILE_MN = (
+    (128, 128),  # Standard: default for prefill (large batches)
+    (128, 64),   # Standard: smaller N for smaller K dimensions
+    (64, 128),   # Smaller M: for decode (small batches), no swap needed
+    (64, 64),    # Smallest: for very small batches
+)
+
+
+def select_tile_mn_for_sm120(num_tokens: int) -> tuple[int, int]:
+    """Select logical (M,N) tile for SM120/121 MoE GEMM.
+
+    Selects tile size based on batch size to optimize for different scenarios:
+    - Decode (small M): Use (64, 128) for better efficiency with smaller tiles
+    - Prefill (large M): Use (128, 128) for maximum throughput
+
+    The tcgen05 hardware natively supports M=64, so no swap_ab is needed.
+
+    Args:
+        num_tokens: Number of tokens in the batch.
+
+    Returns:
+        Tile shape (M, N).
+    """
+    # For small batches (decode), use smaller M tiles for better efficiency
+    if num_tokens < 64:
+        return (64, 128)  # M=64 natively supported by tcgen05
+    # For medium batches, standard mode works well
+    return (128, 128)
+
 @functools.cache
-def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
+def get_cutlass_fused_moe_module(
+    backend: str = "100",
+    use_fast_build: bool = False,
+    tile_mn: tuple[int, int] = (128, 128),
+):
+    """Get JIT-compiled CUTLASS MoE module.
+
+    Args:
+        backend: GPU architecture backend (e.g., "120", "100", "90").
+        use_fast_build: Enable fast build mode.
+        tile_mn: Logical (M,N) tile (only used for SM120/121).
+
+    Returns:
+        Compiled MoE module with attached MoERunner class.
+    """
+
     if backend in ("120", "121"):
-        module = gen_cutlass_fused_moe_sm120_module(use_fast_build).build_and_load()
+        logical_m, logical_n = tile_mn
+        # SM120/121 block-scaled MXFP4 constraints:
+        # - M must be a multiple of 64 (tcgen05 hardware natively supports M=64)
+        # - N must be a multiple of 64 (TMA + scale factor alignment)
+        # Both M < 128 and N < 128 are internally padded to 128 in scale factor layouts.
+        if logical_m <= 0 or logical_m % 64 != 0:
+            raise ValueError(
+                f"Unsupported SM120/121 logical tile_mn={tile_mn}: M must be a positive "
+                f"multiple of 64 (tcgen05 constraint)."
+            )
+        if logical_n <= 0 or logical_n % 64 != 0:
+            raise ValueError(
+                f"Unsupported SM120/121 logical tile_mn={tile_mn}: N must be a positive "
+                f"multiple of 64."
+            )
+
+        # SM120/121: Support logical (M,N) tile selection
+        module = gen_cutlass_fused_moe_sm120_module(
+            use_fast_build=use_fast_build,
+            tile_mn=tile_mn,
+        ).build_and_load()
     elif backend == "103":
         module = gen_cutlass_fused_moe_sm103_module(use_fast_build).build_and_load()
     elif backend in ("100", "110"):
@@ -325,13 +405,13 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
     else:
         raise ValueError(f"Invalid backend: {backend}")
 
-    # Set DeepGEMM JIT include directories after module is loaded
+    # Set DeepGEMM JIT include directories after module is loaded (if supported
+    # by the built module).
     from ..jit import env as jit_env
 
-    deepgemm_include_dir = str(
-        jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "tensorrt_llm"
-    )
-    module.set_deepgemm_jit_include_dirs([deepgemm_include_dir])
+    deepgemm_include_dir = str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "tensorrt_llm")
+    if hasattr(module, "set_deepgemm_jit_include_dirs"):
+        module.set_deepgemm_jit_include_dirs([deepgemm_include_dir])
 
     class MoERunner(TunableRunner):
         # avoid overhead of creating a new runner in forward pass
@@ -729,6 +809,7 @@ def cutlass_fused_moe(
     tune_max_num_tokens: int = 8192,
     enable_pdl: Optional[bool] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
+    auto_tile_select: bool = True,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -890,7 +971,11 @@ def cutlass_fused_moe(
             output, output_shape, output_dtype, input.device, "output"
         )
 
-    return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
+    tile_mn = (128, 128)
+    if auto_tile_select:
+        tile_mn = select_tile_mn_for_sm120(num_rows)
+
+    return get_cutlass_fused_moe_module(device_arch, tile_mn=tile_mn).cutlass_fused_moe(
         output,
         input,
         token_selected_experts,
@@ -921,6 +1006,35 @@ def cutlass_fused_moe(
         enable_pdl=enable_pdl,
         activation_type=activation_type,
     )
+
+
+def prewarm_moe_tiles():
+    """Pre-compile tile variants during server startup.
+    
+    Pre-warms the MoE GEMM kernel for SM120/121 to avoid JIT compilation
+    latency during inference. Currently only the baseline (128,128) tile
+    is pre-warmed.
+    
+    Tile variants to consider adding after validation:
+    - (32, 128): decode-optimized (via swap-hack)
+    - (128, 32): mid-batch optimization
+    """
+    # Only prewarm tiles that are known-good and compile successfully.
+    TILES_TO_PREWARM: list[tuple[int, int]] = [(128, 128)]
+    # Try to detect if we are on SM120/121
+    try:
+        major, minor = torch.cuda.get_device_capability()
+        arch = f"{major}{minor}"
+        # Only prewarm for Blackwell SM120/121
+        if arch not in ("120", "121"):
+            return
+            
+        print(f"Prewarming {len(TILES_TO_PREWARM)} MoE tile variants for SM{arch}...")
+        for tile_mn in TILES_TO_PREWARM:
+            _ = get_cutlass_fused_moe_module(backend="120", tile_mn=tile_mn)
+        print(f"Prewarmed {len(TILES_TO_PREWARM)} MoE tile variants")
+    except Exception as e:
+        print(f"Failed to prewarm MoE tiles: {e}")
 
 
 # trtllmgen-moe-fp8
