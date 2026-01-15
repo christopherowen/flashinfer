@@ -225,6 +225,9 @@ def gen_cutlass_fused_moe_module(
         jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
         jit_env.FLASHINFER_CSRC_DIR
         / "nv_internal/tensorrt_llm/kernels/preQuantScaleKernel.cu",
+        # cutlass_heuristic provides get_candidate_configs() needed by MoE runner
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp",
     ]
 
     if is_sm120_family:
