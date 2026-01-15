@@ -326,7 +326,15 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 # Constraints from CUTLASS block-scaled MXFP4 and GB10 hardware:
 #   - Physical M must be >= 64 (tcgen05 hardware minimum)
 #   - N must be power of 2: 8, 16, 32, 64, 128, or 256
-#   - Shared memory capacity: 101KB, need >= 2 pipeline stages
+#   - Shared memory capacity: 101KB (~70KB available after overhead)
+#   - Need >= 2 pipeline stages (double buffering)
+#
+# SMEM calculation (FP8 x FP4 with K=128):
+#   - A tensor (FP8): M × K × 1 byte
+#   - B tensor (FP4): N × K × 1 byte (PADDED format due to ldmatrix.b4x16_p64)
+#   - Per stage: 128 × (M + N) bytes
+#   - 2 stages: 256 × (M + N) bytes
+#   - Max M+N for 2 stages: ~275 (70KB / 256)
 #
 # Two modes:
 # 1. NATIVE (M >= 64): Physical tile = logical tile, no swap needed.
@@ -342,23 +350,25 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 SM120_SUPPORTED_TILE_MN = (
     # ========== NATIVE TILES (M >= 64, no swap_ab) ==========
     # M must be power-of-2 multiple of 64 (CUTE shape divisibility constraint)
-    # FP4 smem optimization reduces B tensor memory by 50%, enabling larger tiles
+    # FP4 B tensor uses PADDED format (1 byte/element, NOT 0.5 bytes) due to
+    # ldmatrix.b4x16_p64 instruction required by mma.kind::f8f6f4
     #
-    # M=64: all N values fit in smem (6-11 stages)
-    (64, 8), (64, 16), (64, 32), (64, 64), (64, 128), (64, 256),
-    # M=128: N <= 256 fit in smem (3-5 stages)
-    (128, 8), (128, 16), (128, 32), (128, 64), (128, 128), (128, 256),
-    # M=256: N <= 128 fit with 2+ stages (256,256 exceeds smem with overhead)
-    (256, 8), (256, 16), (256, 32), (256, 64), (256, 128),
-    # Note: M=192, M=320 fail CUTE "Shape Divisibility Condition"
+    # M=64: N <= 128 fit in smem with 2+ stages
+    (64, 8), (64, 16), (64, 32), (64, 64), (64, 128),
+    # M=128: N <= 128 fit in smem with 2+ stages
+    (128, 8), (128, 16), (128, 32), (128, 64), (128, 128),
+    # M=256: only N <= 16 fit with 2 stages (M+N must be <= ~275)
+    (256, 8), (256, 16),
+    # Note: (64,256), (128,256), (256,32+) exceed SMEM for 2 stages
     #
     # ========== SWAPPED TILES (M < 64, uses swap_ab) ==========
     # Physical (64, N) -> Logical (N, 64), for small decode batches
     (8, 64), (16, 64), (32, 64),
     # Physical (128, N) -> Logical (N, 128)
     (8, 128), (16, 128), (32, 128),
-    # Physical (256, N) -> Logical (N, 256)
-    (8, 256), (16, 256), (32, 256),
+    # Physical (256, N) -> Logical (N, 256) - only 8,16 fit
+    (8, 256), (16, 256),
+    # Note: (32, 256) would need physical (256, 32) which exceeds SMEM
 )
 
 
@@ -367,10 +377,13 @@ def select_tile_mn_for_sm120(num_tokens: int) -> tuple[int, int]:
 
     Selects tile size based on batch size to optimize for different scenarios:
     - Decode (small M): Use (64, 128) for better efficiency with smaller tiles
-    - Prefill (medium M): Use (128, 128) for good throughput
-    - Prefill (large M): Use (256, 64) for maximum M coverage
+    - Prefill: Use (128, 128) for good throughput
 
     The tcgen05 hardware natively supports M=64, so no swap_ab is needed.
+
+    Note: Larger tiles like (256, 64) don't fit in SMEM with 2 pipeline stages
+    because FP4 uses padded format (1 byte/element due to ldmatrix.b4x16_p64).
+    Max tile is (128, 128) which uses 32KB per stage × 2 = 64KB.
 
     Args:
         num_tokens: Number of tokens in the batch.
@@ -381,10 +394,7 @@ def select_tile_mn_for_sm120(num_tokens: int) -> tuple[int, int]:
     # For small batches (decode), use smaller M tiles for better efficiency
     if num_tokens < 64:
         return (64, 128)  # M=64 natively supported by tcgen05
-    # For large batches (prefill with many tokens), use larger M tiles
-    if num_tokens >= 256:
-        return (256, 64)  # Larger M, smaller N due to smem constraints
-    # For medium batches, standard mode works well
+    # For medium/large batches, use (128, 128) - largest tile that fits in SMEM
     return (128, 128)
 
 @functools.cache
