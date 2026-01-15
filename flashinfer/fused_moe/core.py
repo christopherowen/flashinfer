@@ -324,7 +324,7 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 # SM120/121 supported logical tile shapes.
 # Constraints from CUTLASS block-scaled MXFP4:
 #   - M must be multiple of 64 (tcgen05 hardware minimum)
-#   - N must be multiple of 64 (TMA alignment, internally padded to 128)
+#   - N must be multiple of 32 (CUTLASS SM120 builder minimum, hardware supports 8)
 #
 # The CUTLASS SM120 block-scaled code has been patched to handle M < 128 and N < 128:
 #   - TileM_SFA/TileN_SFB use ceil_div to pad dimensions to 128 for TMA and SmemLayout
@@ -333,9 +333,11 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 # Note: SWAP_AB is no longer needed - tcgen05 hardware natively supports M=64.
 SM120_SUPPORTED_TILE_MN = (
     (128, 128),  # Standard: default for prefill (large batches)
-    (128, 64),   # Standard: smaller N for smaller K dimensions
-    (64, 128),   # Smaller M: for decode (small batches), no swap needed
-    (64, 64),    # Smallest: for very small batches
+    (128, 64),   # Standard: smaller N
+    (128, 32),   # Standard: smallest N (CUTLASS minimum)
+    (64, 128),   # Smaller M: for decode (small batches)
+    (64, 64),    # Smaller M and N
+    (64, 32),    # Smallest practical tile for decode
 )
 
 
@@ -381,17 +383,17 @@ def get_cutlass_fused_moe_module(
         logical_m, logical_n = tile_mn
         # SM120/121 block-scaled MXFP4 constraints:
         # - M must be a multiple of 64 (tcgen05 hardware natively supports M=64)
-        # - N must be a multiple of 64 (TMA + scale factor alignment)
+        # - N must be a multiple of 32 (CUTLASS SM120 builder minimum)
         # Both M < 128 and N < 128 are internally padded to 128 in scale factor layouts.
         if logical_m <= 0 or logical_m % 64 != 0:
             raise ValueError(
                 f"Unsupported SM120/121 logical tile_mn={tile_mn}: M must be a positive "
                 f"multiple of 64 (tcgen05 constraint)."
             )
-        if logical_n <= 0 or logical_n % 64 != 0:
+        if logical_n <= 0 or logical_n % 32 != 0:
             raise ValueError(
                 f"Unsupported SM120/121 logical tile_mn={tile_mn}: N must be a positive "
-                f"multiple of 64."
+                f"multiple of 32 (CUTLASS SM120 builder minimum)."
             )
 
         # SM120/121: Support logical (M,N) tile selection
