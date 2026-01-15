@@ -1070,12 +1070,19 @@ class BatchDecodeWithPagedKVCacheWrapper:
                             f"got backend='{self._backend}'. Either use backend='fa2' or "
                             f"set use_sinks=False."
                         )
-                    # Check for FP8 dtypes - sink module is compiled with fp8_enabled=False
-                    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
-                    if q_data_type in fp8_dtypes or kv_data_type in fp8_dtypes:
+                    # Supported query dtypes: BF16, FP16
+                    supported_q_dtypes = (torch.bfloat16, torch.float16)
+                    if q_data_type not in supported_q_dtypes:
                         raise NotImplementedError(
-                            "Attention sinks are not supported with FP8 inputs. "
-                            "Use BF16/FP16 inputs or set use_sinks=False."
+                            f"Attention sinks require BF16/FP16 query, got {q_data_type}."
+                        )
+                    # Supported KV cache dtypes: BF16, FP16, FP8 E4M3
+                    supported_kv_dtypes = (torch.bfloat16, torch.float16, torch.float8_e4m3fn)
+                    if hasattr(torch, "float8_e4m3fnuz"):
+                        supported_kv_dtypes = supported_kv_dtypes + (torch.float8_e4m3fnuz,)
+                    if kv_data_type not in supported_kv_dtypes:
+                        raise NotImplementedError(
+                            f"Attention sinks support BF16/FP16/FP8 E4M3 KV cache, got {kv_data_type}."
                         )
                     self._cached_module = get_batch_prefill_attention_sink_module(
                         self._backend,
