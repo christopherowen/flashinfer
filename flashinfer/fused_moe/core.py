@@ -319,17 +319,19 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 # SM120/121 supported logical tile shapes.
 # Constraints from CUTLASS block-scaled MXFP4:
 #   - M must be multiple of 64 (tcgen05 hardware minimum)
-#   - N must be multiple of 32 (CUTLASS SM120 builder minimum, hardware supports 8)
+#   - N must be multiple of 32 (smem copy atom minimum - SM100_SU4_DU8x16_x4_LDSM_N)
 #
 # The CUTLASS SM120 block-scaled code has been patched to handle M < 128 and N < 128:
 #   - TileM_SFA/TileN_SFB use ceil_div to pad dimensions to 128 for TMA and SmemLayout
 #   - TileShape_SFA/TileShape_SFB provide padded dimensions for TMA descriptors
-#   - IsCtaM64/IsCtaN64 flags skip size assertions that don't apply to padded layouts
+#   - IsCtaMSmall/IsCtaNSmall flags skip size assertions that don't apply to padded layouts
+#   - Epilogue tile uses GCD to adapt to smaller N values
 # Note: SWAP_AB is no longer needed - tcgen05 hardware natively supports M=64.
+# Note: N=16 and N=8 fail due to copy atom size constraints (needs 32 elements minimum).
 SM120_SUPPORTED_TILE_MN = (
     (128, 128),  # Standard: default for prefill (large batches)
     (128, 64),   # Standard: smaller N
-    (128, 32),   # Standard: smallest N (CUTLASS minimum)
+    (128, 32),   # Standard: smallest N (copy atom minimum)
     (64, 128),   # Smaller M: for decode (small batches)
     (64, 64),    # Smaller M and N
     (64, 32),    # Smallest practical tile for decode
@@ -378,7 +380,7 @@ def get_cutlass_fused_moe_module(
         logical_m, logical_n = tile_mn
         # SM120/121 block-scaled MXFP4 constraints:
         # - M must be a multiple of 64 (tcgen05 hardware natively supports M=64)
-        # - N must be a multiple of 32 (CUTLASS SM120 builder minimum)
+        # - N must be a multiple of 32 (smem copy atom minimum)
         # Both M < 128 and N < 128 are internally padded to 128 in scale factor layouts.
         if logical_m <= 0 or logical_m % 64 != 0:
             raise ValueError(
@@ -388,7 +390,7 @@ def get_cutlass_fused_moe_module(
         if logical_n <= 0 or logical_n % 32 != 0:
             raise ValueError(
                 f"Unsupported SM120/121 logical tile_mn={tile_mn}: N must be a positive "
-                f"multiple of 32 (CUTLASS SM120 builder minimum)."
+                f"multiple of 32 (smem copy atom minimum)."
             )
 
         # SM120/121: Support logical (M,N) tile selection
