@@ -18,6 +18,25 @@
 #include "moe_kernels.h"
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
+
+// Optional reduced instantiation set for SM120/121 MXFP4 iteration.
+// This is controlled by the JIT build profile in `flashinfer/jit/fused_moe.py`.
+#if defined(FLASHINFER_FUSED_MOE_MXFP4_MINIMAL)
+
+#ifdef ENABLE_FP8
+#ifdef ENABLE_FP4
+// MXFP4 path: FP8 activations × FP4 weights -> BF16/FP16 outputs.
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half>;
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, half, half>;
+#ifdef ENABLE_BF16
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, __nv_bfloat16>;
+template class CutlassMoeFCRunner<__nv_fp8_e4m3, __nv_fp4_e2m1, __nv_bfloat16, __nv_bfloat16>;
+#endif
+#endif
+#endif
+
+#else  // FLASHINFER_FUSED_MOE_MXFP4_MINIMAL
+
 template class CutlassMoeFCRunner<float, float>;
 
 #ifdef ENABLE_BF16
@@ -62,4 +81,6 @@ INSTANTIATE_FINALIZE_MOE_ROUTING(float, float, float);
 #ifdef ENABLE_BF16
 INSTANTIATE_FINALIZE_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
 #endif
+
+#endif  // FLASHINFER_FUSED_MOE_MXFP4_MINIMAL
 }  // namespace tensorrt_llm::kernels::cutlass_kernels

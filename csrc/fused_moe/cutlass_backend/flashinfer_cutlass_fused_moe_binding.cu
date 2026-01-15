@@ -129,7 +129,19 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     mUseMxfp8ActScaling = use_mxfp8_act_scaling;
     mInnerDimMultiplier = 1;
 
+// In the minimal MXFP4-only build, we intentionally only support the FP8×FP4
+// (MXFP4) fused-MoE path to minimize template instantiations and compile time.
+#if defined(FLASHINFER_FUSED_MOE_MXFP4_MINIMAL)
+    TVM_FFI_ICHECK(isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant())
+        << "FLASHINFER_FUSED_MOE_MXFP4_MINIMAL only supports MXFP4 (FP8xFP4) fused MoE.";
+#endif
+
     // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
+    //
+    // Optional minimal build: compile only the MXFP4 (FP8×FP4) path for SM120/121 iteration.
+    // This avoids pulling in unrelated runner instantiations (fp16/fp32/etc) and dramatically
+    // reduces JIT compile surface area for TILE_M experiments.
+#if !defined(FLASHINFER_FUSED_MOE_MXFP4_MINIMAL)
     if (mActivationDtype == dl_float16 && mWeightDtype == dl_float16) {
       mKernelRunner = std::make_shared<kernels::CutlassMoeFCRunner<half, half>>();
     }
@@ -143,6 +155,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     }
 #endif
 #endif
+#endif  // !FLASHINFER_FUSED_MOE_MXFP4_MINIMAL
 
 #ifdef ENABLE_FP8
     if (isFp8Quant()) {
@@ -155,6 +168,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp4_e2m1>(mOutputDtype);
     }
 
+#if !defined(FLASHINFER_FUSED_MOE_MXFP4_MINIMAL)
     if (isNvfp4Quant()) {
       mInnerDimMultiplier = 16;
       switch (encode_dlpack_dtype(mActivationDtype)) {
@@ -181,8 +195,9 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       }
 #endif
     }
-
+#endif  // !FLASHINFER_FUSED_MOE_MXFP4_MINIMAL
 #endif
+#if !defined(FLASHINFER_FUSED_MOE_MXFP4_MINIMAL)
     if (isInt4Quant()) {
       mInnerDimMultiplier = 2;
       if (mActivationDtype == dl_float16) {
@@ -215,6 +230,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
       }
 #endif
     }
+#endif  // !FLASHINFER_FUSED_MOE_MXFP4_MINIMAL
     if (!mKernelRunner) {
       TVM_FFI_ICHECK(false)
           << "Could not construct fused moe op with the requested input combination Activation: "

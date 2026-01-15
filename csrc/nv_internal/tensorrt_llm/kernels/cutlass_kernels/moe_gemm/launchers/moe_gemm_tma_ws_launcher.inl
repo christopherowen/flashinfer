@@ -49,52 +49,60 @@
 
 #include <sstream>
 
+#include "moe_gemm_sm120_mixed_input_launcher.inl"
+
 namespace tensorrt_llm {
 namespace kernels {
 namespace cutlass_kernels_oss {
 using namespace tensorrt_llm::kernels::cutlass_kernels;
+namespace tk = tensorrt_llm::common;
+namespace tkc = tensorrt_llm::cutlass_extensions;
+
+using namespace cute;
+
+// Convenience alias: this is the enum used by the generated dispatch templates.
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
 
-// Constructs an object with specific arguments only if flag is true
-// This forces the if constexpr branch to properly pruned be when called from in non-template
-// functions
-template <bool FLAG, class ReturnType, class... Args>
-ReturnType construct_if_true(Args&&... args) {
-  if constexpr (FLAG) {
-    return ReturnType{std::forward<Args>(args)...};
+// Helper: conditionally construct a type in a way that keeps both "enabled" and
+// "disabled" instantiations well-formed for nvcc.
+template <bool Enable, typename T, typename... Args>
+CUTLASS_HOST_DEVICE constexpr T construct_if_true(Args&&... args) {
+  if constexpr (Enable) {
+    return T{std::forward<Args>(args)...};
   } else {
-    return ReturnType{};
+    return T{};
   }
 }
 
-template <bool FLAG, class GemmGrouped, bool A>
-auto deduce_layout_sf() {
-  if constexpr (FLAG && A) {
-    // In moe_kernels.cu we rely on these two types being the same. This is not necessarily
-    // guaranteed by cutlass so we have a sanity check here.
-    static_assert(std::is_same_v<typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFA,
-                                 typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFB>,
-                  "Deduced layout SF does not match for A and B");
-    return typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFA{};
-  } else if constexpr (FLAG && !A) {
-    // In moe_kernels.cu we rely on these two types being the same. This is not necessarily
-    // guaranteed by cutlass so we have a sanity check here.
-    static_assert(std::is_same_v<typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFA,
-                                 typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFB>,
-                  "Deduced layout SF does not match for A and B");
-    return typename GemmGrouped::GemmKernel::CollectiveMainloop::LayoutSFB{};
+// Helper: deduce the correct SF layout pointer type for the CUTLASS mainloop.
+// This is used only for block-scaled (MXFPX) paths where SF layouts are passed.
+template <bool IsBlockScaled, typename GemmGrouped, bool IsOperandA>
+CUTLASS_HOST_DEVICE constexpr auto deduce_layout_sf() {
+  if constexpr (IsBlockScaled) {
+    if constexpr (IsOperandA) {
+      return static_cast<typename GemmGrouped::CollectiveMainloop::LayoutSFA*>(nullptr);
+    } else {
+      return static_cast<typename GemmGrouped::CollectiveMainloop::LayoutSFB*>(nullptr);
+    }
   } else {
-    return (void*)nullptr;
+    return static_cast<void*>(nullptr);
   }
 }
 
+// Default dispatch: if no explicit specialization was generated, throw at runtime.
 template <typename ArchTag, typename T, typename WeightType, typename OutputType,
           typename EpilogueSchedule, typename EpilogueTag, EpilogueFusion FUSION,
           typename TileShape, typename ClusterShape, bool IsMXFPX, bool DYNAMIC_CGA, bool BIAS,
           bool SwapAB>
-struct DispatchToTmaWSFunction {};
+struct DispatchToTmaWSFunction {
+  static void unimplemented(TmaWarpSpecializedGroupedGemmInput, int, int, cudaStream_t, int*,
+                            size_t*, cute::Shape<int32_t, int32_t, cute::_1>,
+                            cute::Shape<int32_t, int32_t, cute::_1>) {
+    TLLM_THROW("No generated TMA-WS grouped GEMM specialization for this configuration");
+  }
+  constexpr static auto* op = &unimplemented;
+};
 
-// TMA WS specialized version
 template <typename ArchTag, typename T, typename WeightType, typename OutputType,
           typename EpilogueSchedule, typename EpilogueTag, EpilogueFusion FUSION,
           typename TileShape, typename ClusterShape, bool IsMXFPX, bool DYNAMIC_CGA, bool BIAS,
@@ -104,6 +112,15 @@ void tma_warp_specialized_generic_moe_gemm_kernelLauncher(
     int const multi_processor_count, cudaStream_t stream, int* kernel_occupancy,
     size_t* workspace_size, cute::Shape<int32_t, int32_t, cute::_1> dynamic_cluster_shape,
     cute::Shape<int32_t, int32_t, cute::_1> fallback_cluster_shape) {
+#if defined(COMPILE_BLACKWELL_SM120_TMA_GROUPED_GEMMS)
+  if constexpr (std::is_same_v<ArchTag, cutlass::arch::Sm120>) {
+    sm120_mixed_input_moe_gemm_kernelLauncher<T, WeightType, OutputType, EpilogueTag, TileShape,
+                                              ClusterShape, IsMXFPX>(
+        tma_ws_input, num_experts, multi_processor_count, stream, kernel_occupancy, workspace_size);
+    return;
+  }
+#endif
+
   if constexpr (ArchTag::kMinComputeCapability < 90) {
     TLLM_THROW("Invalid architecture instantiated");
   }
