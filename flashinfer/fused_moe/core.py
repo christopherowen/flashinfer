@@ -319,22 +319,22 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 # SM120/121 supported logical tile shapes.
 # Constraints from CUTLASS block-scaled MXFP4:
 #   - M must be multiple of 64 (tcgen05 hardware minimum)
-#   - N must be multiple of 32 (smem copy atom minimum - SM100_SU4_DU8x16_x4_LDSM_N)
+#   - N must be power of 2: 8, 16, 32, 64, 128, or 256
+#     (Non-power-of-2 N values fail due to smem layout atom constraints)
+#   - (128, 256) exceeds smem capacity (requires Stages >= 2, only 1 fits)
 #
 # The CUTLASS SM120 block-scaled code has been patched to handle M < 128 and N < 128:
 #   - TileM_SFA/TileN_SFB use ceil_div to pad dimensions to 128 for TMA and SmemLayout
 #   - TileShape_SFA/TileShape_SFB provide padded dimensions for TMA descriptors
 #   - IsCtaMSmall/IsCtaNSmall flags skip size assertions that don't apply to padded layouts
 #   - Epilogue tile uses GCD to adapt to smaller N values
+#   - sm120_rr_smem_copy_selector_B selects appropriate copy atom based on TileN
 # Note: SWAP_AB is no longer needed - tcgen05 hardware natively supports M=64.
-# Note: N=16 and N=8 fail due to copy atom size constraints (needs 32 elements minimum).
 SM120_SUPPORTED_TILE_MN = (
-    (128, 128),  # Standard: default for prefill (large batches)
-    (128, 64),   # Standard: smaller N
-    (128, 32),   # Standard: smallest N (copy atom minimum)
-    (64, 128),   # Smaller M: for decode (small batches)
-    (64, 64),    # Smaller M and N
-    (64, 32),    # Smallest practical tile for decode
+    # M=64: all N values fit in smem
+    (64, 8), (64, 16), (64, 32), (64, 64), (64, 128), (64, 256),
+    # M=128: N=256 exceeds smem capacity
+    (128, 8), (128, 16), (128, 32), (128, 64), (128, 128),
 )
 
 
@@ -380,17 +380,25 @@ def get_cutlass_fused_moe_module(
         logical_m, logical_n = tile_mn
         # SM120/121 block-scaled MXFP4 constraints:
         # - M must be a multiple of 64 (tcgen05 hardware natively supports M=64)
-        # - N must be a multiple of 32 (smem copy atom minimum)
+        # - N must be a multiple of 8 (MMA atom N dimension)
         # Both M < 128 and N < 128 are internally padded to 128 in scale factor layouts.
         if logical_m <= 0 or logical_m % 64 != 0:
             raise ValueError(
                 f"Unsupported SM120/121 logical tile_mn={tile_mn}: M must be a positive "
                 f"multiple of 64 (tcgen05 constraint)."
             )
-        if logical_n <= 0 or logical_n % 32 != 0:
+        # N must be a power of 2 in {8, 16, 32, 64, 128, 256}
+        # Exception: (128, 256) exceeds smem capacity
+        valid_ns = (8, 16, 32, 64, 128, 256)
+        if logical_n not in valid_ns:
             raise ValueError(
-                f"Unsupported SM120/121 logical tile_mn={tile_mn}: N must be a positive "
-                f"multiple of 32 (smem copy atom minimum)."
+                f"Unsupported SM120/121 logical tile_mn={tile_mn}: N must be a power of 2 "
+                f"in {valid_ns} (smem layout atom constraint)."
+            )
+        if tile_mn == (128, 256):
+            raise ValueError(
+                f"Unsupported SM120/121 logical tile_mn={tile_mn}: tile exceeds smem capacity. "
+                f"Use (64, 256) or (128, 128) instead."
             )
 
         # SM120/121: Support logical (M,N) tile selection
