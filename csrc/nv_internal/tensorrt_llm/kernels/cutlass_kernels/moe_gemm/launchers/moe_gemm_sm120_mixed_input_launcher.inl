@@ -456,7 +456,12 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   auto run_status = gemm.run(stream);
   TLLM_LOG_DEBUG("[SM120 MXFP4 MoE] run=%s", cutlassGetStatusString(run_status));
   if (run_status != cutlass::Status::kSuccess) {
-    TLLM_THROW("SM120 MXFP4 MoE: run failed: %s", cutlassGetStatusString(run_status));
+    // Get the actual CUDA error for better diagnostics
+    cudaError_t cuda_err = cudaGetLastError();
+    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE] CUDA error after run: %s (%d)", 
+                   cudaGetErrorString(cuda_err), static_cast<int>(cuda_err));
+    TLLM_THROW("SM120 MXFP4 MoE: run failed: %s (CUDA: %s)", 
+               cutlassGetStatusString(run_status), cudaGetErrorString(cuda_err));
   }
 
   if (occupancy != nullptr) {
