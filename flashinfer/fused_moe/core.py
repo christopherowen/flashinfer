@@ -342,18 +342,23 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 SM120_SUPPORTED_TILE_MN = (
     # ========== NATIVE TILES (M >= 64, no swap_ab) ==========
     # M must be power-of-2 multiple of 64 (CUTE shape divisibility constraint)
-    # M=64: all N values fit in smem
+    # FP4 smem optimization reduces B tensor memory by 50%, enabling larger tiles
+    #
+    # M=64: all N values fit in smem (6-11 stages)
     (64, 8), (64, 16), (64, 32), (64, 64), (64, 128), (64, 256),
-    # M=128: N <= 128 fit in smem
-    (128, 8), (128, 16), (128, 32), (128, 64), (128, 128),
-    # M=256: Largest M within smem budget (only N <= 64 fit with 2+ stages)
-    (256, 8), (256, 16), (256, 32), (256, 64),
+    # M=128: N <= 256 fit in smem (3-5 stages)
+    (128, 8), (128, 16), (128, 32), (128, 64), (128, 128), (128, 256),
+    # M=256: N <= 128 fit with 2+ stages (256,256 exceeds smem with overhead)
+    (256, 8), (256, 16), (256, 32), (256, 64), (256, 128),
     # Note: M=192, M=320 fail CUTE "Shape Divisibility Condition"
+    #
     # ========== SWAPPED TILES (M < 64, uses swap_ab) ==========
     # Physical (64, N) -> Logical (N, 64), for small decode batches
     (8, 64), (16, 64), (32, 64),
     # Physical (128, N) -> Logical (N, 128)
     (8, 128), (16, 128), (32, 128),
+    # Physical (256, N) -> Logical (N, 256)
+    (8, 256), (16, 256), (32, 256),
 )
 
 
