@@ -322,24 +322,38 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 # Logical (M,N) tiles for D = A @ W on SM120/121.
 # Some logical tiles may be implemented via internal swap/transpose tricks.
 # SM120/121 supported logical tile shapes.
-# Constraints from CUTLASS block-scaled MXFP4:
-#   - M must be multiple of 64 (tcgen05 hardware minimum)
-#   - N must be power of 2: 8, 16, 32, 64, 128, or 256
-#     (Non-power-of-2 N values fail due to smem layout atom constraints)
-#   - (128, 256) exceeds smem capacity (requires Stages >= 2, only 1 fits)
 #
-# The CUTLASS SM120 block-scaled code has been patched to handle M < 128 and N < 128:
+# Constraints from CUTLASS block-scaled MXFP4 and GB10 hardware:
+#   - Physical M must be >= 64 (tcgen05 hardware minimum)
+#   - N must be power of 2: 8, 16, 32, 64, 128, or 256
+#   - Shared memory capacity: 101KB, need >= 2 pipeline stages
+#
+# Two modes:
+# 1. NATIVE (M >= 64): Physical tile = logical tile, no swap needed.
+# 2. SWAPPED (M < 64): Uses swap_ab to transpose problem.
+#    Physical (N, M) -> Logical (M, N), where physical N >= 64.
+#
+# The CUTLASS SM120 block-scaled code has been patched to handle various tile sizes:
 #   - TileM_SFA/TileN_SFB use ceil_div to pad dimensions to 128 for TMA and SmemLayout
 #   - TileShape_SFA/TileShape_SFB provide padded dimensions for TMA descriptors
 #   - IsCtaMSmall/IsCtaNSmall flags skip size assertions that don't apply to padded layouts
-#   - Epilogue tile uses GCD to adapt to smaller N values
+#   - Epilogue tile uses min(64, CTA_M) and adaptive EpiN for smaller tiles
 #   - sm120_rr_smem_copy_selector_B selects appropriate copy atom based on TileN
-# Note: SWAP_AB is no longer needed - tcgen05 hardware natively supports M=64.
 SM120_SUPPORTED_TILE_MN = (
+    # ========== NATIVE TILES (M >= 64, no swap_ab) ==========
+    # M must be power-of-2 multiple of 64 (CUTE shape divisibility constraint)
     # M=64: all N values fit in smem
     (64, 8), (64, 16), (64, 32), (64, 64), (64, 128), (64, 256),
-    # M=128: N=256 exceeds smem capacity
+    # M=128: N <= 128 fit in smem
     (128, 8), (128, 16), (128, 32), (128, 64), (128, 128),
+    # M=256: Largest M within smem budget (only N <= 64 fit with 2+ stages)
+    (256, 8), (256, 16), (256, 32), (256, 64),
+    # Note: M=192, M=320 fail CUTE "Shape Divisibility Condition"
+    # ========== SWAPPED TILES (M < 64, uses swap_ab) ==========
+    # Physical (64, N) -> Logical (N, 64), for small decode batches
+    (8, 64), (16, 64), (32, 64),
+    # Physical (128, N) -> Logical (N, 128)
+    (8, 128), (16, 128), (32, 128),
 )
 
 
@@ -348,7 +362,8 @@ def select_tile_mn_for_sm120(num_tokens: int) -> tuple[int, int]:
 
     Selects tile size based on batch size to optimize for different scenarios:
     - Decode (small M): Use (64, 128) for better efficiency with smaller tiles
-    - Prefill (large M): Use (128, 128) for maximum throughput
+    - Prefill (medium M): Use (128, 128) for good throughput
+    - Prefill (large M): Use (256, 64) for maximum M coverage
 
     The tcgen05 hardware natively supports M=64, so no swap_ab is needed.
 
@@ -361,6 +376,9 @@ def select_tile_mn_for_sm120(num_tokens: int) -> tuple[int, int]:
     # For small batches (decode), use smaller M tiles for better efficiency
     if num_tokens < 64:
         return (64, 128)  # M=64 natively supported by tcgen05
+    # For large batches (prefill with many tokens), use larger M tiles
+    if num_tokens >= 256:
+        return (256, 64)  # Larger M, smaller N due to smem constraints
     # For medium batches, standard mode works well
     return (128, 128)
 
@@ -384,26 +402,52 @@ def get_cutlass_fused_moe_module(
     if backend in ("120", "121"):
         logical_m, logical_n = tile_mn
         # SM120/121 block-scaled MXFP4 constraints:
-        # - M must be a multiple of 64 (tcgen05 hardware natively supports M=64)
-        # - N must be a multiple of 8 (MMA atom N dimension)
-        # Both M < 128 and N < 128 are internally padded to 128 in scale factor layouts.
-        if logical_m <= 0 or logical_m % 64 != 0:
-            raise ValueError(
-                f"Unsupported SM120/121 logical tile_mn={tile_mn}: M must be a positive "
-                f"multiple of 64 (tcgen05 constraint)."
-            )
-        # N must be a power of 2 in {8, 16, 32, 64, 128, 256}
-        # Exception: (128, 256) exceeds smem capacity
+        # - Physical M must be >= 64 (tcgen05 hardware minimum)
+        # - For logical M < 64, swap_ab is used (physical tile is (N, M))
+        # - N must be a power of 2 in {8, 16, 32, 64, 128, 256}
+        # - Total tile must fit in smem with >= 2 pipeline stages
+        
         valid_ns = (8, 16, 32, 64, 128, 256)
+        valid_swapped_ms = (8, 16, 32)  # Logical M for swapped tiles
+        
+        # Check if this is a swapped tile (logical M < 64)
+        is_swapped = logical_m < 64
+        
+        if is_swapped:
+            # Swapped tile: physical (N, M) -> logical (M, N)
+            # Physical M = logical N, physical N = logical M
+            # Physical M must be >= 64
+            if logical_m not in valid_swapped_ms:
+                raise ValueError(
+                    f"Unsupported SM120/121 logical tile_mn={tile_mn}: for swapped tiles "
+                    f"(M < 64), M must be in {valid_swapped_ms}."
+                )
+            if logical_n < 64:
+                raise ValueError(
+                    f"Unsupported SM120/121 logical tile_mn={tile_mn}: for swapped tiles "
+                    f"(M < 64), N must be >= 64 (becomes physical M after swap)."
+                )
+        else:
+            # Native tile: M must be multiple of 64
+            if logical_m <= 0 or logical_m % 64 != 0:
+                raise ValueError(
+                    f"Unsupported SM120/121 logical tile_mn={tile_mn}: M must be a positive "
+                    f"multiple of 64 (tcgen05 constraint), or use swapped tiles for M < 64."
+                )
+        
+        # N must be a power of 2 for both native and swapped tiles
         if logical_n not in valid_ns:
             raise ValueError(
                 f"Unsupported SM120/121 logical tile_mn={tile_mn}: N must be a power of 2 "
                 f"in {valid_ns} (smem layout atom constraint)."
             )
-        if tile_mn == (128, 256):
+        
+        # Check smem capacity (simplified check for known bad combinations)
+        # Full list is in SM120_SUPPORTED_TILE_MN
+        if tile_mn not in SM120_SUPPORTED_TILE_MN:
             raise ValueError(
-                f"Unsupported SM120/121 logical tile_mn={tile_mn}: tile exceeds smem capacity. "
-                f"Use (64, 256) or (128, 128) instead."
+                f"Unsupported SM120/121 logical tile_mn={tile_mn}: tile exceeds smem capacity "
+                f"or is not in supported set. Valid tiles: {SM120_SUPPORTED_TILE_MN}"
             )
 
         # SM120/121: Support logical (M,N) tile selection

@@ -64,10 +64,11 @@ def gen_cutlass_fused_moe_sm120_module(
     """
     logical_m, logical_n = tile_mn
 
-    # swap_ab (transposed mode) is no longer needed.
-    # The tcgen05 hardware supports M=64 directly, and we've patched CUTLASS to handle
-    # the scale factor layout padding for M < 128.
-    swap_ab = False
+    # swap_ab (transposed mode) for logical M < 64:
+    # The tcgen05 hardware requires physical M >= 64. For logical M < 64 (decode batches),
+    # we use swap_ab to transpose the problem: physical (N, M) -> logical (M, N).
+    # For logical M >= 64, we use the native (non-swapped) path.
+    swap_ab = logical_m < 64
 
     nvcc_flags = [
         "-DCOMPILE_BLACKWELL_TMA_GEMMS",
