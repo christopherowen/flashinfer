@@ -405,6 +405,8 @@ def get_batch_prefill_attention_sink_uri(
     head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
 ) -> str:
     return (
         f"batch_prefill_with_attention_sink_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -413,7 +415,10 @@ def get_batch_prefill_attention_sink_uri(
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_qk_{head_dim_qk}_"
         f"head_dim_vo_{head_dim_vo}_"
-        f"use_swa_{use_sliding_window}_" + ("_sm90" if backend == "fa3" else "")
+        f"posenc_{pos_encoding_mode}_"
+        f"use_swa_{use_sliding_window}_"
+        f"use_logits_cap_{use_logits_soft_cap}_"
+        f"use_fp16_qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
     )
 
 
@@ -1087,6 +1092,8 @@ def gen_batch_prefill_attention_sink_module(
     head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
+    use_logits_soft_cap: bool = False,
+    use_fp16_qk_reduction: bool = False,
 ) -> JitSpec:
     from flashinfer.jit.attention.variants import attention_sink_decl
 
@@ -1100,6 +1107,8 @@ def gen_batch_prefill_attention_sink_module(
         head_dim_vo,
         pos_encoding_mode,
         use_sliding_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
     )
 
     return gen_customize_batch_prefill_module(
@@ -1119,8 +1128,8 @@ def gen_batch_prefill_attention_sink_module(
         attention_sink_decl[backend],
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
-        use_logits_soft_cap=False,
-        use_fp16_qk_reduction=False,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=False,
     )
 
