@@ -349,26 +349,29 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 #   - sm120_rr_smem_copy_selector_B selects appropriate copy atom based on TileN
 SM120_SUPPORTED_TILE_MN = (
     # ========== NATIVE TILES (M >= 64, no swap_ab) ==========
-    # M must be power-of-2 multiple of 64 (CUTE shape divisibility constraint)
-    # FP4 B tensor uses PADDED format (1 byte/element, NOT 0.5 bytes) due to
-    # ldmatrix.b4x16_p64 instruction required by mma.kind::f8f6f4
+    # Constraints:
+    # - M must be power-of-2 multiple of 64 (CUTE shape divisibility)
+    # - N >= 16 required (N=8 fails stmatrix "Ambiguous scatter" constraint)
+    # - N must be power-of-2 (TMA alignment)
     #
-    # M=64: N <= 128 fit in smem with 2+ stages
-    (64, 8), (64, 16), (64, 32), (64, 64), (64, 128),
-    # M=128: N <= 128 fit in smem with 2+ stages
-    (128, 8), (128, 16), (128, 32), (128, 64), (128, 128),
-    # M=256: only N <= 16 fit with 2 stages (M+N must be <= ~275)
-    (256, 8), (256, 16),
-    # Note: (64,256), (128,256), (256,32+) exceed SMEM for 2 stages
+    # M=64: N in {16, 32, 64, 128} fit in smem with 2+ stages
+    (64, 16), (64, 32), (64, 64), (64, 128),
+    # M=128: N in {16, 32, 64, 128} fit in smem with 2+ stages
+    (128, 16), (128, 32), (128, 64), (128, 128),
+    # M=256: only N=16 fits with 2 stages
+    (256, 16),
     #
     # ========== SWAPPED TILES (M < 64, uses swap_ab) ==========
-    # Physical (64, N) -> Logical (N, 64), for small decode batches
-    (8, 64), (16, 64), (32, 64),
-    # Physical (128, N) -> Logical (N, 128)
-    (8, 128), (16, 128), (32, 128),
-    # Physical (256, N) -> Logical (N, 256) - only 8,16 fit
-    (8, 256), (16, 256),
-    # Note: (32, 256) would need physical (256, 32) which exceeds SMEM
+    # Physical tile is (N, M), so physical N = logical M
+    # Constraint: logical M >= 16 (physical N >= 16 for stmatrix)
+    #
+    # Physical (64, M) -> Logical (M, 64)
+    (16, 64), (32, 64),
+    # Physical (128, M) -> Logical (M, 128)
+    (16, 128), (32, 128),
+    # Physical (256, M) -> Logical (M, 256)
+    (16, 256),
+    # Note: Logical M=8 fails (physical N=8 fails stmatrix constraint)
 )
 
 
@@ -385,15 +388,32 @@ def select_tile_mn_for_sm120(num_tokens: int) -> tuple[int, int]:
     because FP4 uses padded format (1 byte/element due to ldmatrix.b4x16_p64).
     Max tile is (128, 128) which uses 32KB per stage × 2 = 64KB.
 
+    Runtime tile override (can be changed without restart):
+        /tmp/flashinfer_moe_tile: File containing tile spec (e.g., "64x128").
+                                   Checked on every call, so can be modified at runtime.
+
     Args:
         num_tokens: Number of tokens in the batch.
 
     Returns:
         Tile shape (M, N).
     """
+    # Runtime file override (can be changed without restart)
+    tile_file = "/tmp/flashinfer_moe_tile"
+    try:
+        with open(tile_file, "r") as f:
+            tile_str = f.read().strip().lower()
+            m, n = map(int, tile_str.split("x"))
+            if (m, n) in SM120_SUPPORTED_TILE_MN:
+                return (m, n)
+    except (FileNotFoundError, IOError, ValueError, AttributeError):
+        pass
+    
+    # Automatic tile selection based on batch size
     # For small batches (decode), use smaller M tiles for better efficiency
     if num_tokens < 64:
         return (64, 128)  # M=64 natively supported by tcgen05
+    
     # For medium/large batches, use (128, 128) - largest tile that fits in SMEM
     return (128, 128)
 
@@ -676,10 +696,14 @@ def get_cutlass_fused_moe_module(
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
-        tuner = AutoTuner.get()
+
+        # Check if we're on SM120/121 - disable autotuner for stability
+        major, minor = torch.cuda.get_device_capability()
+        is_sm12x = major == 12
+
         MoERunner.refine_tuning_config(tune_max_num_tokens)
 
-        # allocate workspace for profiling
+        # Create MoE runner (needed for both paths)
         moe_runner = MoERunner(
             x_dtype=input.dtype,
             weight_dtype=fc1_expert_weights.dtype,
@@ -701,37 +725,46 @@ def get_cutlass_fused_moe_module(
             use_packed_weights=use_packed_weights,
         )
 
-        # Limit tactics to GEMM1 during tuning
-        moe_runner.gemm_idx_for_tuning = 1
-        _, gemm_tactic_1 = tuner.choose_one(
-            "trtllm::fused_moe::gemm1",
-            [moe_runner],
-            MoERunner.tuning_config,
-            [
-                input,
-                fc1_expert_weights,
-                fc1_expert_biases,
-                fc2_expert_weights,
-                fc2_expert_biases,
-            ],
-            gemm_idx=1,
-        )
+        if is_sm12x:
+            # SM120/121: Skip autotuner, use fallback tactic (-1)
+            # Autotuner is disabled until tile selection is fully validated
+            gemm_tactic_1 = -1
+            gemm_tactic_2 = -1
+        else:
+            # Other architectures: Use autotuner
+            tuner = AutoTuner.get()
 
-        # Limit tactics to GEMM2 during tuning
-        moe_runner.gemm_idx_for_tuning = 2
-        _, gemm_tactic_2 = tuner.choose_one(
-            "trtllm::fused_moe::gemm2",
-            [moe_runner],
-            MoERunner.tuning_config,
-            [
-                input,
-                fc1_expert_weights,
-                fc1_expert_biases,
-                fc2_expert_weights,
-                fc2_expert_biases,
-            ],
-            gemm_idx=2,
-        )
+            # Limit tactics to GEMM1 during tuning
+            moe_runner.gemm_idx_for_tuning = 1
+            _, gemm_tactic_1 = tuner.choose_one(
+                "trtllm::fused_moe::gemm1",
+                [moe_runner],
+                MoERunner.tuning_config,
+                [
+                    input,
+                    fc1_expert_weights,
+                    fc1_expert_biases,
+                    fc2_expert_weights,
+                    fc2_expert_biases,
+                ],
+                gemm_idx=1,
+            )
+
+            # Limit tactics to GEMM2 during tuning
+            moe_runner.gemm_idx_for_tuning = 2
+            _, gemm_tactic_2 = tuner.choose_one(
+                "trtllm::fused_moe::gemm2",
+                [moe_runner],
+                MoERunner.tuning_config,
+                [
+                    input,
+                    fc1_expert_weights,
+                    fc1_expert_biases,
+                    fc2_expert_weights,
+                    fc2_expert_biases,
+                ],
+                gemm_idx=2,
+            )
 
         run_moe = (
             moe_runner.fused_moe_runner.run_moe_min_latency
