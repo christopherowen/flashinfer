@@ -82,12 +82,9 @@ class Logger {
  private:
   static auto constexpr kPREFIX = "[TensorRT-LLM]";
 
-#ifndef NDEBUG
-  Level const DEFAULT_LOG_LEVEL = DEBUG;
-#else
-  Level const DEFAULT_LOG_LEVEL = INFO;
-#endif
-  Level level_ = DEFAULT_LOG_LEVEL;
+  // Default to INFO to avoid verbose debug logs in production.
+  // Use setLevel(DEBUG) to enable debug logs if needed.
+  Level level_ = INFO;
 
   Logger();  // NOLINT(modernize-use-equals-delete)
 
