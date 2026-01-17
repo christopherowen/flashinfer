@@ -1,0 +1,625 @@
+/*
+ * FP4 GEMV Kernel using DP4A (following llama.cpp approach)
+ * 
+ * This kernel implements MXFP4 matrix-vector multiplication using INT8 DP4A
+ * instructions instead of Tensor Cores. This is more efficient for small
+ * batch sizes (M=1) where Tensor Core tile overhead dominates.
+ *
+ * Key insight from llama.cpp:
+ * - Convert FP4 weights to INT8 via lookup table (not floating point conversion)
+ * - Quantize BF16 activations to INT8 with per-block scale
+ * - Use DP4A for 4x int8 dot products per instruction
+ * - Apply scale factors at the end
+ *
+ * This version is adapted for vLLM's MXFP4 format:
+ * - weights: [N, K/2] uint8 (packed FP4, 2 values per byte)
+ * - weight_scales: [N, K/32] uint8 (E8M0 block scales)
+ * - activations: [M, K] bfloat16 (quantized to INT8 inside kernel)
+ *
+ * Reference: llama.cpp ggml/src/ggml-cuda/vecdotq.cuh
+ */
+
+#include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cstdint>
+
+// TVM FFI bindings
+#include "../tvm_ffi_utils.h"
+
+using tvm::ffi::TensorView;
+
+namespace flashinfer {
+namespace gemv {
+
+//=============================================================================
+// Constants and Lookup Tables
+//=============================================================================
+
+// E2M1 values doubled (for int8 range), matching llama.cpp's kvalues_mxfp4
+// These are the 16 possible FP4 values: {0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}
+// Doubled: {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12}
+__constant__ int8_t kvalues_fp4[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12,      // Positive values (index 0-7)
+    0, -1, -2, -3, -4, -6, -8, -12  // Negative values (index 8-15)
+};
+
+// Block size for MXFP4 quantization
+constexpr int QK_MXFP4 = 32;
+
+// Block size for Q8_1 activation quantization
+constexpr int QK8_1 = 32;
+
+//=============================================================================
+// Utility Functions (from llama.cpp)
+//=============================================================================
+
+// Load 4 bytes from unaligned address
+__device__ __forceinline__ int get_int_b1(const void* x, const int& i32) {
+    const uint8_t* x8 = (const uint8_t*)x;
+    int x32  = x8[4*i32 + 0] <<  0;
+    x32     |= x8[4*i32 + 1] <<  8;
+    x32     |= x8[4*i32 + 2] << 16;
+    x32     |= x8[4*i32 + 3] << 24;
+    return x32;
+}
+
+// Convert 8 FP4 indices (packed in 32 bits) to 8 int8 values using lookup table
+// Uses __byte_perm for efficient byte selection on CUDA
+// q4: 8 x 4-bit indices packed in 32 bits
+// Returns int2 with even indices in .x and odd indices in .y
+__device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
+    const uint32_t* table32 = (const uint32_t*)table;
+    
+    // __byte_perm selects bytes based on the lower 16 bits in its third argument
+    // Do 2 iterations over the 32 bits in q4 with 0 and 16 shift
+    uint32_t tmp[2];
+    const uint32_t low_high_selection_indices = (0x32103210 | ((q4 & 0x88888888) >> 1));
+    
+    #pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+        const uint32_t shift = 16 * i;
+        const uint32_t low  = __byte_perm(table32[0], table32[1], q4 >> shift);
+        const uint32_t high = __byte_perm(table32[2], table32[3], q4 >> shift);
+        tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
+    }
+    
+    // Reorder: even indices in .x, odd indices in .y
+    return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), 
+                     __byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
+// DP4A: 4x int8 dot product with int32 accumulation
+// Computes: d = sum(a[i] * b[i] for i in 0..3) + c
+__device__ __forceinline__ int dp4a(int a, int b, int c) {
+    int result;
+#if __CUDA_ARCH__ >= 610
+    asm volatile("dp4a.s32.s32 %0, %1, %2, %3;" 
+                 : "=r"(result) 
+                 : "r"(a), "r"(b), "r"(c));
+#else
+    // Fallback for older architectures
+    const int8_t* a8 = reinterpret_cast<const int8_t*>(&a);
+    const int8_t* b8 = reinterpret_cast<const int8_t*>(&b);
+    result = c;
+    for (int k = 0; k < 4; ++k) {
+        result += int(a8[k]) * int(b8[k]);
+    }
+#endif
+    return result;
+}
+
+// Convert E8M0 scale factor to float
+// E8M0: 8-bit exponent only, no mantissa, bias = 127
+__device__ __forceinline__ float e8m0_to_fp32(uint8_t e) {
+    // E8M0: value = 2^(e - 127)
+    uint32_t bits = (uint32_t(e) << 23);  // Put exponent in float32 format
+    return __uint_as_float(bits);
+}
+
+//=============================================================================
+// MXFP4 Block Structure (matching llama.cpp's block_mxfp4)
+//=============================================================================
+
+// MXFP4 block: 1 E8M0 scale + 16 packed FP4 nibbles = 32 values
+struct block_mxfp4 {
+    uint8_t e;                    // E8M0 scale factor
+    uint8_t qs[QK_MXFP4 / 2];     // 16 bytes = 32 packed 4-bit values
+};
+
+// Q8_1 block for quantized activations: 32 int8 values + scale + sum
+struct block_q8_1 {
+    half2 ds;   // .x = scale (d), .y = sum (s) for bias correction
+    int8_t qs[QK8_1];  // 32 quantized values
+};
+
+//=============================================================================
+// Core Vector Dot Product (matching llama.cpp's vec_dot_mxfp4_q8_1)
+//=============================================================================
+
+// Vector dot product: FP4 weights × Q8_1 activations
+// This processes one block (32 elements) at a time
+constexpr int VDR_MXFP4_Q8_1 = 2;  // Vector depth ratio
+
+__device__ __forceinline__ float vec_dot_mxfp4_q8_1(
+    const void* __restrict__ vbq,      // MXFP4 weights
+    const block_q8_1* __restrict__ bq8_1,  // Q8_1 activations  
+    const int& kbx,                     // Block index for weights
+    const int& iqs                      // Sub-block index
+) {
+    const block_mxfp4* bq4 = (const block_mxfp4*)vbq + kbx;
+    const int* q8 = (const int*)bq8_1->qs + iqs;
+    
+    int sumi = 0;
+    #pragma unroll
+    for (int l = 0; l < VDR_MXFP4_Q8_1; ++l) {
+        // Load 4 bytes = 8 FP4 values
+        const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
+        // Convert to int8 via lookup table
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_fp4);
+        
+        // DP4A: 4x int8 dot products
+        sumi = dp4a(v.x, q8[l + 0], sumi);  // Even nibbles
+        sumi = dp4a(v.y, q8[l + 4], sumi);  // Odd nibbles
+    }
+    
+    // Apply scale factors:
+    // - Weight scale: E8M0 value * 0.5 (because kvalues_fp4 is doubled)
+    // - Activation scale: d from Q8_1
+    const float d = e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
+    return d * float(sumi);
+}
+
+//=============================================================================
+// Quantize BF16 Activation to Q8_1 Format (Interleaved for DP4A)
+//=============================================================================
+
+// Quantize a block of 32 BF16 values to Q8_1 format with INTERLEAVED layout
+// to match the output of get_int_from_table_16.
+//
+// The interleaving pattern:
+// - qs[0..15]  = even indices: act[0,2,4,6,8,10,12,14,16,18,20,22,24,26,28,30]
+// - qs[16..31] = odd indices:  act[1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31]
+//
+// This matches get_int_from_table_16 which returns:
+// - v.x = table values for even nibbles (low nibbles of each byte)
+// - v.y = table values for odd nibbles (high nibbles of each byte)
+//
+// With this layout, dp4a(v.x, q8[l], sumi) and dp4a(v.y, q8[l+4], sumi)
+// correctly pairs FP4 weights with their corresponding activations.
+__device__ void quantize_bf16_to_q8_1_interleaved(
+    const nv_bfloat16* __restrict__ input,  // [32] BF16 values in sequential order
+    block_q8_1* __restrict__ output          // Output Q8_1 block in interleaved order
+) {
+    // Find max absolute value for scaling
+    float amax = 0.0f;
+    float vals[QK8_1];
+    
+    #pragma unroll
+    for (int i = 0; i < QK8_1; ++i) {
+        vals[i] = __bfloat162float(input[i]);
+        amax = fmaxf(amax, fabsf(vals[i]));
+    }
+    
+    // Compute scale: map max value to 127
+    const float d = amax / 127.0f;
+    const float id = (d != 0.0f) ? 127.0f / amax : 0.0f;  // Inverse scale
+    
+    // Quantize with interleaved storage
+    float sum = 0.0f;
+    
+    // First half: even indices (0, 2, 4, ..., 30)
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int src_idx = i * 2;  // 0, 2, 4, ..., 30
+        const float v = vals[src_idx] * id;
+        const int8_t q = (int8_t)roundf(v);
+        output->qs[i] = q;
+        sum += float(q);
+    }
+    
+    // Second half: odd indices (1, 3, 5, ..., 31)
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        const int src_idx = i * 2 + 1;  // 1, 3, 5, ..., 31
+        const float v = vals[src_idx] * id;
+        const int8_t q = (int8_t)roundf(v);
+        output->qs[16 + i] = q;
+        sum += float(q);
+    }
+    
+    // Store scale and sum
+    output->ds = __halves2half2(__float2half(d), __float2half(sum * d));
+}
+
+//=============================================================================
+// Main GEMV Kernel: Y = X @ W^T (M=1 optimized)
+//=============================================================================
+
+// Grid: (N / BLOCK_N, batch)
+// Block: (BLOCK_N) threads
+template <int BLOCK_N = 128>
+__global__ void gemv_mxfp4_dp4a_kernel(
+    const uint8_t* __restrict__ weights,     // [N, K/2] packed FP4 (interpreted as block_mxfp4)
+    const uint8_t* __restrict__ weight_scales, // [N, K/32] E8M0 scales (embedded in weights)
+    const nv_bfloat16* __restrict__ input,   // [K] BF16 activation
+    nv_bfloat16* __restrict__ output,        // [N] BF16 output
+    int N,                                   // Output dimension
+    int K                                    // Reduction dimension
+) {
+    // Dynamic shared memory for quantized activations
+    extern __shared__ block_q8_1 q8_blocks[];
+    
+    const int n_block = blockIdx.x;
+    const int n_start = n_block * BLOCK_N;
+    const int tid = threadIdx.x;
+    
+    // Number of blocks in K dimension
+    const int n_k_blocks = K / QK_MXFP4;
+    const int n_q8_blocks = K / QK8_1;
+    
+    // Cooperative quantization of activations (once per block)
+    // All threads participate
+    for (int i = tid; i < n_q8_blocks; i += BLOCK_N) {
+        quantize_bf16_to_q8_1_interleaved(input + i * QK8_1, &q8_blocks[i]);
+    }
+    __syncthreads();
+    
+    // Each thread handles one output element
+    const int n = n_start + tid;
+    if (n >= N) return;
+    
+    // Pointers for this output row's weights
+    const block_mxfp4* w_blocks = (const block_mxfp4*)(weights) + n * n_k_blocks;
+    
+    // Accumulate dot product
+    float sum = 0.0f;
+    
+    // Process blocks of 32 elements
+    for (int kb = 0; kb < n_k_blocks; ++kb) {
+        // Each block_mxfp4 corresponds to one block_q8_1
+        const block_q8_1* q8 = &q8_blocks[kb];
+        
+        // Sum over sub-blocks within the 32-element block
+        for (int iqs = 0; iqs < QK_MXFP4 / 8; iqs += VDR_MXFP4_Q8_1) {
+            sum += vec_dot_mxfp4_q8_1(w_blocks, q8, kb, iqs);
+        }
+    }
+    
+    // Write output
+    output[n] = __float2bfloat16(sum);
+}
+
+//=============================================================================
+// MoE-Optimized GEMV: Process Multiple Experts
+//=============================================================================
+
+// For MoE, we need to process 8 experts per token
+// This kernel batches all experts together for better efficiency
+template <int BLOCK_N = 128>
+__global__ void gemv_mxfp4_moe_dp4a_kernel(
+    const uint8_t* __restrict__* expert_weights,  // [num_experts] pointers to weight matrices
+    const nv_bfloat16* __restrict__ input,        // [K] BF16 activation (shared across experts)
+    const int* __restrict__ expert_ids,            // [topk] expert indices to use
+    const float* __restrict__ expert_weights_scale, // [topk] routing weights
+    nv_bfloat16* __restrict__ output,              // [N] BF16 output (accumulated)
+    int num_experts,                               // Total number of experts
+    int topk,                                      // Number of experts to use
+    int N,                                         // Output dimension per expert
+    int K                                          // Hidden dimension
+) {
+    const int n_block = blockIdx.x;
+    const int expert_idx = blockIdx.y;  // Which of the topk experts
+    
+    const int n_start = n_block * BLOCK_N;
+    const int tid = threadIdx.x;
+    const int n = n_start + tid;
+    
+    if (n >= N || expert_idx >= topk) return;
+    
+    const int expert_id = expert_ids[expert_idx];
+    const float routing_weight = expert_weights_scale[expert_idx];
+    
+    // Get this expert's weights
+    const int n_k_blocks = K / QK_MXFP4;
+    const block_mxfp4* w_blocks = (const block_mxfp4*)(expert_weights[expert_id]) + n * n_k_blocks;
+    
+    // Shared memory for quantized activations (shared across experts)
+    extern __shared__ block_q8_1 q8_blocks[];
+    
+    // Quantize activations cooperatively
+    const int n_q8_blocks = K / QK8_1;
+    if (expert_idx == 0) {  // Only first expert block quantizes
+        for (int i = tid; i < n_q8_blocks; i += BLOCK_N) {
+            quantize_bf16_to_q8_1_interleaved(input + i * QK8_1, &q8_blocks[i]);
+        }
+    }
+    __syncthreads();
+    
+    // Compute dot product
+    float sum = 0.0f;
+    for (int kb = 0; kb < n_k_blocks; ++kb) {
+        const block_q8_1* q8 = &q8_blocks[kb];
+        for (int iqs = 0; iqs < QK_MXFP4 / 8; iqs += VDR_MXFP4_Q8_1) {
+            sum += vec_dot_mxfp4_q8_1(w_blocks, q8, kb, iqs);
+        }
+    }
+    
+    // Apply routing weight and accumulate to output
+    atomicAdd(reinterpret_cast<float*>(output + n), 
+              __bfloat162float(output[n]) + sum * routing_weight);
+}
+
+//=============================================================================
+// VLLM-Compatible GEMV Kernel: Separate weight and scale tensors
+// Optimized version matching llama.cpp's approach with DP4A vectorization
+//=============================================================================
+
+// Warp size for CUDA
+constexpr int WARP_SIZE = 32;
+
+// Warp reduction sum
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        val += __shfl_xor_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+// Vector dot product for vLLM format using vectorized DP4A
+// Matches llama.cpp's approach exactly for maximum performance
+//
+// With interleaved Q8 layout:
+// - qs[0..15] = even activations (indices 0,2,4,...,30)
+// - qs[16..31] = odd activations (indices 1,3,5,...,31)
+//
+// And get_int_from_table_16 output:
+// - v.x = int8 values for even nibbles (positions 0,2,4,6 in 4 bytes)
+// - v.y = int8 values for odd nibbles (positions 1,3,5,7 in 4 bytes)
+//
+// The dp4a pairing works correctly:
+// dp4a(v.x, q8[l]) pairs even weights with even activations
+// dp4a(v.y, q8[l+4]) pairs odd weights with odd activations
+//
+// Parameters:
+// - iqs: sub-block index (0 or 2), determines which 16 of 32 elements to process
+// - Each call processes 16 elements via 2 iterations of 8 elements each
+constexpr int VDR_MXFP4_Q8_1_MMVQ = 2;  // Vector depth ratio: 2 iterations per call
+
+__device__ __forceinline__ float vec_dot_vllm_mxfp4_q8_1_dp4a(
+    const uint8_t* __restrict__ weights,    // [K/2] packed FP4 for this row
+    const uint8_t* __restrict__ scales,     // [K/32] E8M0 scales for this row
+    const block_q8_1* __restrict__ q8,      // Q8_1 activation block (INTERLEAVED)
+    const int kb,                            // Block index (0 to K/32-1)
+    const int iqs                            // Sub-block index (0 or 2)
+) {
+    // Get scale for this block
+    const float weight_scale = e8m0_to_fp32(scales[kb]) * 0.5f;
+    const float act_scale = __low2float(q8->ds);
+    
+    // Get weights for this block: 16 bytes = 32 x 4-bit values
+    const uint8_t* w_ptr = weights + kb * 16;
+    
+    // Get activation ints - with interleaved layout:
+    // q8_qs[0..3] = even activations 0-15 as 4 int32
+    // q8_qs[4..7] = odd activations 0-15 as 4 int32
+    const int* q8_qs = (const int*)q8->qs + iqs;
+    
+    int sumi = 0;
+    
+    #pragma unroll
+    for (int l = 0; l < VDR_MXFP4_Q8_1_MMVQ; ++l) {
+        // Load 4 bytes = 8 FP4 values
+        const int aux_q4 = get_int_b1(w_ptr, iqs + l);
+        
+        // Convert to int8 via lookup table (vectorized, 8 values at once)
+        // v.x = int8 for even nibbles, v.y = int8 for odd nibbles
+        const int2 v = get_int_from_table_16(aux_q4, kvalues_fp4);
+        
+        // DP4A: 4x int8 dot products each
+        // Even nibbles × even activations
+        sumi = dp4a(v.x, q8_qs[l + 0], sumi);
+        // Odd nibbles × odd activations  
+        sumi = dp4a(v.y, q8_qs[l + 4], sumi);
+    }
+    
+    return weight_scale * act_scale * float(sumi);
+}
+
+// Optimized GEMV kernel with warp-level parallelism for K dimension
+// Processes multiple output rows per block to amortize activation quantization cost
+// 
+// Key optimization: ROWS_PER_BLOCK=8 means we compute 8 output elements
+// while only quantizing activations once per block.
+//
+// Grid: (ceil(N/ROWS_PER_BLOCK), M)
+// Block: (WARP_SIZE, NWARPS) = (32, NWARPS) threads
+template <int NWARPS = 4, int ROWS_PER_BLOCK = 8>
+__global__ void gemv_vllm_mxfp4_dp4a_kernel(
+    const uint8_t* __restrict__ weights,      // [N, K/2] packed FP4
+    const uint8_t* __restrict__ weight_scales, // [N, K/32] E8M0 scales
+    const nv_bfloat16* __restrict__ input,    // [M, K] BF16 activation
+    nv_bfloat16* __restrict__ output,         // [M, N] BF16 output
+    int M,                                     // Batch size (number of rows)
+    int N,                                     // Output dimension
+    int K                                      // Hidden dimension
+) {
+    // Shared memory for quantized activations
+    extern __shared__ block_q8_1 q8_blocks[];
+    
+    const int m = blockIdx.y;  // Which input row (batch dimension)
+    const int n_start = blockIdx.x * ROWS_PER_BLOCK;  // Starting output row
+    
+    const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;  // Linear thread ID
+    const int warp_id = threadIdx.y;
+    const int lane_id = threadIdx.x;
+    
+    // Number of blocks in K dimension
+    const int n_k_blocks = K / QK_MXFP4;
+    const int n_q8_blocks = K / QK8_1;
+    
+    // Pointer to this input row
+    const nv_bfloat16* row_input = input + m * K;
+    
+    // Threads per block
+    constexpr int THREADS_PER_BLOCK = NWARPS * WARP_SIZE;
+    
+    // Cooperative quantization of activations (all threads participate)
+    // Using INTERLEAVED layout to match get_int_from_table_16 output
+    for (int i = tid; i < n_q8_blocks; i += THREADS_PER_BLOCK) {
+        quantize_bf16_to_q8_1_interleaved(row_input + i * QK8_1, &q8_blocks[i]);
+    }
+    __syncthreads();
+    
+    // Work distribution matching llama.cpp:
+    // - VDR = 2: each vec_dot call processes 16 elements (half a block)
+    // - qi = 4: number of int32 groups in Q8 (32 int8 / 8 per group = 4)
+    // - Each thread handles a different (kb, iqs) pair
+    constexpr int qi = 4;
+    constexpr int vdr = VDR_MXFP4_Q8_1_MMVQ;  // = 2
+    constexpr int blocks_per_iter = vdr * THREADS_PER_BLOCK / qi;
+    
+    // Partial sums for each output row this block handles
+    // With ROWS_PER_BLOCK=8, each thread tracks 8 partial sums
+    float tmp[ROWS_PER_BLOCK] = {0.0f};
+    
+    // Determine which sub-block this thread handles
+    const int iqs = vdr * (tid % (qi / vdr));  // 0 or 2
+    
+    // Iterate over K dimension in strides
+    for (int kb = tid / (qi / vdr); kb < n_k_blocks; kb += blocks_per_iter) {
+        // Process all ROWS_PER_BLOCK output rows with the same activation block
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            const int n = n_start + row;
+            if (n < N) {
+                const uint8_t* row_weights = weights + n * (K / 2);
+                const uint8_t* row_scales = weight_scales + n * n_k_blocks;
+                
+                tmp[row] += vec_dot_vllm_mxfp4_q8_1_dp4a(
+                    row_weights, row_scales, &q8_blocks[kb], kb, iqs);
+            }
+        }
+    }
+    
+    // Cross-warp reduction via shared memory
+    // Each thread has partial sums for ROWS_PER_BLOCK outputs
+    __shared__ float tmp_shared[NWARPS > 1 ? NWARPS - 1 : 1][ROWS_PER_BLOCK][WARP_SIZE];
+    
+    // Non-zero warps write their partial sums to shared memory
+    if (warp_id > 0) {
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            tmp_shared[warp_id - 1][row][lane_id] = tmp[row];
+        }
+    }
+    __syncthreads();
+    
+    // Only warp 0 continues with final reduction
+    if (warp_id > 0) return;
+    
+    // Warp 0: sum results from other warps (per-lane)
+    #pragma unroll
+    for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+        #pragma unroll
+        for (int w = 0; w < NWARPS - 1; ++w) {
+            tmp[row] += tmp_shared[w][row][lane_id];
+        }
+    }
+    
+    // Now do warp reduction to sum across all 32 lanes
+    #pragma unroll
+    for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+        tmp[row] = warp_reduce_sum(tmp[row]);
+    }
+    
+    // Lane 0 writes final results
+    if (lane_id == 0) {
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            const int n = n_start + row;
+            if (n < N) {
+                output[m * N + n] = __float2bfloat16(tmp[row]);
+            }
+        }
+    }
+}
+
+//=============================================================================
+// Internal launcher
+//=============================================================================
+
+cudaError_t run_gemv_fp4_dp4a(
+    int M, int N, int K,
+    const void* weights,
+    const void* weight_scales,
+    const void* input,
+    void* output,
+    cudaStream_t stream
+) {
+    // Kernel configuration optimized for throughput
+    // ROWS_PER_BLOCK=8: Process 8 output rows per block
+    // This amortizes activation quantization cost across 8 outputs instead of 2
+    // With 4 warps (128 threads), we have good K-dimension parallelism
+    constexpr int NWARPS = 4;           // 4 warps per block
+    constexpr int ROWS_PER_BLOCK = 8;   // Process 8 output rows per block
+    
+    dim3 grid((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, M);
+    dim3 block(WARP_SIZE, NWARPS);  // 32 x 4 = 128 threads
+    
+    // Dynamic shared memory: K/32 blocks of block_q8_1 (36 bytes each)
+    // Plus space for cross-warp reduction (now for 8 rows instead of 2)
+    const int n_q8_blocks = K / QK8_1;
+    const size_t smem_q8 = n_q8_blocks * sizeof(block_q8_1);
+    const size_t smem_reduce = (NWARPS - 1) * ROWS_PER_BLOCK * WARP_SIZE * sizeof(float);
+    const size_t smem_size = smem_q8 + smem_reduce;
+    
+    gemv_vllm_mxfp4_dp4a_kernel<NWARPS, ROWS_PER_BLOCK><<<grid, block, smem_size, stream>>>(
+        (const uint8_t*)weights,
+        (const uint8_t*)weight_scales,
+        (const nv_bfloat16*)input,
+        (nv_bfloat16*)output,
+        M, N, K
+    );
+    
+    return cudaGetLastError();
+}
+
+}  // namespace gemv
+}  // namespace flashinfer
+
+//=============================================================================
+// TVM FFI Bindings
+//=============================================================================
+
+// GEMV for MXFP4: output[M, N] = input[M, K] @ weights[N, K].T
+// Fuses BF16->INT8 activation quantization inside the kernel
+void gemv_fp4_dp4a(
+    int64_t M,
+    int64_t N, 
+    int64_t K,
+    TensorView weights,       // [N, K/2] uint8 packed FP4
+    TensorView weight_scales, // [N, K/32] uint8 E8M0
+    TensorView input,         // [M, K] bfloat16
+    TensorView output         // [M, N] bfloat16
+) {
+    cudaStream_t stream = nullptr;
+    
+    cudaError_t err = flashinfer::gemv::run_gemv_fp4_dp4a(
+        static_cast<int>(M),
+        static_cast<int>(N),
+        static_cast<int>(K),
+        weights.data_ptr(),
+        weight_scales.data_ptr(),
+        input.data_ptr(),
+        output.data_ptr(),
+        stream
+    );
+    
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "GEMV FP4 DP4A kernel failed: " << cudaGetErrorString(err);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemv_fp4_dp4a, gemv_fp4_dp4a);
+
