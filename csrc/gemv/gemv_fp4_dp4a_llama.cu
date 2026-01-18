@@ -969,10 +969,17 @@ __global__ void gemv_vllm_mxfp4_dp4a_fused_qkv_kernel(
 // Dynamic Configuration Selection
 //=============================================================================
 
-// Select optimal NWARPS based on K dimension
+// Select optimal NWARPS based on K dimension and N dimension
 // Goal: ~2-4 iterations per thread for good occupancy without wasted work
-__host__ inline int select_nwarps(int K) {
+// For very large N (like LM Head), more warps help hide memory latency
+__host__ inline int select_nwarps(int K, int N = 0) {
     const int n_k_blocks = K / QK_MXFP4;  // Number of K-blocks to process
+    
+    // For very large N (LM Head), use more warps to hide memory latency
+    // despite fewer iterations per thread
+    if (N > 100000) {
+        return 4;  // More warps for memory-bound workloads
+    }
     
     // Target: 2-4 K-blocks per thread for good work balance
     // NWARPS * 32 threads, each processes n_k_blocks / (NWARPS * 32) blocks
@@ -1096,17 +1103,20 @@ cudaError_t run_gemv_fp4_dp4a_fused_qkv(
     cudaStream_t stream
 ) {
     // Dynamic configuration based on largest N and K
-    const int selected_nwarps = select_nwarps(K);
-    // For fused QKV, use the max N to determine ROWS
+    // For fused QKV, use the max N to determine ROWS and NWARPS
     const int max_N = max(N_q, max(N_k, N_v));
+    const int selected_nwarps = select_nwarps(K, max_N);
     const int selected_rows = select_rows_per_block(max_N);
     
     // Dispatch to specialized kernel
     // For gpt-oss-120b: K=2880, N_q=2880, N_k=N_v=360
     DISPATCH_FUSED_QKV(1, 2);
     DISPATCH_FUSED_QKV(1, 4);
+    DISPATCH_FUSED_QKV(2, 2);
     DISPATCH_FUSED_QKV(2, 4);   // Would be selected for N_k=N_v=360
     DISPATCH_FUSED_QKV(2, 8);   // Selected for max(2880, 360) = 2880
+    DISPATCH_FUSED_QKV(2, 16);  // Large QKV with K<=3072
+    DISPATCH_FUSED_QKV(4, 4);
     DISPATCH_FUSED_QKV(4, 8);
     DISPATCH_FUSED_QKV(4, 16);
     
@@ -1129,20 +1139,24 @@ cudaError_t run_gemv_fp4_dp4a_prequant(
     cudaStream_t stream
 ) {
     // Dynamic configuration selection
-    const int selected_nwarps = select_nwarps(K);
+    // Pass N to select_nwarps for large N (LM Head) optimization
+    const int selected_nwarps = select_nwarps(K, N);
     const int selected_rows = select_rows_per_block(N);
     
     // Dispatch to specialized kernel
     // Common configurations for gpt-oss-120b (K=2880):
     DISPATCH_PREQUANT(1, 2);   // Very small N
     DISPATCH_PREQUANT(1, 4);   // Small N, small K
+    DISPATCH_PREQUANT(2, 2);   // Very small N, medium K
     DISPATCH_PREQUANT(2, 4);   // K/V projection (N=360, K=2880)
     DISPATCH_PREQUANT(2, 8);   // Q/O projection (N=2880, K=2880)
+    DISPATCH_PREQUANT(2, 16);  // Medium N with K<=3072
+    DISPATCH_PREQUANT(4, 4);   // Small N, large K
     DISPATCH_PREQUANT(4, 8);   // Large N, large K (default)
-    DISPATCH_PREQUANT(4, 16);  // LM Head (N=201088)
+    DISPATCH_PREQUANT(4, 16);  // LM Head with K>3072
     
     // Fallback to default if no match
-    return launch_gemv_prequant<4, 8>(M, N, K, weights, weight_scales, q8_activations, output, stream);
+    return launch_gemv_prequant<2, 8>(M, N, K, weights, weight_scales, q8_activations, output, stream);
 }
 
 cudaError_t run_quantize_activations(
@@ -1217,19 +1231,23 @@ cudaError_t run_gemv_fp4_dp4a(
     cudaStream_t stream
 ) {
     // Dynamic configuration selection
-    const int selected_nwarps = select_nwarps(K);
+    // Pass N to select_nwarps for large N (LM Head) optimization
+    const int selected_nwarps = select_nwarps(K, N);
     const int selected_rows = select_rows_per_block(N);
     
     // Dispatch to specialized kernel
     DISPATCH_DP4A(1, 2);
     DISPATCH_DP4A(1, 4);
+    DISPATCH_DP4A(2, 2);
     DISPATCH_DP4A(2, 4);
     DISPATCH_DP4A(2, 8);
+    DISPATCH_DP4A(2, 16);   // Medium N with K<=3072
+    DISPATCH_DP4A(4, 4);
     DISPATCH_DP4A(4, 8);
     DISPATCH_DP4A(4, 16);
     
     // Fallback
-    return launch_gemv_dp4a<4, 8>(M, N, K, weights, weight_scales, input, output, stream);
+    return launch_gemv_dp4a<2, 8>(M, N, K, weights, weight_scales, input, output, stream);
 }
 
 }  // namespace gemv
