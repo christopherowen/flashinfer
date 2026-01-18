@@ -1268,7 +1268,7 @@ void gemv_fp4_dp4a(
     TensorView input,         // [M, K] bfloat16
     TensorView output         // [M, N] bfloat16
 ) {
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = get_current_stream();
     
     cudaError_t err = flashinfer::gemv::run_gemv_fp4_dp4a(
         static_cast<int>(M),
@@ -1295,7 +1295,7 @@ void quantize_activations_q8(
     TensorView input,   // [M, K] bfloat16
     TensorView output   // [M, K/32, 36] uint8 (block_q8_1 = 36 bytes)
 ) {
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = get_current_stream();
     
     cudaError_t err = flashinfer::gemv::run_quantize_activations(
         static_cast<int>(M),
@@ -1322,7 +1322,7 @@ void gemv_fp4_dp4a_prequant(
     TensorView q8_activations,  // [M, K/32, 36] uint8 (block_q8_1)
     TensorView output           // [M, N] bfloat16
 ) {
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = get_current_stream();
     
     cudaError_t err = flashinfer::gemv::run_gemv_fp4_dp4a_prequant(
         static_cast<int>(M),
@@ -1352,7 +1352,7 @@ void gemv_fp4_dp4a_prefetch(
     TensorView q8_activations,
     TensorView output
 ) {
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = get_current_stream();
     
     cudaError_t err = flashinfer::gemv::run_gemv_fp4_dp4a_prefetch(
         static_cast<int>(M),
@@ -1381,7 +1381,7 @@ void gemv_fp4_dp4a_fused_qkv(
     TensorView q8_activations,
     TensorView output_q, TensorView output_k, TensorView output_v
 ) {
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = get_current_stream();
     
     cudaError_t err = flashinfer::gemv::run_gemv_fp4_dp4a_fused_qkv(
         static_cast<int>(M),
@@ -1614,7 +1614,7 @@ void transpose_weights_fp4(
     TensorView weights,      // [N, K/2] uint8
     TensorView weights_t     // [K/32, N, 16] uint8
 ) {
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = get_current_stream();
     
     cudaError_t err = flashinfer::gemv::run_transpose_weights(
         static_cast<int>(N),
@@ -1637,7 +1637,7 @@ void transpose_scales_fp4(
     TensorView scales,       // [N, K/32] uint8
     TensorView scales_t      // [K/32, N] uint8
 ) {
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = get_current_stream();
     
     cudaError_t err = flashinfer::gemv::run_transpose_scales(
         static_cast<int>(N),
@@ -1663,7 +1663,7 @@ void gemv_fp4_transposed(
     TensorView q8_activations, // [M, K/32, 36] uint8
     TensorView output          // [M, N] bfloat16
 ) {
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = get_current_stream();
     
     cudaError_t err = flashinfer::gemv::run_gemv_transposed(
         static_cast<int>(M),
