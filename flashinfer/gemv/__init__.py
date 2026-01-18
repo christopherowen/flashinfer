@@ -22,6 +22,9 @@ from .core import (
     quantize_activations_q8,
     gemv_mxfp4_dp4a_prequant,
     gemv_mxfp4_dp4a_fused_qkv,
+    transpose_weights_fp4,
+    transpose_scales_fp4,
+    gemv_mxfp4_transposed,
     GEMV_M_THRESHOLD,
 )
 
@@ -36,6 +39,10 @@ __all__ = [
     "quantize_activations_q8",   # Separate quantization
     "gemv_mxfp4_dp4a_prequant",  # GEMV with pre-quantized activations
     "gemv_mxfp4_dp4a_fused_qkv", # Fused Q/K/V projection (1.6x faster)
+    # Transposed weight layout (experimental, for large N)
+    "transpose_weights_fp4",     # One-time weight transpose
+    "transpose_scales_fp4",      # One-time scale transpose
+    "gemv_mxfp4_transposed",     # GEMV with transposed weights
 ]
 
 

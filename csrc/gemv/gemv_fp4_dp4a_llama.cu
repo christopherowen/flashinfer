@@ -1401,3 +1401,284 @@ void gemv_fp4_dp4a_fused_qkv(
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemv_fp4_dp4a_fused_qkv, gemv_fp4_dp4a_fused_qkv);
 
+//=============================================================================
+// Transposed Weight Layout for Better Memory Coalescing
+//=============================================================================
+//
+// Original layout:   weights[N, K/2]     - each row is one output's weights
+// Transposed layout: weights_t[K/32, N, 16] - each "row" is one K-block for all outputs
+//
+// With transposed layout, threads reading different output rows (n) will read
+// consecutive memory addresses, enabling perfect coalescing.
+//
+// Memory access pattern comparison:
+//   Original:   Thread i reads weights[n_i][kb*16:kb*16+16] - stride of K/2 bytes
+//   Transposed: Thread i reads weights_t[kb][n_i][:16]      - stride of 16 bytes (coalesced!)
+
+namespace flashinfer {
+namespace gemv {
+
+//=============================================================================
+// Transpose kernel: [N, K/2] -> [K/32, N, 16]
+//=============================================================================
+
+__global__ void transpose_weights_kernel(
+    const uint8_t* __restrict__ weights,      // [N, K/2] input
+    uint8_t* __restrict__ weights_t,          // [K/32, N, 16] output
+    int N,
+    int K
+) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int kb = blockIdx.y;
+    
+    if (n >= N) return;
+    
+    const int n_k_blocks = K / 32;
+    
+    // Read 16 bytes from original layout
+    const uint8_t* src = weights + n * (K / 2) + kb * 16;
+    
+    // Write 16 bytes to transposed layout
+    uint8_t* dst = weights_t + kb * N * 16 + n * 16;
+    
+    // Copy 16 bytes (could use int4 for efficiency)
+    int4 data = load_int4_unaligned(src);
+    *reinterpret_cast<int4*>(dst) = data;
+}
+
+//=============================================================================
+// Transpose kernel for scales: [N, K/32] -> [K/32, N]
+//=============================================================================
+
+__global__ void transpose_scales_kernel(
+    const uint8_t* __restrict__ scales,       // [N, K/32] input
+    uint8_t* __restrict__ scales_t,           // [K/32, N] output
+    int N,
+    int K
+) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int kb = blockIdx.y;
+    
+    if (n >= N) return;
+    
+    const int n_k_blocks = K / 32;
+    
+    // Read 1 byte from original layout
+    uint8_t scale = scales[n * n_k_blocks + kb];
+    
+    // Write 1 byte to transposed layout
+    scales_t[kb * N + n] = scale;
+}
+
+//=============================================================================
+// GEMV with transposed weights - fully coalesced memory access
+//=============================================================================
+
+// Each thread handles one output row, iterates over K-blocks
+// Memory access is coalesced: consecutive threads read consecutive memory
+__global__ void gemv_transposed_kernel(
+    const uint8_t* __restrict__ weights_t,    // [K/32, N, 16] transposed weights
+    const uint8_t* __restrict__ scales_t,     // [K/32, N] transposed scales
+    const block_q8_1* __restrict__ q8_activations, // [M, K/32] pre-quantized
+    nv_bfloat16* __restrict__ output,         // [M, N]
+    int M,
+    int N,
+    int K
+) {
+    const int n = blockIdx.x * blockDim.x + threadIdx.x;  // Output row
+    const int m = blockIdx.y;                              // Batch index
+    
+    if (n >= N) return;
+    
+    const int n_k_blocks = K / 32;
+    const block_q8_1* q8_row = q8_activations + m * n_k_blocks;
+    
+    float sum = 0.0f;
+    
+    // Loop over K-blocks
+    for (int kb = 0; kb < n_k_blocks; kb++) {
+        // Coalesced read: consecutive threads read consecutive 16-byte chunks
+        const uint8_t* w_ptr = weights_t + kb * N * 16 + n * 16;
+        const int4 w_vec = *reinterpret_cast<const int4*>(w_ptr);
+        
+        // Coalesced read: consecutive threads read consecutive scale bytes
+        const float weight_scale = e8m0_to_fp32(scales_t[kb * N + n]) * 0.5f;
+        
+        // Activations (shared across all threads, L2 cached)
+        const block_q8_1* q8 = &q8_row[kb];
+        const float act_scale = __low2float(q8->ds);
+        const int* q8_qs = reinterpret_cast<const int*>(q8->qs);
+        
+        int sumi = 0;
+        
+        // Process 32 FP4 values (16 bytes)
+        int2 v0 = get_int_from_table_16(w_vec.x, kvalues_fp4);
+        sumi = dp4a(v0.x, q8_qs[0], sumi);
+        sumi = dp4a(v0.y, q8_qs[4], sumi);
+        
+        int2 v1 = get_int_from_table_16(w_vec.y, kvalues_fp4);
+        sumi = dp4a(v1.x, q8_qs[1], sumi);
+        sumi = dp4a(v1.y, q8_qs[5], sumi);
+        
+        int2 v2 = get_int_from_table_16(w_vec.z, kvalues_fp4);
+        sumi = dp4a(v2.x, q8_qs[2], sumi);
+        sumi = dp4a(v2.y, q8_qs[6], sumi);
+        
+        int2 v3 = get_int_from_table_16(w_vec.w, kvalues_fp4);
+        sumi = dp4a(v3.x, q8_qs[3], sumi);
+        sumi = dp4a(v3.y, q8_qs[7], sumi);
+        
+        sum += weight_scale * act_scale * float(sumi);
+    }
+    
+    output[m * N + n] = __float2bfloat16(sum);
+}
+
+//=============================================================================
+// Launchers
+//=============================================================================
+
+cudaError_t run_transpose_weights(
+    int N, int K,
+    const void* weights,
+    void* weights_t,
+    cudaStream_t stream
+) {
+    const int n_k_blocks = K / 32;
+    
+    dim3 block(256);
+    dim3 grid((N + block.x - 1) / block.x, n_k_blocks);
+    
+    transpose_weights_kernel<<<grid, block, 0, stream>>>(
+        (const uint8_t*)weights,
+        (uint8_t*)weights_t,
+        N, K
+    );
+    
+    return cudaGetLastError();
+}
+
+cudaError_t run_transpose_scales(
+    int N, int K,
+    const void* scales,
+    void* scales_t,
+    cudaStream_t stream
+) {
+    const int n_k_blocks = K / 32;
+    
+    dim3 block(256);
+    dim3 grid((N + block.x - 1) / block.x, n_k_blocks);
+    
+    transpose_scales_kernel<<<grid, block, 0, stream>>>(
+        (const uint8_t*)scales,
+        (uint8_t*)scales_t,
+        N, K
+    );
+    
+    return cudaGetLastError();
+}
+
+cudaError_t run_gemv_transposed(
+    int M, int N, int K,
+    const void* weights_t,
+    const void* scales_t,
+    const void* q8_activations,
+    void* output,
+    cudaStream_t stream
+) {
+    dim3 block(256);
+    dim3 grid((N + block.x - 1) / block.x, M);
+    
+    gemv_transposed_kernel<<<grid, block, 0, stream>>>(
+        (const uint8_t*)weights_t,
+        (const uint8_t*)scales_t,
+        (const block_q8_1*)q8_activations,
+        (nv_bfloat16*)output,
+        M, N, K
+    );
+    
+    return cudaGetLastError();
+}
+
+}  // namespace gemv
+}  // namespace flashinfer
+
+//=============================================================================
+// TVM FFI Bindings for transposed kernels
+//=============================================================================
+
+// Transpose weights from [N, K/2] to [K/32, N, 16]
+void transpose_weights_fp4(
+    int64_t N,
+    int64_t K,
+    TensorView weights,      // [N, K/2] uint8
+    TensorView weights_t     // [K/32, N, 16] uint8
+) {
+    cudaStream_t stream = nullptr;
+    
+    cudaError_t err = flashinfer::gemv::run_transpose_weights(
+        static_cast<int>(N),
+        static_cast<int>(K),
+        weights.data_ptr(),
+        weights_t.data_ptr(),
+        stream
+    );
+    
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "Transpose weights kernel failed: " << cudaGetErrorString(err);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transpose_weights_fp4, transpose_weights_fp4);
+
+// Transpose scales from [N, K/32] to [K/32, N]
+void transpose_scales_fp4(
+    int64_t N,
+    int64_t K,
+    TensorView scales,       // [N, K/32] uint8
+    TensorView scales_t      // [K/32, N] uint8
+) {
+    cudaStream_t stream = nullptr;
+    
+    cudaError_t err = flashinfer::gemv::run_transpose_scales(
+        static_cast<int>(N),
+        static_cast<int>(K),
+        scales.data_ptr(),
+        scales_t.data_ptr(),
+        stream
+    );
+    
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "Transpose scales kernel failed: " << cudaGetErrorString(err);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(transpose_scales_fp4, transpose_scales_fp4);
+
+// GEMV with transposed weights - fully coalesced memory access
+void gemv_fp4_transposed(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    TensorView weights_t,     // [K/32, N, 16] uint8 transposed
+    TensorView scales_t,      // [K/32, N] uint8 transposed
+    TensorView q8_activations, // [M, K/32, 36] uint8
+    TensorView output          // [M, N] bfloat16
+) {
+    cudaStream_t stream = nullptr;
+    
+    cudaError_t err = flashinfer::gemv::run_gemv_transposed(
+        static_cast<int>(M),
+        static_cast<int>(N),
+        static_cast<int>(K),
+        weights_t.data_ptr(),
+        scales_t.data_ptr(),
+        q8_activations.data_ptr(),
+        output.data_ptr(),
+        stream
+    );
+    
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "GEMV transposed kernel failed: " << cudaGetErrorString(err);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemv_fp4_transposed, gemv_fp4_transposed);
+

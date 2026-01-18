@@ -681,3 +681,106 @@ def gemv_mxfp4_dp4a_fused_qkv(
     return output_q, output_k, output_v
 
 
+#=============================================================================
+# Transposed Weight Layout for Better Memory Coalescing
+#=============================================================================
+
+def transpose_weights_fp4(
+    weight: torch.Tensor,
+    K: int,
+) -> torch.Tensor:
+    """
+    Transpose FP4 weights from [N, K/2] to [K/32, N, 16] for coalesced access.
+    
+    This is a one-time operation done at model load time. The transposed
+    layout enables fully coalesced memory access in the GEMV kernel.
+    
+    Args:
+        weight: [N, K//2] uint8 packed FP4 weights
+        K: Original dimension (needed to compute K/32)
+    
+    Returns:
+        [K//32, N, 16] uint8 transposed weights
+    """
+    N = weight.shape[0]
+    n_k_blocks = K // 32
+    
+    weight_t = torch.empty(n_k_blocks, N, 16, dtype=torch.uint8, device=weight.device)
+    
+    module = _get_gemv_dp4a_module()
+    module.transpose_weights_fp4(N, K, weight, weight_t)
+    
+    return weight_t
+
+
+def transpose_scales_fp4(
+    scale: torch.Tensor,
+    K: int,
+) -> torch.Tensor:
+    """
+    Transpose FP4 scales from [N, K/32] to [K/32, N] for coalesced access.
+    
+    Args:
+        scale: [N, K//32] uint8 E8M0 scales
+        K: Original dimension
+    
+    Returns:
+        [K//32, N] uint8 transposed scales
+    """
+    N = scale.shape[0]
+    n_k_blocks = K // 32
+    
+    scale_t = torch.empty(n_k_blocks, N, dtype=torch.uint8, device=scale.device)
+    
+    module = _get_gemv_dp4a_module()
+    module.transpose_scales_fp4(N, K, scale, scale_t)
+    
+    return scale_t
+
+
+def gemv_mxfp4_transposed(
+    q8_activations: torch.Tensor,
+    weight_t: torch.Tensor,
+    scale_t: torch.Tensor,
+    K: int,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    GEMV with transposed weights - fully coalesced memory access.
+    
+    This kernel uses transposed weight layout [K/32, N, 16] which enables
+    perfect memory coalescing when multiple threads read different output rows.
+    
+    Expected to be faster for large N (like LM Head) due to better
+    memory access patterns.
+    
+    Args:
+        q8_activations: [M, K//32, 36] uint8 from quantize_activations_q8
+        weight_t: [K//32, N, 16] uint8 transposed weights (from transpose_weights_fp4)
+        scale_t: [K//32, N] uint8 transposed scales (from transpose_scales_fp4)
+        K: Original activation dimension
+        output: Optional [M, N] BF16 output buffer
+    
+    Returns:
+        [M, N] BF16 tensor
+    
+    Example:
+        # One-time transpose at load
+        weight_t = transpose_weights_fp4(weight, K)
+        scale_t = transpose_scales_fp4(scale, K)
+        
+        # Fast GEMV using transposed layout
+        output = gemv_mxfp4_transposed(q8, weight_t, scale_t, K)
+    """
+    M = q8_activations.shape[0]
+    N = weight_t.shape[1]  # [K/32, N, 16]
+    
+    if output is None:
+        output = torch.empty(M, N, dtype=torch.bfloat16, device=weight_t.device)
+    
+    module = _get_gemv_dp4a_module()
+    module.gemv_fp4_transposed(M, N, K, weight_t, scale_t, q8_activations, output)
+    
+    return output
+
+
