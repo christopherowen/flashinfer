@@ -166,7 +166,13 @@ class JitSpecRegistry:
         """Register a new JitSpec"""
         if spec.name not in self._specs:
             self._specs[spec.name] = spec
-            self._creation_times[spec.name] = datetime.now()
+            # Guard datetime.now() to avoid breaking torch.compile
+            try:
+                import torch
+                if not torch.compiler.is_compiling():
+                    self._creation_times[spec.name] = datetime.now()
+            except Exception:
+                pass  # Skip timestamp if torch.compile is tracing
 
     def get_all_specs(self) -> Dict[str, "JitSpec"]:
         """Get all registered JitSpecs"""

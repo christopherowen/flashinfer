@@ -1753,4 +1753,3 @@ void gemv_fp4_transposed(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemv_fp4_transposed, gemv_fp4_transposed);
-

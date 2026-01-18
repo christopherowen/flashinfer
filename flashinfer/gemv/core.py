@@ -111,6 +111,7 @@ Example for gpt-oss-120b (K=2880):
 - LM Head (N=201088):       NWARPS=2, ROWS=16 → ~1.4ms
 """
 
+import functools
 import torch
 from typing import Optional, List, Tuple
 
@@ -417,20 +418,16 @@ def gemv_moe_fc2(
     )
 
 
-# Cached module for DP4A GEMV
-_gemv_dp4a_module = None
-
-
+@functools.cache
 def _get_gemv_dp4a_module():
-    """Get the compiled DP4A GEMV module, compiling it if necessary."""
-    global _gemv_dp4a_module
+    """Get the compiled DP4A GEMV module, compiling it if necessary.
     
-    if _gemv_dp4a_module is None:
-        from ..jit.gemv import gen_gemv_fp4_sm120_module
-        spec = gen_gemv_fp4_sm120_module()
-        _gemv_dp4a_module = spec.build_and_load()
-    
-    return _gemv_dp4a_module
+    Uses @functools.cache for memoization, matching the pattern used by
+    get_cutlass_fused_moe_module() for torch.compile compatibility.
+    """
+    from ..jit.gemv import gen_gemv_fp4_sm120_module
+    spec = gen_gemv_fp4_sm120_module()
+    return spec.build_and_load()
 
 
 def gemv_mxfp4_dp4a(
@@ -782,5 +779,4 @@ def gemv_mxfp4_transposed(
     module.gemv_fp4_transposed(M, N, K, weight_t, scale_t, q8_activations, output)
     
     return output
-
 
