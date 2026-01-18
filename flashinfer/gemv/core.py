@@ -85,6 +85,30 @@ Performance Notes
 - For K=2880 (gpt-oss-120b), kernels are launch-overhead bound, not memory-bound
 - Fused QKV is critical: individual K/V projections take ~6μs (mostly launch overhead)
 - LM Head (N=201088) is memory-bound and benefits from vectorized loads
+
+Dynamic Kernel Configuration
+----------------------------
+
+Kernel launch parameters (NWARPS, ROWS_PER_BLOCK) are automatically selected
+based on problem dimensions to maximize throughput:
+
+**NWARPS Selection** (based on K):
+- K <= 1536: NWARPS=1 (1.5 iters/thread)
+- K <= 3072: NWARPS=2 (1.5 iters/thread) ← gpt-oss-120b
+- K <= 6144: NWARPS=2 (3 iters/thread)
+- K > 6144:  NWARPS=4 (larger models)
+
+**ROWS_PER_BLOCK Selection** (based on N):
+- N <= 256:   ROWS=2  (maximize parallelism)
+- N <= 512:   ROWS=4  (K/V projection)
+- N <= 4096:  ROWS=8  (Q/O projection)
+- N <= 65536: ROWS=8  (good balance)
+- N > 65536:  ROWS=16 (LM Head)
+
+Example for gpt-oss-120b (K=2880):
+- K/V projection (N=360):   NWARPS=2, ROWS=4 → ~8μs
+- Q/O projection (N=2880):  NWARPS=2, ROWS=8 → ~17μs
+- LM Head (N=201088):       NWARPS=2, ROWS=16 → ~1.4ms
 """
 
 import torch

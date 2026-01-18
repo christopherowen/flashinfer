@@ -635,6 +635,11 @@ __global__ void quantize_activations_kernel(
 // GEMV Kernel with Pre-Quantized Activations (no shared memory for activations)
 //=============================================================================
 
+// Prefetch helper using inline PTX for L2 prefetch
+__device__ __forceinline__ void prefetch_l2(const void* ptr) {
+    asm volatile("prefetch.global.L2 [%0];" :: "l"(ptr));
+}
+
 // This kernel reads pre-quantized activations from global memory (L2 cached)
 // Uses VECTORIZED int4 loads (16 bytes) for better memory throughput.
 // Each thread processes entire K-blocks (no iqs splitting).
@@ -719,6 +724,137 @@ __global__ void gemv_vllm_mxfp4_dp4a_prequant_kernel(
             }
         }
     }
+}
+
+//=============================================================================
+// GEMV Kernel with Software Prefetching
+//=============================================================================
+
+// Version with warp-cooperative L2 prefetching
+// Only lane 0 of each warp prefetches, reducing overhead by 32x
+// Also prefetches activation blocks which are shared across all output rows
+template <int NWARPS = 4, int ROWS_PER_BLOCK = 8>
+__global__ void gemv_vllm_mxfp4_dp4a_prefetch_kernel(
+    const uint8_t* __restrict__ weights,           // [N, K/2] packed FP4
+    const uint8_t* __restrict__ weight_scales,     // [N, K/32] E8M0 scales
+    const block_q8_1* __restrict__ q8_activations, // [M, K/32] pre-quantized
+    nv_bfloat16* __restrict__ output,              // [M, N] BF16 output
+    int M,
+    int N,
+    int K
+) {
+    const int m = blockIdx.y;
+    const int n_start = blockIdx.x * ROWS_PER_BLOCK;
+    
+    const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int lane_id = threadIdx.x;
+    
+    const int n_k_blocks = K / QK_MXFP4;
+    const int stride_k = K / 2;
+    
+    const block_q8_1* q8_row = q8_activations + m * n_k_blocks;
+    
+    constexpr int THREADS_PER_BLOCK = NWARPS * WARP_SIZE;
+    
+    float tmp[ROWS_PER_BLOCK] = {0.0f};
+    
+    // Main loop with warp-cooperative prefetching
+    for (int kb = tid; kb < n_k_blocks; kb += THREADS_PER_BLOCK) {
+        const int kb_next = kb + THREADS_PER_BLOCK;
+        
+        // Warp-cooperative prefetch: only lane 0 prefetches for next iteration
+        // This reduces prefetch overhead by 32x while still providing hints
+        if (lane_id == 0 && kb_next < n_k_blocks) {
+            // Prefetch activation block (shared across all rows, high value)
+            prefetch_l2(&q8_row[kb_next]);
+            
+            // Prefetch first weight row only (let hardware handle spatial locality)
+            if (n_start < N) {
+                prefetch_l2(weights + n_start * stride_k + kb_next * 16);
+            }
+        }
+        
+        // Compute current K-block
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            const int n = n_start + row;
+            if (n < N) {
+                const uint8_t* row_weights = weights + n * stride_k;
+                const uint8_t* row_scales = weight_scales + n * n_k_blocks;
+                
+                tmp[row] += vec_dot_vllm_mxfp4_q8_1_dp4a_vec(
+                    row_weights, row_scales, &q8_row[kb], kb);
+            }
+        }
+    }
+    
+    // Cross-warp reduction
+    __shared__ float tmp_shared[NWARPS > 1 ? NWARPS - 1 : 1][ROWS_PER_BLOCK][WARP_SIZE];
+    
+    if (warp_id > 0) {
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            tmp_shared[warp_id - 1][row][lane_id] = tmp[row];
+        }
+    }
+    __syncthreads();
+    
+    if (warp_id > 0) return;
+    
+    #pragma unroll
+    for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+        #pragma unroll
+        for (int w = 0; w < NWARPS - 1; ++w) {
+            tmp[row] += tmp_shared[w][row][lane_id];
+        }
+    }
+    
+    #pragma unroll
+    for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+        tmp[row] = warp_reduce_sum(tmp[row]);
+    }
+    
+    if (lane_id == 0) {
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            const int n = n_start + row;
+            if (n < N) {
+                output[m * N + n] = __float2bfloat16(tmp[row]);
+            }
+        }
+    }
+}
+
+//=============================================================================
+// Internal launcher for prefetch version
+//=============================================================================
+
+cudaError_t run_gemv_fp4_dp4a_prefetch(
+    int M, int N, int K,
+    const void* weights,
+    const void* weight_scales,
+    const void* q8_activations,
+    void* output,
+    cudaStream_t stream
+) {
+    constexpr int NWARPS = 4;
+    constexpr int ROWS_PER_BLOCK = 8;
+    
+    dim3 grid((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, M);
+    dim3 block(WARP_SIZE, NWARPS);
+    
+    const size_t smem_reduce = (NWARPS - 1) * ROWS_PER_BLOCK * WARP_SIZE * sizeof(float);
+    
+    gemv_vllm_mxfp4_dp4a_prefetch_kernel<NWARPS, ROWS_PER_BLOCK><<<grid, block, smem_reduce, stream>>>(
+        (const uint8_t*)weights,
+        (const uint8_t*)weight_scales,
+        (const block_q8_1*)q8_activations,
+        (nv_bfloat16*)output,
+        M, N, K
+    );
+    
+    return cudaGetLastError();
 }
 
 //=============================================================================
@@ -830,10 +966,80 @@ __global__ void gemv_vllm_mxfp4_dp4a_fused_qkv_kernel(
 }
 
 //=============================================================================
-// Internal launcher for fused QKV
+// Dynamic Configuration Selection
 //=============================================================================
 
-cudaError_t run_gemv_fp4_dp4a_fused_qkv(
+// Select optimal NWARPS based on K dimension
+// Goal: ~2-4 iterations per thread for good occupancy without wasted work
+__host__ inline int select_nwarps(int K) {
+    const int n_k_blocks = K / QK_MXFP4;  // Number of K-blocks to process
+    
+    // Target: 2-4 K-blocks per thread for good work balance
+    // NWARPS * 32 threads, each processes n_k_blocks / (NWARPS * 32) blocks
+    
+    if (n_k_blocks <= 48) {        // K <= 1536: 1 warp gives 1.5 iters/thread
+        return 1;
+    } else if (n_k_blocks <= 96) { // K <= 3072 (gpt-oss-120b): 2 warps gives 1.5 iters/thread
+        return 2;
+    } else if (n_k_blocks <= 192) { // K <= 6144: 2 warps gives 3 iters/thread
+        return 2;
+    } else {                        // K > 6144: 4 warps for larger models
+        return 4;
+    }
+}
+
+// Select optimal ROWS_PER_BLOCK based on N dimension
+// Goal: Enough blocks for good SM occupancy, but not too small (launch overhead)
+__host__ inline int select_rows_per_block(int N, int sm_count = 16) {
+    // GB10 has 16 SMs, want at least 2 waves of blocks
+    // int min_blocks = sm_count * 2;  // (unused, for future tuning)
+    
+    if (N <= 256) {           // Very small (e.g., tiny K/V heads)
+        return 2;              // More blocks for parallelism
+    } else if (N <= 512) {    // Small N (K/V projection: N=360)
+        return 4;              // 360/4 = 90 blocks
+    } else if (N <= 4096) {   // Medium N (Q/O projection: N=2880)
+        return 8;              // 2880/8 = 360 blocks
+    } else if (N <= 65536) {  // Large N
+        return 8;              // Good balance
+    } else {                   // Very large N (LM Head: N=201088)
+        return 16;             // Fewer blocks, more work per block
+    }
+}
+
+//=============================================================================
+// Template instantiation helpers
+//=============================================================================
+
+// Prequant kernel launcher with specific NWARPS and ROWS
+template <int NWARPS, int ROWS_PER_BLOCK>
+cudaError_t launch_gemv_prequant(
+    int M, int N, int K,
+    const void* weights,
+    const void* weight_scales,
+    const void* q8_activations,
+    void* output,
+    cudaStream_t stream
+) {
+    dim3 grid((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, M);
+    dim3 block(WARP_SIZE, NWARPS);
+    
+    const size_t smem_reduce = (NWARPS > 1 ? NWARPS - 1 : 1) * ROWS_PER_BLOCK * WARP_SIZE * sizeof(float);
+    
+    gemv_vllm_mxfp4_dp4a_prequant_kernel<NWARPS, ROWS_PER_BLOCK><<<grid, block, smem_reduce, stream>>>(
+        (const uint8_t*)weights,
+        (const uint8_t*)weight_scales,
+        (const block_q8_1*)q8_activations,
+        (nv_bfloat16*)output,
+        M, N, K
+    );
+    
+    return cudaGetLastError();
+}
+
+// Fused QKV kernel launcher with specific NWARPS and ROWS
+template <int NWARPS, int ROWS_PER_BLOCK>
+cudaError_t launch_gemv_fused_qkv(
     int M, int N_q, int N_k, int N_v, int K,
     const void* weights_q, const void* scales_q,
     const void* weights_k, const void* scales_k,
@@ -842,16 +1048,12 @@ cudaError_t run_gemv_fp4_dp4a_fused_qkv(
     void* output_q, void* output_k, void* output_v,
     cudaStream_t stream
 ) {
-    constexpr int NWARPS = 4;
-    constexpr int ROWS_PER_BLOCK = 8;
-    
-    // Use max N for grid size, kernel handles variable N per QKV
     int max_N = max(N_q, max(N_k, N_v));
     
-    dim3 grid((max_N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, M, 3);  // z=3 for Q,K,V
+    dim3 grid((max_N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, M, 3);
     dim3 block(WARP_SIZE, NWARPS);
     
-    const size_t smem_reduce = (NWARPS - 1) * ROWS_PER_BLOCK * WARP_SIZE * sizeof(float);
+    const size_t smem_reduce = (NWARPS > 1 ? NWARPS - 1 : 1) * ROWS_PER_BLOCK * WARP_SIZE * sizeof(float);
     
     gemv_vllm_mxfp4_dp4a_fused_qkv_kernel<NWARPS, ROWS_PER_BLOCK><<<grid, block, smem_reduce, stream>>>(
         (const uint8_t*)weights_q, (const uint8_t*)weights_k, (const uint8_t*)weights_v,
@@ -865,7 +1067,57 @@ cudaError_t run_gemv_fp4_dp4a_fused_qkv(
 }
 
 //=============================================================================
-// Internal launcher for pre-quantized version
+// Dispatch macros for common configurations
+//=============================================================================
+
+#define DISPATCH_PREQUANT(nwarps, rows) \
+    if (selected_nwarps == nwarps && selected_rows == rows) { \
+        return launch_gemv_prequant<nwarps, rows>(M, N, K, weights, weight_scales, q8_activations, output, stream); \
+    }
+
+#define DISPATCH_FUSED_QKV(nwarps, rows) \
+    if (selected_nwarps == nwarps && selected_rows == rows) { \
+        return launch_gemv_fused_qkv<nwarps, rows>(M, N_q, N_k, N_v, K, \
+            weights_q, scales_q, weights_k, scales_k, weights_v, scales_v, \
+            q8_activations, output_q, output_k, output_v, stream); \
+    }
+
+//=============================================================================
+// Internal launcher for fused QKV (with dynamic config)
+//=============================================================================
+
+cudaError_t run_gemv_fp4_dp4a_fused_qkv(
+    int M, int N_q, int N_k, int N_v, int K,
+    const void* weights_q, const void* scales_q,
+    const void* weights_k, const void* scales_k,
+    const void* weights_v, const void* scales_v,
+    const void* q8_activations,
+    void* output_q, void* output_k, void* output_v,
+    cudaStream_t stream
+) {
+    // Dynamic configuration based on largest N and K
+    const int selected_nwarps = select_nwarps(K);
+    // For fused QKV, use the max N to determine ROWS
+    const int max_N = max(N_q, max(N_k, N_v));
+    const int selected_rows = select_rows_per_block(max_N);
+    
+    // Dispatch to specialized kernel
+    // For gpt-oss-120b: K=2880, N_q=2880, N_k=N_v=360
+    DISPATCH_FUSED_QKV(1, 2);
+    DISPATCH_FUSED_QKV(1, 4);
+    DISPATCH_FUSED_QKV(2, 4);   // Would be selected for N_k=N_v=360
+    DISPATCH_FUSED_QKV(2, 8);   // Selected for max(2880, 360) = 2880
+    DISPATCH_FUSED_QKV(4, 8);
+    DISPATCH_FUSED_QKV(4, 16);
+    
+    // Fallback
+    return launch_gemv_fused_qkv<4, 8>(M, N_q, N_k, N_v, K,
+        weights_q, scales_q, weights_k, scales_k, weights_v, scales_v,
+        q8_activations, output_q, output_k, output_v, stream);
+}
+
+//=============================================================================
+// Internal launcher for pre-quantized version (with dynamic config)
 //=============================================================================
 
 cudaError_t run_gemv_fp4_dp4a_prequant(
@@ -876,24 +1128,21 @@ cudaError_t run_gemv_fp4_dp4a_prequant(
     void* output,
     cudaStream_t stream
 ) {
-    constexpr int NWARPS = 4;
-    constexpr int ROWS_PER_BLOCK = 8;
+    // Dynamic configuration selection
+    const int selected_nwarps = select_nwarps(K);
+    const int selected_rows = select_rows_per_block(N);
     
-    dim3 grid((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, M);
-    dim3 block(WARP_SIZE, NWARPS);
+    // Dispatch to specialized kernel
+    // Common configurations for gpt-oss-120b (K=2880):
+    DISPATCH_PREQUANT(1, 2);   // Very small N
+    DISPATCH_PREQUANT(1, 4);   // Small N, small K
+    DISPATCH_PREQUANT(2, 4);   // K/V projection (N=360, K=2880)
+    DISPATCH_PREQUANT(2, 8);   // Q/O projection (N=2880, K=2880)
+    DISPATCH_PREQUANT(4, 8);   // Large N, large K (default)
+    DISPATCH_PREQUANT(4, 16);  // LM Head (N=201088)
     
-    // Only need shared memory for reduction now (no activation storage)
-    const size_t smem_reduce = (NWARPS - 1) * ROWS_PER_BLOCK * WARP_SIZE * sizeof(float);
-    
-    gemv_vllm_mxfp4_dp4a_prequant_kernel<NWARPS, ROWS_PER_BLOCK><<<grid, block, smem_reduce, stream>>>(
-        (const uint8_t*)weights,
-        (const uint8_t*)weight_scales,
-        (const block_q8_1*)q8_activations,
-        (nv_bfloat16*)output,
-        M, N, K
-    );
-    
-    return cudaGetLastError();
+    // Fallback to default if no match
+    return launch_gemv_prequant<4, 8>(M, N, K, weights, weight_scales, q8_activations, output, stream);
 }
 
 cudaError_t run_quantize_activations(
@@ -919,10 +1168,11 @@ cudaError_t run_quantize_activations(
 }
 
 //=============================================================================
-// Internal launcher (original with in-kernel quantization)
+// Template launcher for original kernel (in-kernel quantization)
 //=============================================================================
 
-cudaError_t run_gemv_fp4_dp4a(
+template <int NWARPS, int ROWS_PER_BLOCK>
+cudaError_t launch_gemv_dp4a(
     int M, int N, int K,
     const void* weights,
     const void* weight_scales,
@@ -930,21 +1180,12 @@ cudaError_t run_gemv_fp4_dp4a(
     void* output,
     cudaStream_t stream
 ) {
-    // Kernel configuration optimized for throughput
-    // ROWS_PER_BLOCK=8: Process 8 output rows per block
-    // This amortizes activation quantization cost across 8 outputs instead of 2
-    // With 4 warps (128 threads), we have good K-dimension parallelism
-    constexpr int NWARPS = 4;           // 4 warps per block
-    constexpr int ROWS_PER_BLOCK = 8;   // Process 8 output rows per block
-    
     dim3 grid((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, M);
-    dim3 block(WARP_SIZE, NWARPS);  // 32 x 4 = 128 threads
+    dim3 block(WARP_SIZE, NWARPS);
     
-    // Dynamic shared memory: K/32 blocks of block_q8_1 (36 bytes each)
-    // Plus space for cross-warp reduction (now for 8 rows instead of 2)
     const int n_q8_blocks = K / QK8_1;
     const size_t smem_q8 = n_q8_blocks * sizeof(block_q8_1);
-    const size_t smem_reduce = (NWARPS - 1) * ROWS_PER_BLOCK * WARP_SIZE * sizeof(float);
+    const size_t smem_reduce = (NWARPS > 1 ? NWARPS - 1 : 1) * ROWS_PER_BLOCK * WARP_SIZE * sizeof(float);
     const size_t smem_size = smem_q8 + smem_reduce;
     
     gemv_vllm_mxfp4_dp4a_kernel<NWARPS, ROWS_PER_BLOCK><<<grid, block, smem_size, stream>>>(
@@ -956,6 +1197,39 @@ cudaError_t run_gemv_fp4_dp4a(
     );
     
     return cudaGetLastError();
+}
+
+#define DISPATCH_DP4A(nwarps, rows) \
+    if (selected_nwarps == nwarps && selected_rows == rows) { \
+        return launch_gemv_dp4a<nwarps, rows>(M, N, K, weights, weight_scales, input, output, stream); \
+    }
+
+//=============================================================================
+// Internal launcher (original with in-kernel quantization, dynamic config)
+//=============================================================================
+
+cudaError_t run_gemv_fp4_dp4a(
+    int M, int N, int K,
+    const void* weights,
+    const void* weight_scales,
+    const void* input,
+    void* output,
+    cudaStream_t stream
+) {
+    // Dynamic configuration selection
+    const int selected_nwarps = select_nwarps(K);
+    const int selected_rows = select_rows_per_block(N);
+    
+    // Dispatch to specialized kernel
+    DISPATCH_DP4A(1, 2);
+    DISPATCH_DP4A(1, 4);
+    DISPATCH_DP4A(2, 4);
+    DISPATCH_DP4A(2, 8);
+    DISPATCH_DP4A(4, 8);
+    DISPATCH_DP4A(4, 16);
+    
+    // Fallback
+    return launch_gemv_dp4a<4, 8>(M, N, K, weights, weight_scales, input, output, stream);
 }
 
 }  // namespace gemv
@@ -1048,6 +1322,36 @@ void gemv_fp4_dp4a_prequant(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemv_fp4_dp4a_prequant, gemv_fp4_dp4a_prequant);
+
+// GEMV with pre-quantized activations and software prefetching
+// Experimental: may be faster on some workloads by hiding memory latency
+void gemv_fp4_dp4a_prefetch(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    TensorView weights,
+    TensorView weight_scales,
+    TensorView q8_activations,
+    TensorView output
+) {
+    cudaStream_t stream = nullptr;
+    
+    cudaError_t err = flashinfer::gemv::run_gemv_fp4_dp4a_prefetch(
+        static_cast<int>(M),
+        static_cast<int>(N),
+        static_cast<int>(K),
+        weights.data_ptr(),
+        weight_scales.data_ptr(),
+        q8_activations.data_ptr(),
+        output.data_ptr(),
+        stream
+    );
+    
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "GEMV FP4 DP4A prefetch kernel failed: " << cudaGetErrorString(err);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemv_fp4_dp4a_prefetch, gemv_fp4_dp4a_prefetch);
 
 // Fused QKV GEMV: compute Q, K, V projections in single kernel launch
 // Saves kernel launch overhead and reuses activations across all 3 matrices
