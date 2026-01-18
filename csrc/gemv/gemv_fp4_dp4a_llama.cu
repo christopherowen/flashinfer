@@ -722,6 +722,149 @@ __global__ void gemv_vllm_mxfp4_dp4a_prequant_kernel(
 }
 
 //=============================================================================
+// Fused QKV GEMV Kernel - Process 3 weight matrices in one launch
+//=============================================================================
+
+// Fused kernel for QKV projection: computes Q, K, V outputs simultaneously
+// Benefits:
+// - Single kernel launch (saves ~5μs per call)
+// - Activations loaded once from L2, reused for all 3 matrices
+// - Better GPU utilization
+//
+// Grid: (ceil(N/ROWS_PER_BLOCK), M, 3)  -- z-dim selects Q/K/V
+// Block: (WARP_SIZE, NWARPS) threads
+template <int NWARPS = 4, int ROWS_PER_BLOCK = 8>
+__global__ void gemv_vllm_mxfp4_dp4a_fused_qkv_kernel(
+    const uint8_t* __restrict__ weights_q,         // [N_q, K/2] packed FP4
+    const uint8_t* __restrict__ weights_k,         // [N_k, K/2] packed FP4
+    const uint8_t* __restrict__ weights_v,         // [N_v, K/2] packed FP4
+    const uint8_t* __restrict__ scales_q,          // [N_q, K/32] E8M0
+    const uint8_t* __restrict__ scales_k,          // [N_k, K/32] E8M0
+    const uint8_t* __restrict__ scales_v,          // [N_v, K/32] E8M0
+    const block_q8_1* __restrict__ q8_activations, // [M, K/32] pre-quantized
+    nv_bfloat16* __restrict__ output_q,            // [M, N_q] 
+    nv_bfloat16* __restrict__ output_k,            // [M, N_k]
+    nv_bfloat16* __restrict__ output_v,            // [M, N_v]
+    int M, int N_q, int N_k, int N_v, int K
+) {
+    const int m = blockIdx.y;
+    const int n_start = blockIdx.x * ROWS_PER_BLOCK;
+    const int qkv_idx = blockIdx.z;  // 0=Q, 1=K, 2=V
+    
+    // Select which weight/output to use based on z-index
+    const uint8_t* weights;
+    const uint8_t* scales;
+    nv_bfloat16* output;
+    int N;
+    
+    if (qkv_idx == 0) {
+        weights = weights_q; scales = scales_q; output = output_q; N = N_q;
+    } else if (qkv_idx == 1) {
+        weights = weights_k; scales = scales_k; output = output_k; N = N_k;
+    } else {
+        weights = weights_v; scales = scales_v; output = output_v; N = N_v;
+    }
+    
+    const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int lane_id = threadIdx.x;
+    
+    const int n_k_blocks = K / QK_MXFP4;
+    
+    // Activations are shared across Q, K, V (L2 cached)
+    const block_q8_1* q8_row = q8_activations + m * n_k_blocks;
+    
+    constexpr int THREADS_PER_BLOCK = NWARPS * WARP_SIZE;
+    
+    float tmp[ROWS_PER_BLOCK] = {0.0f};
+    
+    for (int kb = tid; kb < n_k_blocks; kb += THREADS_PER_BLOCK) {
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            const int n = n_start + row;
+            if (n < N) {
+                const uint8_t* row_weights = weights + n * (K / 2);
+                const uint8_t* row_scales = scales + n * n_k_blocks;
+                
+                tmp[row] += vec_dot_vllm_mxfp4_q8_1_dp4a_vec(
+                    row_weights, row_scales, &q8_row[kb], kb);
+            }
+        }
+    }
+    
+    // Cross-warp reduction
+    __shared__ float tmp_shared[NWARPS > 1 ? NWARPS - 1 : 1][ROWS_PER_BLOCK][WARP_SIZE];
+    
+    if (warp_id > 0) {
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            tmp_shared[warp_id - 1][row][lane_id] = tmp[row];
+        }
+    }
+    __syncthreads();
+    
+    if (warp_id > 0) return;
+    
+    #pragma unroll
+    for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+        #pragma unroll
+        for (int w = 0; w < NWARPS - 1; ++w) {
+            tmp[row] += tmp_shared[w][row][lane_id];
+        }
+    }
+    
+    #pragma unroll
+    for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+        tmp[row] = warp_reduce_sum(tmp[row]);
+    }
+    
+    if (lane_id == 0) {
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            const int n = n_start + row;
+            if (n < N) {
+                output[m * N + n] = __float2bfloat16(tmp[row]);
+            }
+        }
+    }
+}
+
+//=============================================================================
+// Internal launcher for fused QKV
+//=============================================================================
+
+cudaError_t run_gemv_fp4_dp4a_fused_qkv(
+    int M, int N_q, int N_k, int N_v, int K,
+    const void* weights_q, const void* scales_q,
+    const void* weights_k, const void* scales_k,
+    const void* weights_v, const void* scales_v,
+    const void* q8_activations,
+    void* output_q, void* output_k, void* output_v,
+    cudaStream_t stream
+) {
+    constexpr int NWARPS = 4;
+    constexpr int ROWS_PER_BLOCK = 8;
+    
+    // Use max N for grid size, kernel handles variable N per QKV
+    int max_N = max(N_q, max(N_k, N_v));
+    
+    dim3 grid((max_N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, M, 3);  // z=3 for Q,K,V
+    dim3 block(WARP_SIZE, NWARPS);
+    
+    const size_t smem_reduce = (NWARPS - 1) * ROWS_PER_BLOCK * WARP_SIZE * sizeof(float);
+    
+    gemv_vllm_mxfp4_dp4a_fused_qkv_kernel<NWARPS, ROWS_PER_BLOCK><<<grid, block, smem_reduce, stream>>>(
+        (const uint8_t*)weights_q, (const uint8_t*)weights_k, (const uint8_t*)weights_v,
+        (const uint8_t*)scales_q, (const uint8_t*)scales_k, (const uint8_t*)scales_v,
+        (const block_q8_1*)q8_activations,
+        (nv_bfloat16*)output_q, (nv_bfloat16*)output_k, (nv_bfloat16*)output_v,
+        M, N_q, N_k, N_v, K
+    );
+    
+    return cudaGetLastError();
+}
+
+//=============================================================================
 // Internal launcher for pre-quantized version
 //=============================================================================
 
@@ -905,4 +1048,34 @@ void gemv_fp4_dp4a_prequant(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemv_fp4_dp4a_prequant, gemv_fp4_dp4a_prequant);
+
+// Fused QKV GEMV: compute Q, K, V projections in single kernel launch
+// Saves kernel launch overhead and reuses activations across all 3 matrices
+void gemv_fp4_dp4a_fused_qkv(
+    int64_t M, int64_t N_q, int64_t N_k, int64_t N_v, int64_t K,
+    TensorView weights_q, TensorView scales_q,
+    TensorView weights_k, TensorView scales_k,
+    TensorView weights_v, TensorView scales_v,
+    TensorView q8_activations,
+    TensorView output_q, TensorView output_k, TensorView output_v
+) {
+    cudaStream_t stream = nullptr;
+    
+    cudaError_t err = flashinfer::gemv::run_gemv_fp4_dp4a_fused_qkv(
+        static_cast<int>(M),
+        static_cast<int>(N_q), static_cast<int>(N_k), static_cast<int>(N_v),
+        static_cast<int>(K),
+        weights_q.data_ptr(), scales_q.data_ptr(),
+        weights_k.data_ptr(), scales_k.data_ptr(),
+        weights_v.data_ptr(), scales_v.data_ptr(),
+        q8_activations.data_ptr(),
+        output_q.data_ptr(), output_k.data_ptr(), output_v.data_ptr(),
+        stream
+    );
+    
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "GEMV FP4 DP4A fused QKV kernel failed: " << cudaGetErrorString(err);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemv_fp4_dp4a_fused_qkv, gemv_fp4_dp4a_fused_qkv);
 

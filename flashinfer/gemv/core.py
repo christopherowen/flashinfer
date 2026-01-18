@@ -524,3 +524,59 @@ def gemv_mxfp4_dp4a_prequant(
     return output
 
 
+def gemv_mxfp4_dp4a_fused_qkv(
+    q8_activations: torch.Tensor,
+    weight_q: torch.Tensor, scale_q: torch.Tensor,
+    weight_k: torch.Tensor, scale_k: torch.Tensor,
+    weight_v: torch.Tensor, scale_v: torch.Tensor,
+    K: int,
+    output_q: Optional[torch.Tensor] = None,
+    output_k: Optional[torch.Tensor] = None,
+    output_v: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Fused QKV GEMV: compute Q, K, V projections in single kernel launch.
+    
+    This is faster than calling gemv_mxfp4_dp4a_prequant 3 times because:
+    - Single kernel launch (saves ~5μs overhead per call)
+    - Activations loaded once from L2, reused for all 3 matrices
+    
+    Args:
+        q8_activations: [M, K//32, 36] uint8 from quantize_activations_q8
+        weight_q: [N_q, K//2] uint8 packed FP4 for Q projection
+        scale_q: [N_q, K//32] uint8 E8M0 scales for Q
+        weight_k: [N_k, K//2] uint8 packed FP4 for K projection
+        scale_k: [N_k, K//32] uint8 E8M0 scales for K
+        weight_v: [N_v, K//2] uint8 packed FP4 for V projection
+        scale_v: [N_v, K//32] uint8 E8M0 scales for V
+        K: Original activation dimension
+        output_q/k/v: Optional output buffers
+    
+    Returns:
+        Tuple of (Q, K, V) tensors, each [M, N_x] BF16
+    """
+    M = q8_activations.shape[0]
+    N_q = weight_q.shape[0]
+    N_k = weight_k.shape[0]
+    N_v = weight_v.shape[0]
+    
+    if output_q is None:
+        output_q = torch.empty(M, N_q, dtype=torch.bfloat16, device=weight_q.device)
+    if output_k is None:
+        output_k = torch.empty(M, N_k, dtype=torch.bfloat16, device=weight_k.device)
+    if output_v is None:
+        output_v = torch.empty(M, N_v, dtype=torch.bfloat16, device=weight_v.device)
+    
+    module = _get_gemv_dp4a_module()
+    module.gemv_fp4_dp4a_fused_qkv(
+        M, N_q, N_k, N_v, K,
+        weight_q, scale_q,
+        weight_k, scale_k,
+        weight_v, scale_v,
+        q8_activations,
+        output_q, output_k, output_v
+    )
+    
+    return output_q, output_k, output_v
+
+

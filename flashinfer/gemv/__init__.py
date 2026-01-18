@@ -21,6 +21,7 @@ from .core import (
     gemv_mxfp4_dp4a,
     quantize_activations_q8,
     gemv_mxfp4_dp4a_prequant,
+    gemv_mxfp4_dp4a_fused_qkv,
     GEMV_M_THRESHOLD,
 )
 
@@ -31,6 +32,7 @@ __all__ = [
     "gemv_mxfp4_dp4a",
     "quantize_activations_q8",
     "gemv_mxfp4_dp4a_prequant",
+    "gemv_mxfp4_dp4a_fused_qkv",
     "GEMV_M_THRESHOLD",
 ]
 
