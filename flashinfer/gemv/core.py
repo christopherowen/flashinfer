@@ -43,6 +43,48 @@ For direct use:
     else:
         # Use grouped GEMM path
         output = cutlass_fused_moe(...)
+
+MXFP4 GEMV Kernel Variants
+--------------------------
+
+For dense layers (QKV projection, O projection, LM head), we provide several
+kernel variants optimized for different use cases:
+
+1. ``gemv_mxfp4_dp4a(input, weight, scale)``
+   - All-in-one: quantizes BF16 activations inside the kernel
+   - Best for: Single GEMV call, simplest API
+   - Overhead: Quantization repeated for each call
+
+2. ``quantize_activations_q8(input)`` + ``gemv_mxfp4_dp4a_prequant(q8, weight, scale, K)``
+   - Two-step: separate quantization and GEMV
+   - Best for: Multiple GEMV with same activations (e.g., Q, K, V separately)
+   - Benefit: Quantization done once, reused across calls
+
+3. ``gemv_mxfp4_dp4a_fused_qkv(q8, w_q, s_q, w_k, s_k, w_v, s_v, K)``
+   - Fused: Computes Q, K, V in single kernel launch
+   - Best for: Attention QKV projection
+   - Benefit: 1.5-1.6x faster than 3 separate calls
+   - Why: Eliminates 2 kernel launches, better L2 cache reuse
+
+Kernel Selection Guide (gpt-oss-120b dimensions: K=2880)
+--------------------------------------------------------
+
++------------------+--------+--------+------------------+--------------------+
+| Layer            | K      | N      | Recommended      | Notes              |
++==================+========+========+==================+====================+
+| QKV projection   | 2880   | varies | fused_qkv        | 1.64x speedup      |
++------------------+--------+--------+------------------+--------------------+
+| O projection     | 2880   | 2880   | prequant         | Reuse Q8 from attn |
++------------------+--------+--------+------------------+--------------------+
+| LM Head          | 2880   | 201088 | prequant         | Memory-bound       |
++------------------+--------+--------+------------------+--------------------+
+
+Performance Notes
+-----------------
+
+- For K=2880 (gpt-oss-120b), kernels are launch-overhead bound, not memory-bound
+- Fused QKV is critical: individual K/V projections take ~6μs (mostly launch overhead)
+- LM Head (N=201088) is memory-bound and benefits from vectorized loads
 """
 
 import torch
@@ -520,6 +562,41 @@ def gemv_mxfp4_dp4a_prequant(
     
     module = _get_gemv_dp4a_module()
     module.gemv_fp4_dp4a_prequant(M, N, K, weight, weight_scale, q8_activations, output)
+    
+    return output
+
+
+def gemv_mxfp4_dp4a_prefetch(
+    q8_activations: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    K: int,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    GEMV with pre-quantized activations and software prefetching.
+    
+    Experimental version that uses explicit L2 prefetch instructions
+    to hide memory latency. May be faster on some workloads.
+    
+    Args:
+        q8_activations: [M, K//32, 36] uint8 from quantize_activations_q8
+        weight: [N, K//2] uint8 packed FP4 weights
+        weight_scale: [N, K//32] uint8 E8M0 scales
+        K: Original activation dimension
+        output: Optional [M, N] BF16 output buffer
+    
+    Returns:
+        [M, N] BF16 tensor
+    """
+    M = q8_activations.shape[0]
+    N = weight.shape[0]
+    
+    if output is None:
+        output = torch.empty(M, N, dtype=torch.bfloat16, device=weight.device)
+    
+    module = _get_gemv_dp4a_module()
+    module.gemv_fp4_dp4a_prefetch(M, N, K, weight, weight_scale, q8_activations, output)
     
     return output
 

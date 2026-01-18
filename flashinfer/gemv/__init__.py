@@ -26,14 +26,16 @@ from .core import (
 )
 
 __all__ = [
+    # MoE GEMV (block-scaled FP4)
     "gemv_fp4_blockscaled",
     "batched_gemv_fp4",
     "should_use_gemv_for_moe",
-    "gemv_mxfp4_dp4a",
-    "quantize_activations_q8",
-    "gemv_mxfp4_dp4a_prequant",
-    "gemv_mxfp4_dp4a_fused_qkv",
     "GEMV_M_THRESHOLD",
+    # Dense layer GEMV (MXFP4 with DP4A)
+    "gemv_mxfp4_dp4a",           # All-in-one (quantizes inside kernel)
+    "quantize_activations_q8",   # Separate quantization
+    "gemv_mxfp4_dp4a_prequant",  # GEMV with pre-quantized activations
+    "gemv_mxfp4_dp4a_fused_qkv", # Fused Q/K/V projection (1.6x faster)
 ]
 
 
