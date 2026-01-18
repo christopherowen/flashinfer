@@ -456,3 +456,71 @@ def gemv_mxfp4_dp4a(
     return output
 
 
+def quantize_activations_q8(
+    input: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Quantize BF16 activations to Q8_1 format (interleaved for DP4A).
+    
+    This function quantizes activations once, and the output can be reused
+    across multiple GEMV calls (e.g., for different weight matrices).
+    
+    Args:
+        input: [M, K] BF16 activations
+        output: Optional [M, K//32, 36] uint8 buffer for Q8_1 blocks
+                Each block_q8_1 is 36 bytes: 32 int8 values + half2 scale
+    
+    Returns:
+        [M, K//32, 36] uint8 tensor containing quantized activations
+    """
+    M, K = input.shape
+    assert K % 32 == 0, f"K must be divisible by 32, got {K}"
+    
+    n_blocks = K // 32
+    
+    if output is None:
+        # block_q8_1 is 36 bytes: 32 x int8 + half2 (4 bytes)
+        output = torch.empty(M, n_blocks, 36, dtype=torch.uint8, device=input.device)
+    
+    module = _get_gemv_dp4a_module()
+    module.quantize_activations_q8(M, K, input, output)
+    
+    return output
+
+
+def gemv_mxfp4_dp4a_prequant(
+    q8_activations: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    K: int,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    GEMV with pre-quantized activations.
+    
+    This is faster than gemv_mxfp4_dp4a when activations are reused across
+    multiple weight matrices (e.g., qkv_proj, o_proj in same layer).
+    
+    Args:
+        q8_activations: [M, K//32, 36] uint8 from quantize_activations_q8
+        weight: [N, K//2] uint8 packed FP4 weights
+        weight_scale: [N, K//32] uint8 E8M0 scales
+        K: Original activation dimension (needed since q8 is packed)
+        output: Optional [M, N] BF16 output buffer
+    
+    Returns:
+        [M, N] BF16 tensor: result of input @ weight.T
+    """
+    M = q8_activations.shape[0]
+    N = weight.shape[0]
+    
+    if output is None:
+        output = torch.empty(M, N, dtype=torch.bfloat16, device=weight.device)
+    
+    module = _get_gemv_dp4a_module()
+    module.gemv_fp4_dp4a_prequant(M, N, K, weight, weight_scale, q8_activations, output)
+    
+    return output
+
+

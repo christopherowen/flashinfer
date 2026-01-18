@@ -19,6 +19,8 @@ from .core import (
     batched_gemv_fp4,
     should_use_gemv_for_moe,
     gemv_mxfp4_dp4a,
+    quantize_activations_q8,
+    gemv_mxfp4_dp4a_prequant,
     GEMV_M_THRESHOLD,
 )
 
@@ -27,6 +29,8 @@ __all__ = [
     "batched_gemv_fp4",
     "should_use_gemv_for_moe",
     "gemv_mxfp4_dp4a",
+    "quantize_activations_q8",
+    "gemv_mxfp4_dp4a_prequant",
     "GEMV_M_THRESHOLD",
 ]
 

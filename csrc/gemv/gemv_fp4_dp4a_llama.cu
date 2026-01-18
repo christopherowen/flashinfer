@@ -427,6 +427,63 @@ __device__ __forceinline__ float vec_dot_vllm_mxfp4_q8_1_dp4a(
     return weight_scale * act_scale * float(sumi);
 }
 
+// Helper to load int4 from potentially unaligned address
+__device__ __forceinline__ int4 load_int4_unaligned(const uint8_t* ptr) {
+    int4 result;
+    result.x = get_int_b1(ptr, 0);
+    result.y = get_int_b1(ptr, 1);
+    result.z = get_int_b1(ptr, 2);
+    result.w = get_int_b1(ptr, 3);
+    return result;
+}
+
+// Vectorized version processing entire 32-element block in one call
+// Unrolled for better instruction-level parallelism
+__device__ __forceinline__ float vec_dot_vllm_mxfp4_q8_1_dp4a_vec(
+    const uint8_t* __restrict__ weights,    // [K/2] packed FP4 for this row
+    const uint8_t* __restrict__ scales,     // [K/32] E8M0 scales for this row
+    const block_q8_1* __restrict__ q8,      // Q8_1 activation block (INTERLEAVED)
+    const int kb                             // Block index (0 to K/32-1)
+) {
+    // Get scale for this block
+    const float weight_scale = e8m0_to_fp32(scales[kb]) * 0.5f;
+    const float act_scale = __low2float(q8->ds);
+    
+    // Load 16 bytes of weights (may be unaligned)
+    const uint8_t* w_ptr = weights + kb * 16;
+    const int4 w_vec = load_int4_unaligned(w_ptr);
+    
+    // Load activations (block_q8_1.qs may not be aligned)
+    const int* q8_qs = reinterpret_cast<const int*>(q8->qs);
+    
+    int sumi = 0;
+    
+    // Process all 4 int32s (16 bytes = 32 FP4 values)
+    // Fully unrolled for better ILP
+    
+    // Bytes 0-3: FP4 indices 0-7
+    int2 v0 = get_int_from_table_16(w_vec.x, kvalues_fp4);
+    sumi = dp4a(v0.x, q8_qs[0], sumi);  // even: indices 0,2,4,6
+    sumi = dp4a(v0.y, q8_qs[4], sumi);  // odd: indices 1,3,5,7
+    
+    // Bytes 4-7: FP4 indices 8-15
+    int2 v1 = get_int_from_table_16(w_vec.y, kvalues_fp4);
+    sumi = dp4a(v1.x, q8_qs[1], sumi);  // even: indices 8,10,12,14
+    sumi = dp4a(v1.y, q8_qs[5], sumi);  // odd: indices 9,11,13,15
+    
+    // Bytes 8-11: FP4 indices 16-23
+    int2 v2 = get_int_from_table_16(w_vec.z, kvalues_fp4);
+    sumi = dp4a(v2.x, q8_qs[2], sumi);  // even: indices 16,18,20,22
+    sumi = dp4a(v2.y, q8_qs[6], sumi);  // odd: indices 17,19,21,23
+    
+    // Bytes 12-15: FP4 indices 24-31
+    int2 v3 = get_int_from_table_16(w_vec.w, kvalues_fp4);
+    sumi = dp4a(v3.x, q8_qs[3], sumi);  // even: indices 24,26,28,30
+    sumi = dp4a(v3.y, q8_qs[7], sumi);  // odd: indices 25,27,29,31
+    
+    return weight_scale * act_scale * float(sumi);
+}
+
 // Optimized GEMV kernel with warp-level parallelism for K dimension
 // Processes multiple output rows per block to amortize activation quantization cost
 // 
@@ -547,7 +604,179 @@ __global__ void gemv_vllm_mxfp4_dp4a_kernel(
 }
 
 //=============================================================================
-// Internal launcher
+// Pre-Quantization Kernel (runs once, output reused by all GEMV blocks)
+//=============================================================================
+
+// Quantize BF16 activations to interleaved Q8_1 format in global memory
+// Grid: (ceil(K/32 / THREADS_PER_BLOCK), M)
+// Block: THREADS_PER_BLOCK threads
+template <int THREADS_PER_BLOCK = 256>
+__global__ void quantize_activations_kernel(
+    const nv_bfloat16* __restrict__ input,    // [M, K] BF16 activations
+    block_q8_1* __restrict__ output,           // [M, K/32] Q8_1 blocks
+    int M,
+    int K
+) {
+    const int m = blockIdx.y;
+    const int n_q8_blocks = K / QK8_1;
+    
+    // Each thread quantizes one or more 32-element blocks
+    for (int i = blockIdx.x * THREADS_PER_BLOCK + threadIdx.x; 
+         i < n_q8_blocks; 
+         i += gridDim.x * THREADS_PER_BLOCK) {
+        quantize_bf16_to_q8_1_interleaved(
+            input + m * K + i * QK8_1,
+            output + m * n_q8_blocks + i
+        );
+    }
+}
+
+//=============================================================================
+// GEMV Kernel with Pre-Quantized Activations (no shared memory for activations)
+//=============================================================================
+
+// This kernel reads pre-quantized activations from global memory (L2 cached)
+// Uses VECTORIZED int4 loads (16 bytes) for better memory throughput.
+// Each thread processes entire K-blocks (no iqs splitting).
+//
+// Grid: (ceil(N/ROWS_PER_BLOCK), M)
+// Block: (WARP_SIZE, NWARPS) = (32, NWARPS) threads
+template <int NWARPS = 4, int ROWS_PER_BLOCK = 8>
+__global__ void gemv_vllm_mxfp4_dp4a_prequant_kernel(
+    const uint8_t* __restrict__ weights,           // [N, K/2] packed FP4
+    const uint8_t* __restrict__ weight_scales,     // [N, K/32] E8M0 scales
+    const block_q8_1* __restrict__ q8_activations, // [M, K/32] pre-quantized
+    nv_bfloat16* __restrict__ output,              // [M, N] BF16 output
+    int M,
+    int N,
+    int K
+) {
+    const int m = blockIdx.y;
+    const int n_start = blockIdx.x * ROWS_PER_BLOCK;
+    
+    const int tid = threadIdx.y * WARP_SIZE + threadIdx.x;
+    const int warp_id = threadIdx.y;
+    const int lane_id = threadIdx.x;
+    
+    const int n_k_blocks = K / QK_MXFP4;
+    
+    // Pointer to pre-quantized activations for this input row
+    const block_q8_1* q8_row = q8_activations + m * n_k_blocks;
+    
+    constexpr int THREADS_PER_BLOCK = NWARPS * WARP_SIZE;
+    
+    float tmp[ROWS_PER_BLOCK] = {0.0f};
+    
+    // Vectorized: each thread handles complete K-blocks
+    // No iqs splitting - vec_dot_vec processes entire 32-element block
+    for (int kb = tid; kb < n_k_blocks; kb += THREADS_PER_BLOCK) {
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            const int n = n_start + row;
+            if (n < N) {
+                const uint8_t* row_weights = weights + n * (K / 2);
+                const uint8_t* row_scales = weight_scales + n * n_k_blocks;
+                
+                // Vectorized: 16-byte int4 load, processes entire block
+                tmp[row] += vec_dot_vllm_mxfp4_q8_1_dp4a_vec(
+                    row_weights, row_scales, &q8_row[kb], kb);
+            }
+        }
+    }
+    
+    // Cross-warp reduction via shared memory
+    __shared__ float tmp_shared[NWARPS > 1 ? NWARPS - 1 : 1][ROWS_PER_BLOCK][WARP_SIZE];
+    
+    if (warp_id > 0) {
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            tmp_shared[warp_id - 1][row][lane_id] = tmp[row];
+        }
+    }
+    __syncthreads();
+    
+    if (warp_id > 0) return;
+    
+    #pragma unroll
+    for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+        #pragma unroll
+        for (int w = 0; w < NWARPS - 1; ++w) {
+            tmp[row] += tmp_shared[w][row][lane_id];
+        }
+    }
+    
+    #pragma unroll
+    for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+        tmp[row] = warp_reduce_sum(tmp[row]);
+    }
+    
+    if (lane_id == 0) {
+        #pragma unroll
+        for (int row = 0; row < ROWS_PER_BLOCK; ++row) {
+            const int n = n_start + row;
+            if (n < N) {
+                output[m * N + n] = __float2bfloat16(tmp[row]);
+            }
+        }
+    }
+}
+
+//=============================================================================
+// Internal launcher for pre-quantized version
+//=============================================================================
+
+cudaError_t run_gemv_fp4_dp4a_prequant(
+    int M, int N, int K,
+    const void* weights,
+    const void* weight_scales,
+    const void* q8_activations,  // Pre-quantized [M, K/32] block_q8_1
+    void* output,
+    cudaStream_t stream
+) {
+    constexpr int NWARPS = 4;
+    constexpr int ROWS_PER_BLOCK = 8;
+    
+    dim3 grid((N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, M);
+    dim3 block(WARP_SIZE, NWARPS);
+    
+    // Only need shared memory for reduction now (no activation storage)
+    const size_t smem_reduce = (NWARPS - 1) * ROWS_PER_BLOCK * WARP_SIZE * sizeof(float);
+    
+    gemv_vllm_mxfp4_dp4a_prequant_kernel<NWARPS, ROWS_PER_BLOCK><<<grid, block, smem_reduce, stream>>>(
+        (const uint8_t*)weights,
+        (const uint8_t*)weight_scales,
+        (const block_q8_1*)q8_activations,
+        (nv_bfloat16*)output,
+        M, N, K
+    );
+    
+    return cudaGetLastError();
+}
+
+cudaError_t run_quantize_activations(
+    int M, int K,
+    const void* input,
+    void* output,
+    cudaStream_t stream
+) {
+    constexpr int THREADS = 256;
+    const int n_q8_blocks = K / QK8_1;
+    
+    // Launch enough blocks to cover all K/32 blocks
+    dim3 grid((n_q8_blocks + THREADS - 1) / THREADS, M);
+    dim3 block(THREADS);
+    
+    quantize_activations_kernel<THREADS><<<grid, block, 0, stream>>>(
+        (const nv_bfloat16*)input,
+        (block_q8_1*)output,
+        M, K
+    );
+    
+    return cudaGetLastError();
+}
+
+//=============================================================================
+// Internal launcher (original with in-kernel quantization)
 //=============================================================================
 
 cudaError_t run_gemv_fp4_dp4a(
@@ -622,4 +851,58 @@ void gemv_fp4_dp4a(
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemv_fp4_dp4a, gemv_fp4_dp4a);
+
+// Quantize BF16 activations to Q8_1 format (interleaved for DP4A)
+// This is called once, and the output is reused across multiple GEMV calls
+void quantize_activations_q8(
+    int64_t M,
+    int64_t K,
+    TensorView input,   // [M, K] bfloat16
+    TensorView output   // [M, K/32, 36] uint8 (block_q8_1 = 36 bytes)
+) {
+    cudaStream_t stream = nullptr;
+    
+    cudaError_t err = flashinfer::gemv::run_quantize_activations(
+        static_cast<int>(M),
+        static_cast<int>(K),
+        input.data_ptr(),
+        output.data_ptr(),
+        stream
+    );
+    
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "Quantize activations kernel failed: " << cudaGetErrorString(err);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(quantize_activations_q8, quantize_activations_q8);
+
+// GEMV with pre-quantized activations
+// Faster than gemv_fp4_dp4a when activations are reused across layers
+void gemv_fp4_dp4a_prequant(
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    TensorView weights,         // [N, K/2] uint8 packed FP4
+    TensorView weight_scales,   // [N, K/32] uint8 E8M0
+    TensorView q8_activations,  // [M, K/32, 36] uint8 (block_q8_1)
+    TensorView output           // [M, N] bfloat16
+) {
+    cudaStream_t stream = nullptr;
+    
+    cudaError_t err = flashinfer::gemv::run_gemv_fp4_dp4a_prequant(
+        static_cast<int>(M),
+        static_cast<int>(N),
+        static_cast<int>(K),
+        weights.data_ptr(),
+        weight_scales.data_ptr(),
+        q8_activations.data_ptr(),
+        output.data_ptr(),
+        stream
+    );
+    
+    TVM_FFI_ICHECK(err == cudaSuccess)
+        << "GEMV FP4 DP4A prequant kernel failed: " << cudaGetErrorString(err);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gemv_fp4_dp4a_prequant, gemv_fp4_dp4a_prequant);
 
