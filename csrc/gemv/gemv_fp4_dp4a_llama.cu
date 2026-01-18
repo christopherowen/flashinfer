@@ -68,6 +68,8 @@ __device__ __forceinline__ int get_int_b1(const void* x, const int& i32) {
 // Uses __byte_perm for efficient byte selection on CUDA
 // q4: 8 x 4-bit indices packed in 32 bits
 // Returns int2 with even indices in .x and odd indices in .y
+//
+// Version 1: Takes table pointer (for __constant__ memory)
 __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
     const uint32_t* table32 = (const uint32_t*)table;
     
@@ -85,6 +87,27 @@ __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_
     }
     
     // Reorder: even indices in .x, odd indices in .y
+    return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), 
+                     __byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
+// Version 2: Takes 4 pre-loaded uint32 values (for register-resident LUT)
+// This avoids repeated __constant__ memory loads
+__device__ __forceinline__ int2 get_int_from_table_16_reg(
+    const int& q4, 
+    const uint32_t t0, const uint32_t t1, const uint32_t t2, const uint32_t t3
+) {
+    uint32_t tmp[2];
+    const uint32_t low_high_selection_indices = (0x32103210 | ((q4 & 0x88888888) >> 1));
+    
+    #pragma unroll
+    for (uint32_t i = 0; i < 2; ++i) {
+        const uint32_t shift = 16 * i;
+        const uint32_t low  = __byte_perm(t0, t1, q4 >> shift);
+        const uint32_t high = __byte_perm(t2, t3, q4 >> shift);
+        tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
+    }
+    
     return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), 
                      __byte_perm(tmp[0], tmp[1], 0x7531));
 }
@@ -484,6 +507,44 @@ __device__ __forceinline__ float vec_dot_vllm_mxfp4_q8_1_dp4a_vec(
     return weight_scale * act_scale * float(sumi);
 }
 
+// Register-resident LUT version for compute efficiency
+// The LUT values (t0-t3) are loaded once at kernel start and passed in registers
+__device__ __forceinline__ float vec_dot_vllm_mxfp4_q8_1_dp4a_vec_reg(
+    const uint8_t* __restrict__ weights,
+    const uint8_t* __restrict__ scales,
+    const block_q8_1* __restrict__ q8,
+    const int kb,
+    const uint32_t t0, const uint32_t t1, const uint32_t t2, const uint32_t t3
+) {
+    const float weight_scale = e8m0_to_fp32(scales[kb]) * 0.5f;
+    const float act_scale = __low2float(q8->ds);
+    
+    const uint8_t* w_ptr = weights + kb * 16;
+    const int4 w_vec = load_int4_unaligned(w_ptr);
+    const int* q8_qs = reinterpret_cast<const int*>(q8->qs);
+    
+    int sumi = 0;
+    
+    // Use register-resident LUT (t0-t3 instead of constant memory)
+    int2 v0 = get_int_from_table_16_reg(w_vec.x, t0, t1, t2, t3);
+    sumi = dp4a(v0.x, q8_qs[0], sumi);
+    sumi = dp4a(v0.y, q8_qs[4], sumi);
+    
+    int2 v1 = get_int_from_table_16_reg(w_vec.y, t0, t1, t2, t3);
+    sumi = dp4a(v1.x, q8_qs[1], sumi);
+    sumi = dp4a(v1.y, q8_qs[5], sumi);
+    
+    int2 v2 = get_int_from_table_16_reg(w_vec.z, t0, t1, t2, t3);
+    sumi = dp4a(v2.x, q8_qs[2], sumi);
+    sumi = dp4a(v2.y, q8_qs[6], sumi);
+    
+    int2 v3 = get_int_from_table_16_reg(w_vec.w, t0, t1, t2, t3);
+    sumi = dp4a(v3.x, q8_qs[3], sumi);
+    sumi = dp4a(v3.y, q8_qs[7], sumi);
+    
+    return weight_scale * act_scale * float(sumi);
+}
+
 // Optimized GEMV kernel with warp-level parallelism for K dimension
 // Processes multiple output rows per block to amortize activation quantization cost
 // 
@@ -644,6 +705,9 @@ __device__ __forceinline__ void prefetch_l2(const void* ptr) {
 // Uses VECTORIZED int4 loads (16 bytes) for better memory throughput.
 // Each thread processes entire K-blocks (no iqs splitting).
 //
+// COMPUTE OPTIMIZATION: Load LUT to registers once at kernel start
+// This avoids repeated __constant__ memory accesses for the FP4 lookup table.
+//
 // Grid: (ceil(N/ROWS_PER_BLOCK), M)
 // Block: (WARP_SIZE, NWARPS) = (32, NWARPS) threads
 template <int NWARPS = 4, int ROWS_PER_BLOCK = 8>
@@ -665,6 +729,14 @@ __global__ void gemv_vllm_mxfp4_dp4a_prequant_kernel(
     
     const int n_k_blocks = K / QK_MXFP4;
     
+    // OPTIMIZATION: Load LUT to registers once (16 bytes = 4 uint32)
+    // This avoids repeated __constant__ memory loads in the inner loop
+    const uint32_t* lut32 = reinterpret_cast<const uint32_t*>(kvalues_fp4);
+    const uint32_t t0 = lut32[0];
+    const uint32_t t1 = lut32[1];
+    const uint32_t t2 = lut32[2];
+    const uint32_t t3 = lut32[3];
+    
     // Pointer to pre-quantized activations for this input row
     const block_q8_1* q8_row = q8_activations + m * n_k_blocks;
     
@@ -682,9 +754,9 @@ __global__ void gemv_vllm_mxfp4_dp4a_prequant_kernel(
                 const uint8_t* row_weights = weights + n * (K / 2);
                 const uint8_t* row_scales = weight_scales + n * n_k_blocks;
                 
-                // Vectorized: 16-byte int4 load, processes entire block
-                tmp[row] += vec_dot_vllm_mxfp4_q8_1_dp4a_vec(
-                    row_weights, row_scales, &q8_row[kb], kb);
+                // Use register-resident LUT for better compute efficiency
+                tmp[row] += vec_dot_vllm_mxfp4_q8_1_dp4a_vec_reg(
+                    row_weights, row_scales, &q8_row[kb], kb, t0, t1, t2, t3);
             }
         }
     }
