@@ -371,6 +371,8 @@ SM120_SUPPORTED_TILE_MN = (
     (16, 128), (32, 128),
     # Physical (256, M) -> Logical (M, 256)
     (16, 256),
+    # Physical (512, M) -> Logical (M, 512)
+    (16, 512),
     # Note: Logical M=8 fails (physical N=8 fails stmatrix constraint)
 )
 
@@ -442,7 +444,7 @@ def get_cutlass_fused_moe_module(
         # - N must be a power of 2 in {8, 16, 32, 64, 128, 256}
         # - Total tile must fit in smem with >= 2 pipeline stages
         
-        valid_ns = (8, 16, 32, 64, 128, 256)
+        valid_ns = (8, 16, 32, 64, 128, 256, 512)
         valid_swapped_ms = (8, 16, 32)  # Logical M for swapped tiles
         
         # Check if this is a swapped tile (logical M < 64)

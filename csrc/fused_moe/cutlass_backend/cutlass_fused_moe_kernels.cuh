@@ -4042,8 +4042,23 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
     gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
 
+    // NOTE: For SM120/121 we JIT-compile one module per logical tile, and the module is compiled
+    // with `-DSWAP_AB={0,1}` (see `flashinfer/jit/fused_moe.py`). Runtime `swap_ab` must match
+    // the compiled mode, because it controls:
+    //  - how grouped problem shapes are written (M/N swapped)
+    //  - how ptr/stride/SF arrays are interpreted
+    //  - which stride packing is used for activations/weights
+    //
+    // Using the heuristic-selected `gemm*_config_->swap_ab` here can mismatch the compiled mode
+    // (e.g. compiled SWAP_AB=1 but default profile has swap_ab=false), which then produces
+    // inconsistent shapes/strides and crashes in the SM120 mainloop.
+#ifdef SWAP_AB
+    gemm1_tma_ws_input.swap_ab = static_cast<bool>(SWAP_AB);
+    gemm2_tma_ws_input.swap_ab = static_cast<bool>(SWAP_AB);
+#else
     gemm1_tma_ws_input.swap_ab = gemm1_config_->swap_ab;
     gemm2_tma_ws_input.swap_ab = gemm2_config_->swap_ab;
+#endif
     TLLM_CHECK_WITH_INFO(
         (gemm1_tma_ws_input.swap_ab && gemm2_tma_ws_input.swap_ab) || !use_w4_groupwise,
         "Hopper w4 mixed input groupwise requires swap_ab");

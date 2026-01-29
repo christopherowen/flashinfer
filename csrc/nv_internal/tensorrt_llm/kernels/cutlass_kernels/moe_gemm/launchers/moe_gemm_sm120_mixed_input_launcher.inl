@@ -51,6 +51,11 @@
 
 #pragma once
 
+// Optional debug dumping (host-side) for SM120 TMA/stride/layout objects.
+#include <cstdlib>
+#include <sstream>
+#include <type_traits>
+
 // Default logical tile configuration
 #ifndef LOGICAL_TILE_M
 #define LOGICAL_TILE_M 128
@@ -159,11 +164,20 @@ constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;         
 using TileShape_MNK = Shape<cute::Int<TILE_M_VAL>, cute::Int<TILE_N_VAL>, cute::Int<TILE_K_VAL>>; \
 using ClusterShape_MNK = Shape<_1, _1, _1>;                                                       \
                                                                                                   \
+/* Epilogue tile: ensure EPI_TILE_N divides CTA_N (= TILE_N_VAL).                                 \
+ *                                                                                                 \
+ * SM90/SM120 TMA warp-specialized epilogues require exact partitioning (no remainder predication):\
+ *   EPI_TILE_N | CTA_N                                                                           \
+ * For small CTA_N like 16, EpilogueTileAuto may pick N=32 and fail to compile.                    \
+ */                                                                                                \
+constexpr int kEpiTileN = (TILE_N_VAL < 32 ? TILE_N_VAL : 32);                                    \
+using EpilogueTile_MN = cute::tuple<cute::C<64>, cute::C<kEpiTileN>>;                              \
+                                                                                                  \
 /* Epilogue collective */                                                                         \
 using CollectiveEpilogue =                                                                        \
     typename cutlass::epilogue::collective::CollectiveBuilder<                                    \
         ArchTag, OperatorClass, TileShape_MNK, ClusterShape_MNK,                                  \
-        cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute,      \
+        EpilogueTile_MN, ElementAccumulator, ElementCompute,                                      \
         ElementC, LayoutC*, AlignmentC, ElementD, LayoutC*, AlignmentD,                           \
         cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;                       \
                                                                                                   \
@@ -243,21 +257,25 @@ using LayoutA = cutlass::layout::RowMajor;                                      
 using LayoutB = cutlass::layout::ColumnMajor;                                                     \
 using LayoutC = cutlass::layout::ColumnMajor;                                                     \
                                                                                                   \
-/* Alignment requirements */                                                                      \
-constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementInputA>::value;  /* 32 for FP4 */    \
-constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementInputB>::value;  /* 16 for FP8 */    \
-constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;                           \
-constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;                           \
+/* Alignment requirements - FP4 operand needs special 128 alignment (same as standard mode) */  \
+constexpr int AlignmentA = 128;  /* Special-case for FP4 (ElementA is weight in transposed) */   \
+constexpr int AlignmentB = 128 / cutlass::sizeof_bits<ElementInputB>::value;  /* 16 for FP8 */   \
+constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;                          \
+constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;                          \
                                                                                                   \
 /* Tile shape: Virtual M=128 (fixed), N=TILE_N_VAL (small token dim), K=128 */                    \
 using TileShape_MNK = Shape<_128, cute::Int<TILE_N_VAL>, _128>;                                   \
 using ClusterShape_MNK = Shape<_1, _1, _1>;                                                       \
                                                                                                   \
+/* Epilogue tile: ensure EPI_TILE_N divides CTA_N (= TILE_N_VAL). */                              \
+constexpr int kEpiTileN = (TILE_N_VAL < 32 ? TILE_N_VAL : 32);                                    \
+using EpilogueTile_MN = cute::tuple<cute::C<64>, cute::C<kEpiTileN>>;                              \
+                                                                                                  \
 /* Epilogue collective */                                                                         \
 using CollectiveEpilogue =                                                                        \
     typename cutlass::epilogue::collective::CollectiveBuilder<                                    \
         ArchTag, OperatorClass, TileShape_MNK, ClusterShape_MNK,                                  \
-        cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementCompute,      \
+        EpilogueTile_MN, ElementAccumulator, ElementCompute,                                      \
         ElementC, LayoutC*, AlignmentC, ElementD, LayoutC*, AlignmentD,                           \
         cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;                       \
                                                                                                   \
@@ -341,13 +359,17 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   static_assert(IsMXFP4,
       "SM120 MoE GEMM only supports MXFP4 (FP8xFP4). NVFP4 (FP4xFP4) not yet implemented.");
 
-  // swap_ab is determined by compile-time SWAP_AB flag (set by Python JIT).
-  // Override runtime swap_ab to match compile-time flag, similar to SM100 approach.
-  // This ensures consistency regardless of what the caller set.
+  // swap_ab for the kernel is baked in by the compile-time SWAP_AB flag (set by Python JIT).
+  // At runtime, `tma_inputs.swap_ab` must match because it controls how ptr/stride arrays are
+  // interpreted and how M/N are written into the grouped problem shapes.
+  //
+  // However, during workspace-size queries the runtime `tma_inputs.swap_ab` may reflect the
+  // default heuristic profile (often swap_ab=false) even when this module was compiled with
+  // SWAP_AB=1. In that case, we force it to the compiled mode for the workspace query path.
   constexpr bool kSwapAB = SWAP_AB;
-  tma_inputs.swap_ab = kSwapAB;
-  TLLM_LOG_DEBUG("[SM120 MXFP4 MoE] swap_ab=%s (from SWAP_AB compile flag)",
-      kSwapAB ? "true" : "false");
+  TLLM_LOG_DEBUG("[SM120 MXFP4 MoE] swap_ab (compiled)=%s swap_ab (runtime)=%s",
+      kSwapAB ? "true" : "false",
+      tma_inputs.swap_ab ? "true" : "false");
 
   // Reject finalize fusion for now (SM120 launcher uses simple epilogue without finalize support)
   TLLM_CHECK_WITH_INFO(
@@ -391,39 +413,313 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
       tma_inputs.swap_ab ? tma_inputs.fpX_block_scaling_factors_stride_act
                          : tma_inputs.fpX_block_scaling_factors_stride_weight;
 
-  // Full arguments - following step22 pattern: inline brace initialization
-  // Standard Mode: D = A @ W
-  // Operand A = activations (FP8), Operand B = weights (FP4)
+  // ==========================================================================
+  // TYPE SAFETY CHECKS
+  // ==========================================================================
+  // The SM120 block-scaled collective expects SINGLE stride values (uniform for all groups),
+  // while TmaWarpSpecializedGroupedGemmInput stores stride ARRAYS (one per group).
+  // We verify the stored types are compatible with what we expect to dereference.
+  //
+  // Key insight: For MoE, all experts have the same weight dimensions, so strides are uniform.
+  // We dereference stride_A[0] to get the shared stride value.
+  static_assert(sizeof(StrideA) == sizeof(TmaWarpSpecializedGroupedGemmInput::StrideA),
+      "SM120 StrideA size must match TmaWsInput::StrideA");
+  static_assert(sizeof(StrideB) == sizeof(TmaWarpSpecializedGroupedGemmInput::StrideB),
+      "SM120 StrideB size must match TmaWsInput::StrideB");
+  static_assert(sizeof(StrideD) == sizeof(TmaWarpSpecializedGroupedGemmInput::StrideD),
+      "SM120 StrideD size must match TmaWsInput::StrideD");
+  
+  // If only workspace size is requested, use minimal arguments (strides may be NULL).
+  // Force runtime swap_ab to match compiled mode in this path.
+  if (workspace_size != nullptr) {
+    tma_inputs.swap_ab = kSwapAB;
+    typename Gemm::Arguments ws_arguments = {
+        cutlass::gemm::GemmUniversalMode::kGrouped,
+        tma_inputs.shape_info,
+        // Mainloop args with default strides (workspace query doesn't need actual strides)
+        {nullptr, StrideA{}, nullptr, StrideB{}, nullptr, LayoutSFA{}, nullptr, LayoutSFB{}},
+        // Epilogue args with default strides
+        {{}, nullptr, nullptr, nullptr, StrideD{}},
+        hw_info};
+    ws_arguments.epilogue.thread.alpha = 1.0f;
+    ws_arguments.epilogue.thread.beta = 0.0f;
+    *workspace_size = gemm.get_workspace_size(ws_arguments);
+    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE] workspace_size=%zu", *workspace_size);
+    return;
+  }
+
+  // For actual execution paths, require runtime swap_ab to match compiled mode.
+  TLLM_CHECK_WITH_INFO(
+      tma_inputs.swap_ab == kSwapAB,
+      "SM120 MXFP4 MoE: swap_ab mismatch between compiled kernel (SWAP_AB) and runtime inputs");
+
+  // Validate stride pointers before dereference
+  TLLM_CHECK_WITH_INFO(stride_A != nullptr, "SM120 MXFP4 MoE: stride_A is null");
+  TLLM_CHECK_WITH_INFO(stride_B != nullptr, "SM120 MXFP4 MoE: stride_B is null");
+  TLLM_CHECK_WITH_INFO(tma_inputs.stride_d != nullptr, "SM120 MXFP4 MoE: stride_d is null");
+  TLLM_CHECK_WITH_INFO(sf_stride_A != nullptr, "SM120 MXFP4 MoE: sf_stride_A is null");
+  TLLM_CHECK_WITH_INFO(sf_stride_B != nullptr, "SM120 MXFP4 MoE: sf_stride_B is null");
+
+  // ==========================================================================
+  // DEBUG: Dump first-group (group 0) packed stride + SF layout objects
+  // ==========================================================================
+  // Enable with:
+  //   export TLLM_SM120_MOE_DUMP_TMA=1
+  //
+  // This copies the packed-stride/layout objects from device workspace to host
+  // and prints them. This is intended to help diagnose swap_ab crashes where
+  // the transposed SM120 kernel expects a different stride/layout "shape order"
+  // than what the stride-fill kernel wrote.
+  if (auto const* dump_env = std::getenv("TLLM_SM120_MOE_DUMP_TMA");
+      dump_env != nullptr && dump_env[0] == '1') {
+    // Print compile-time type/size relationships (helps confirm mismatches).
+    using TmaInput = TmaWarpSpecializedGroupedGemmInput;
+    using Mxfp4LayoutSF = typename TmaInput::MXFPXBlockScaledConfig::LayoutSF;
+    using KernelStrideA = StrideA;
+    using KernelStrideB = StrideB;
+    using KernelStrideD = StrideD;
+    using KernelStrideAVal = std::remove_pointer_t<KernelStrideA>;
+    using KernelStrideBVal = std::remove_pointer_t<KernelStrideB>;
+    using KernelStrideDVal = std::remove_pointer_t<KernelStrideD>;
+    TLLM_LOG_DEBUG(
+        "[SM120 MXFP4 MoE][dump] sizeof(StrideA)=%zu sizeof(TmaInput::StrideA)=%zu",
+        sizeof(StrideA), sizeof(typename TmaInput::StrideA));
+    TLLM_LOG_DEBUG(
+        "[SM120 MXFP4 MoE][dump] sizeof(StrideB)=%zu sizeof(TmaInput::StrideB)=%zu",
+        sizeof(StrideB), sizeof(typename TmaInput::StrideB));
+    TLLM_LOG_DEBUG(
+        "[SM120 MXFP4 MoE][dump] sizeof(StrideD)=%zu sizeof(TmaInput::StrideD_T)=%zu sizeof(TmaInput::StrideD)=%zu",
+        sizeof(StrideD), sizeof(typename TmaInput::StrideD_T),
+        sizeof(typename TmaInput::StrideD));
+    TLLM_LOG_DEBUG(
+        "[SM120 MXFP4 MoE][dump] is_same(remove_ptr(KernelStrideA), TmaInput::StrideA)=%d",
+        int(std::is_same_v<KernelStrideAVal, typename TmaInput::StrideA>));
+    TLLM_LOG_DEBUG(
+        "[SM120 MXFP4 MoE][dump] is_same(remove_ptr(KernelStrideB), TmaInput::StrideB)=%d",
+        int(std::is_same_v<KernelStrideBVal, typename TmaInput::StrideB>));
+    TLLM_LOG_DEBUG(
+        "[SM120 MXFP4 MoE][dump] is_same(remove_ptr(KernelStrideD), TmaInput::StrideD)=%d is_same(remove_ptr(KernelStrideD), TmaInput::StrideD_T)=%d",
+        int(std::is_same_v<KernelStrideDVal, typename TmaInput::StrideD>),
+        int(std::is_same_v<KernelStrideDVal, typename TmaInput::StrideD_T>));
+    TLLM_LOG_DEBUG(
+        "[SM120 MXFP4 MoE][dump] sizeof(LayoutSFA)=%zu sizeof(MXFPX LayoutSF)=%zu",
+        sizeof(LayoutSFA), sizeof(Mxfp4LayoutSF));
+    TLLM_LOG_DEBUG(
+        "[SM120 MXFP4 MoE][dump] sizeof(LayoutSFB)=%zu sizeof(MXFPX LayoutSF)=%zu",
+        sizeof(LayoutSFB), sizeof(Mxfp4LayoutSF));
+    TLLM_LOG_DEBUG(
+        "[SM120 MXFP4 MoE][dump] is_same(LayoutSFA, MXFPX LayoutSF)=%d is_same(LayoutSFB, MXFPX LayoutSF)=%d",
+        int(std::is_same_v<LayoutSFA, Mxfp4LayoutSF>), int(std::is_same_v<LayoutSFB, Mxfp4LayoutSF>));
+    TLLM_LOG_DEBUG(
+        "[SM120 MXFP4 MoE][dump] is_same(remove_ptr(LayoutSFA), MXFPX LayoutSF)=%d is_same(remove_ptr(LayoutSFB), MXFPX LayoutSF)=%d",
+        int(std::is_same_v<std::remove_pointer_t<LayoutSFA>, Mxfp4LayoutSF>),
+        int(std::is_same_v<std::remove_pointer_t<LayoutSFB>, Mxfp4LayoutSF>));
+
+    // Copy group-0 problem shape and stride/layout objects to host.
+    // Note: problem_shapes is device memory.
+    using UnderlyingProblemShape = typename ProblemShape::UnderlyingProblemShape;
+    UnderlyingProblemShape host_problem_shape{};
+    // The stride-fill kernel writes TmaInput::{StrideA,StrideB,StrideD/StrideD_T} into these arrays.
+    // Do NOT use the SM120 kernel's Stride* aliases here; they may differ (and that's what we're diagnosing).
+    using HostStrideA = typename TmaInput::StrideA;
+    using HostStrideB = typename TmaInput::StrideB;
+    using HostStrideD = std::conditional_t<kSwapAB, typename TmaInput::StrideD_T, typename TmaInput::StrideD>;
+    HostStrideA host_strideA{};
+    HostStrideB host_strideB{};
+    HostStrideD host_strideD{};
+    Mxfp4LayoutSF host_layout_sfa{};
+    Mxfp4LayoutSF host_layout_sfb{};
+
+    auto memcpy_and_sync = [&](void* dst, void const* src, size_t bytes, char const* what) {
+      cudaError_t st = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream);
+      if (st != cudaSuccess) {
+        TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] cudaMemcpyAsync(%s) failed: %s", what,
+                       cudaGetErrorString(st));
+        return false;
+      }
+      st = cudaStreamSynchronize(stream);
+      if (st != cudaSuccess) {
+        TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] cudaStreamSynchronize(%s) failed: %s", what,
+                       cudaGetErrorString(st));
+        return false;
+      }
+      return true;
+    };
+
+    // Problem shape 0
+    (void)memcpy_and_sync(&host_problem_shape, tma_inputs.shape_info.problem_shapes,
+                          sizeof(host_problem_shape), "problem_shape[0]");
+    // Strides/layouts 0
+    (void)memcpy_and_sync(&host_strideA, stride_A, sizeof(host_strideA), "strideA[0]");
+    (void)memcpy_and_sync(&host_strideB, stride_B, sizeof(host_strideB), "strideB[0]");
+    (void)memcpy_and_sync(&host_strideD, tma_inputs.stride_d, sizeof(host_strideD), "strideD[0]");
+    (void)memcpy_and_sync(&host_layout_sfa, sf_stride_A, sizeof(host_layout_sfa), "layoutSFA[0]");
+    (void)memcpy_and_sync(&host_layout_sfb, sf_stride_B, sizeof(host_layout_sfb), "layoutSFB[0]");
+
+    std::ostringstream oss_ps;
+    oss_ps << host_problem_shape;
+    std::ostringstream oss_sa;
+    oss_sa << host_strideA;
+    std::ostringstream oss_sb;
+    oss_sb << host_strideB;
+    std::ostringstream oss_sd;
+    oss_sd << host_strideD;
+    std::ostringstream oss_lsfa;
+    oss_lsfa << host_layout_sfa;
+    std::ostringstream oss_lsfb;
+    oss_lsfb << host_layout_sfb;
+
+    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] group0 problem_shape=%s", oss_ps.str().c_str());
+    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] group0 strideA=%s", oss_sa.str().c_str());
+    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] group0 strideB=%s", oss_sb.str().c_str());
+    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] group0 strideD=%s", oss_sd.str().c_str());
+    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] group0 layoutSFA=%s", oss_lsfa.str().c_str());
+    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] group0 layoutSFB=%s", oss_lsfb.str().c_str());
+
+    // ------------------------------------------------------------------------
+    // Stride sanity checks: print expected vs actual (swap mode)
+    // ------------------------------------------------------------------------
+    // NOTE: This checks only the 2D matrix stride components and is intentionally
+    // conservative. It is meant to catch the most common “shape order” mismatch
+    // that can yield invalid TMA descriptors and illegal-instruction traps.
+    //
+    // For swap_ab transposed mode, the compiled SM120 kernel namespace defines:
+    // - LayoutA = RowMajor  (A = weights in swap mode)
+    // - LayoutB = ColumnMajor (B = activations in swap mode)
+    // - StrideD uses TmaInput::StrideD_T (transposed output)
+    //
+    // The group problem shape is (M,N,K) for the GEMM kernel.
+    auto to_i64 = [](auto x) -> int64_t {
+      using X = std::remove_cv_t<std::remove_reference_t<decltype(x)>>;
+      if constexpr (std::is_integral_v<X>) {
+        return static_cast<int64_t>(x);
+      } else {
+        // cute::C<N> has a ::value
+        return static_cast<int64_t>(X::value);
+      }
+    };
+
+    // UnderlyingProblemShape prints as "(M,N,K)".
+    int64_t const ps_m = to_i64(cute::get<0>(host_problem_shape));
+    int64_t const ps_n = to_i64(cute::get<1>(host_problem_shape));
+    int64_t const ps_k = to_i64(cute::get<2>(host_problem_shape));
+
+    auto stride2_str = [&](int64_t s0, int64_t s1) {
+      std::ostringstream oss;
+      oss << "(" << s0 << "," << s1 << ")";
+      return oss.str();
+    };
+
+    // Extract the first two stride components.
+    int64_t const a_s0 = to_i64(cute::get<0>(host_strideA));
+    int64_t const a_s1 = to_i64(cute::get<1>(host_strideA));
+    int64_t const b_s0 = to_i64(cute::get<0>(host_strideB));
+    int64_t const b_s1 = to_i64(cute::get<1>(host_strideB));
+    int64_t const d_s0 = to_i64(cute::get<0>(host_strideD));
+    int64_t const d_s1 = to_i64(cute::get<1>(host_strideD));
+
+    // Expected (swap_ab compiled kernel):
+    // NOTE: CUTLASS "B" stride types are in (N,K) mode order (see `cutlass/detail/layout.hpp`
+    // TagToStrideB* specializations), so packed ColumnMajor B is (K,1), not (1,K).
+    //
+    // - A (RowMajor)      modes [M,K] => strides (K,1)
+    // - B (ColumnMajor)   modes [N,K] => strides (K,1)
+    // - D_T (ColumnMajor) modes [M,N] => strides (1,M)
+    int64_t const exp_a_s0 = ps_k;
+    int64_t const exp_a_s1 = 1;
+    int64_t const exp_b_s0 = ps_k;
+    int64_t const exp_b_s1 = 1;
+    int64_t const exp_d_s0 = 1;
+    int64_t const exp_d_s1 = ps_m;
+
+    auto log_match = [&](char const* name, int64_t act0, int64_t act1, int64_t exp0, int64_t exp1) {
+      bool ok = (act0 == exp0) && (act1 == exp1);
+      TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] %s stride expected=%s actual=%s %s (ps_m=%ld ps_n=%ld ps_k=%ld)",
+                     name,
+                     stride2_str(exp0, exp1).c_str(),
+                     stride2_str(act0, act1).c_str(),
+                     ok ? "OK" : "MISMATCH",
+                     (long)ps_m, (long)ps_n, (long)ps_k);
+    };
+
+    if (kSwapAB) {
+      log_match("A(RowMajor MxK)", a_s0, a_s1, exp_a_s0, exp_a_s1);
+      log_match("B(ColumnMajor NxK)", b_s0, b_s1, exp_b_s0, exp_b_s1);
+      log_match("D_T(ColumnMajor MxN)", d_s0, d_s1, exp_d_s0, exp_d_s1);
+    } else {
+      // Standard (non-swap) path is already known-good. Still print the raw
+      // numbers to help compare across modes.
+      TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] (non-swap) ps_m=%ld ps_n=%ld ps_k=%ld A=(%ld,%ld) B=(%ld,%ld) D=(%ld,%ld)",
+                     (long)ps_m, (long)ps_n, (long)ps_k,
+                     (long)a_s0, (long)a_s1,
+                     (long)b_s0, (long)b_s1,
+                     (long)d_s0, (long)d_s1);
+    }
+  }
+  
+  // Full arguments for actual kernel run
+  // IMPORTANT: CUTLASS grouped GEMM expects stride/layout *arrays* for grouped mode.
+  // Depending on the CollectiveMainloop/Epilogue type aliases, these may be represented as
+  // pointer types (e.g., StrideA == TmaInputStrideA*) or value types. Handle both.
+  auto strideA_arg = [&]() -> StrideA {
+    if constexpr (std::is_pointer_v<StrideA>) {
+      return reinterpret_cast<StrideA>(stride_A);
+    } else {
+      return *reinterpret_cast<StrideA const*>(stride_A);
+    }
+  }();
+  auto strideB_arg = [&]() -> StrideB {
+    if constexpr (std::is_pointer_v<StrideB>) {
+      return reinterpret_cast<StrideB>(stride_B);
+    } else {
+      return *reinterpret_cast<StrideB const*>(stride_B);
+    }
+  }();
+  auto strideD_arg = [&]() -> StrideD {
+    if constexpr (std::is_pointer_v<StrideD>) {
+      return reinterpret_cast<StrideD>(tma_inputs.stride_d);
+    } else {
+      return *reinterpret_cast<StrideD const*>(tma_inputs.stride_d);
+    }
+  }();
+  auto layoutSFA_arg = [&]() -> LayoutSFA {
+    if constexpr (std::is_pointer_v<LayoutSFA>) {
+      return reinterpret_cast<LayoutSFA>(sf_stride_A);
+    } else {
+      return *reinterpret_cast<LayoutSFA const*>(sf_stride_A);
+    }
+  }();
+  auto layoutSFB_arg = [&]() -> LayoutSFB {
+    if constexpr (std::is_pointer_v<LayoutSFB>) {
+      return reinterpret_cast<LayoutSFB>(sf_stride_B);
+    } else {
+      return *reinterpret_cast<LayoutSFB const*>(sf_stride_B);
+    }
+  }();
+
   typename Gemm::Arguments arguments = {
       cutlass::gemm::GemmUniversalMode::kGrouped,
       tma_inputs.shape_info,
-      // Mainloop arguments (inline, not as CollectiveMainloop::Arguments)
+      // Mainloop arguments
       {reinterpret_cast<ElementInputA const**>(ptr_A),
-       reinterpret_cast<StrideA>(stride_A),
+       strideA_arg,
        reinterpret_cast<ElementInputB const**>(ptr_B),
-       reinterpret_cast<StrideB>(stride_B),
+       strideB_arg,
        reinterpret_cast<ElementSF const**>(sf_A),
-       reinterpret_cast<LayoutSFA>(sf_stride_A),
+       layoutSFA_arg,
        reinterpret_cast<ElementSF const**>(sf_B),
-       reinterpret_cast<LayoutSFB>(sf_stride_B)},
-      // Epilogue arguments (inline)
+       layoutSFB_arg},
+      // Epilogue arguments
       {{},  // thread args (will set alpha/beta below)
        nullptr,  // C ptr (not used)
        nullptr,  // C stride (not used)
        reinterpret_cast<ElementD**>(tma_inputs.ptr_d),
-       reinterpret_cast<StrideD>(tma_inputs.stride_d)},
+       strideD_arg},
       hw_info};
   
   // Set epilogue thread args
   arguments.epilogue.thread.alpha = 1.0f;
   arguments.epilogue.thread.beta = 0.0f;
-
-  // If only workspace size is requested, return early
-  if (workspace_size != nullptr) {
-    *workspace_size = gemm.get_workspace_size(arguments);
-    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE] workspace_size=%zu", *workspace_size);
-    return;
-  }
 
   // Validate inputs
   TLLM_CHECK_WITH_INFO(tma_inputs.isValid(), "SM120 MXFP4 MoE: Invalid TMA inputs");
@@ -452,9 +748,112 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
     TLLM_THROW("SM120 MXFP4 MoE: initialize failed: %s", cutlassGetStatusString(init_status));
   }
 
+  // Extra debug: record launch grid shape (helps correlate SASS plane-strides to C++ indexing)
+  if (auto const* dump_env = std::getenv("TLLM_SM120_MOE_DUMP_TMA");
+      dump_env != nullptr && dump_env[0] == '1') {
+    dim3 grid = Gemm::get_grid_shape(arguments, tma_inputs.gemm_workspace);
+    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] grid=(%u,%u,%u) hw_info.sm_count=%d",
+                   grid.x, grid.y, grid.z, hw_info.sm_count);
+  }
+
+  // Extra debug: dump tensormap workspace bytes (A/B/SFA/SFB planes) for one SM slot.
+  // Enable with:
+  //   export TLLM_SM120_MOE_DUMP_TENSORMAPS=1
+  // Optional:
+  //   export TLLM_SM120_MOE_DUMP_TENSORMAPS_POSTRUN=1
+  //
+  // Rationale:
+  //  - We observed a consistent trap at a `UTMALDG.4D ... [UR44] ...` instruction where
+  //    `UR44/UR46/UR48/UR50` look like four 128B-strided "planes" indexed by `gridDim.x` (== sm_count).
+  //  - CUTLASS uses a 4-plane per-SM tensormap workspace (A, B, SFA, SFB) in the SM120 block-scaled mainloop.
+  //  - Dumping the raw descriptor bytes lets us quickly see if plane 4 (SFB) is malformed/uninitialized.
+  if (auto const* dump_env = std::getenv("TLLM_SM120_MOE_DUMP_TENSORMAPS");
+      dump_env != nullptr && dump_env[0] == '1') {
+    auto dump_tensormaps = [&](const char* tag) {
+      constexpr size_t kDescBytes = 128;  // sizeof(cute::TmaDescriptor) on these kernels
+      const int sm_count = hw_info.sm_count;
+      const size_t expected_bytes = size_t(4) * size_t(sm_count) * kDescBytes;
+      const size_t copy_bytes = std::min(expected_bytes, tma_inputs.gemm_workspace_size);
+
+      std::vector<uint8_t> host(copy_bytes, 0);
+      cudaError_t copy_err = cudaMemcpyAsync(
+          host.data(), tma_inputs.gemm_workspace, copy_bytes, cudaMemcpyDeviceToHost, stream);
+      cudaError_t sync_err = cudaStreamSynchronize(stream);
+
+      TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] tensormaps(%s): workspace=%p copy_bytes=%zu expected=%zu memcpy=%s sync=%s",
+                     tag, tma_inputs.gemm_workspace, copy_bytes, expected_bytes,
+                     cudaGetErrorString(copy_err), cudaGetErrorString(sync_err));
+
+      auto format_hex16 = [](const uint8_t* p) {
+        std::array<char, 16 * 3 + 1> out{};
+        size_t off = 0;
+        for (int i = 0; i < 16; ++i) {
+          off += std::snprintf(out.data() + off, out.size() - off, "%02x%s",
+                               unsigned(p[i]), (i == 15) ? "" : " ");
+        }
+        return out;
+      };
+
+      // By default dump the slot corresponding to sm_idx=0 (matches the plane indexing formula).
+      int sm_idx = 0;
+      if (auto const* idx_env = std::getenv("TLLM_SM120_MOE_DUMP_TENSORMAPS_SMIDX");
+          idx_env != nullptr && idx_env[0] != '\0') {
+        sm_idx = std::atoi(idx_env);
+      }
+      sm_idx = std::max(0, std::min(sm_idx, sm_count - 1));
+
+      auto dump_plane = [&](int plane, const char* name) {
+        const size_t idx = size_t(sm_idx) + size_t(plane) * size_t(sm_count);
+        const size_t byte_off = idx * kDescBytes;
+        if (byte_off + kDescBytes > host.size()) {
+          TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] tensormaps(%s)[%s] plane=%d sm_idx=%d: OOB (byte_off=%zu host=%zu)",
+                         tag, name, plane, sm_idx, byte_off, host.size());
+          return;
+        }
+        const uint8_t* p = host.data() + byte_off;
+        for (size_t line = 0; line < kDescBytes; line += 16) {
+          auto hex = format_hex16(p + line);
+          TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] tensormaps(%s)[%s] plane=%d sm_idx=%d off=%zu bytes[%zu..%zu]=%s",
+                         tag, name, plane, sm_idx, byte_off, line, line + 15, hex.data());
+        }
+      };
+
+      dump_plane(0, "A");
+      dump_plane(1, "B");
+      dump_plane(2, "SFA");
+      dump_plane(3, "SFB");
+    };
+
+    dump_tensormaps("pre_run");
+
+    // If requested, dump again after a successful run (useful for comparing to failing tiles).
+    // Note: the second dump happens below once `run_status` is known.
+    (void)dump_tensormaps;
+  }
+
   // Run GEMM
   auto run_status = gemm.run(stream);
   TLLM_LOG_DEBUG("[SM120 MXFP4 MoE] run=%s", cutlassGetStatusString(run_status));
+  if (auto const* dump_env = std::getenv("TLLM_SM120_MOE_DUMP_TENSORMAPS_POSTRUN");
+      dump_env != nullptr && dump_env[0] == '1' &&
+      std::getenv("TLLM_SM120_MOE_DUMP_TENSORMAPS") != nullptr &&
+      run_status == cutlass::Status::kSuccess) {
+    // Re-run the same dump logic by toggling the main flag (the lambda is in the other block).
+    // We simply re-enter the block by duplicating minimal logic here (avoids refactoring further).
+    constexpr size_t kDescBytes = 128;
+    const int sm_count = hw_info.sm_count;
+    const size_t expected_bytes = size_t(4) * size_t(sm_count) * kDescBytes;
+    const size_t copy_bytes = std::min(expected_bytes, tma_inputs.gemm_workspace_size);
+
+    std::vector<uint8_t> host(copy_bytes, 0);
+    cudaError_t copy_err = cudaMemcpyAsync(
+        host.data(), tma_inputs.gemm_workspace, copy_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaError_t sync_err = cudaStreamSynchronize(stream);
+
+    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] tensormaps(post_run): workspace=%p copy_bytes=%zu expected=%zu memcpy=%s sync=%s",
+                   tma_inputs.gemm_workspace, copy_bytes, expected_bytes,
+                   cudaGetErrorString(copy_err), cudaGetErrorString(sync_err));
+  }
   if (run_status != cutlass::Status::kSuccess) {
     // Get the actual CUDA error for better diagnostics
     cudaError_t cuda_err = cudaGetLastError();

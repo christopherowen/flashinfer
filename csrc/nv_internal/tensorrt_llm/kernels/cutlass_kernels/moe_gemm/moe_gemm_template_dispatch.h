@@ -658,6 +658,20 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
                    return config;
                  });
 
+  // SM120/121 fused-MoE JIT builds compile separate libraries per SWAP_AB setting.
+  // When SWAP_AB is defined, we must only return configs whose runtime swap_ab matches
+  // the compiled kernel variant, otherwise the runner may select an incompatible config
+  // (leading to invalid workspace queries or kernel launch failures).
+#if defined(SWAP_AB)
+  if (sm == 120 || sm == 121) {
+    bool const want_swap_ab = (SWAP_AB != 0);
+    tma_ws_configs.erase(
+        std::remove_if(tma_ws_configs.begin(), tma_ws_configs.end(),
+                       [&](auto const& config) { return config.swap_ab != want_swap_ab; }),
+        tma_ws_configs.end());
+  }
+#endif
+
   if (use_w4_groupwise) {
     // w4 groupwise implementation requires swap_ab to be true
     tma_ws_configs.erase(std::remove_if(tma_ws_configs.begin(), tma_ws_configs.end(),
