@@ -767,80 +767,8 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   //    `UR44/UR46/UR48/UR50` look like four 128B-strided "planes" indexed by `gridDim.x` (== sm_count).
   //  - CUTLASS uses a 4-plane per-SM tensormap workspace (A, B, SFA, SFB) in the SM120 block-scaled mainloop.
   //  - Dumping the raw descriptor bytes lets us quickly see if plane 4 (SFB) is malformed/uninitialized.
-  if (auto const* dump_env = std::getenv("TLLM_SM120_MOE_DUMP_TENSORMAPS");
-      dump_env != nullptr && dump_env[0] == '1') {
-    auto dump_tensormaps = [&](const char* tag) {
-      constexpr size_t kDescBytes = 128;  // sizeof(cute::TmaDescriptor) on these kernels
-      const int sm_count = hw_info.sm_count;
-      const size_t expected_bytes = size_t(4) * size_t(sm_count) * kDescBytes;
-      const size_t copy_bytes = std::min(expected_bytes, tma_inputs.gemm_workspace_size);
-
-      std::vector<uint8_t> host(copy_bytes, 0);
-      cudaError_t copy_err = cudaMemcpyAsync(
-          host.data(), tma_inputs.gemm_workspace, copy_bytes, cudaMemcpyDeviceToHost, stream);
-      cudaError_t sync_err = cudaStreamSynchronize(stream);
-
-      TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] tensormaps(%s): workspace=%p copy_bytes=%zu expected=%zu memcpy=%s sync=%s",
-                     tag, tma_inputs.gemm_workspace, copy_bytes, expected_bytes,
-                     cudaGetErrorString(copy_err), cudaGetErrorString(sync_err));
-
-      auto format_hex16 = [](const uint8_t* p) {
-        std::array<char, 16 * 3 + 1> out{};
-        size_t off = 0;
-        for (int i = 0; i < 16; ++i) {
-          off += std::snprintf(out.data() + off, out.size() - off, "%02x%s",
-                               unsigned(p[i]), (i == 15) ? "" : " ");
-        }
-        return out;
-      };
-
-      // By default dump the slot corresponding to sm_idx=0 (matches the plane indexing formula).
-      int sm_idx = 0;
-      if (auto const* idx_env = std::getenv("TLLM_SM120_MOE_DUMP_TENSORMAPS_SMIDX");
-          idx_env != nullptr && idx_env[0] != '\0') {
-        sm_idx = std::atoi(idx_env);
-      }
-      sm_idx = std::max(0, std::min(sm_idx, sm_count - 1));
-
-      auto dump_plane = [&](int plane, const char* name) {
-        const size_t idx = size_t(sm_idx) + size_t(plane) * size_t(sm_count);
-        const size_t byte_off = idx * kDescBytes;
-        if (byte_off + kDescBytes > host.size()) {
-          TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] tensormaps(%s)[%s] plane=%d sm_idx=%d: OOB (byte_off=%zu host=%zu)",
-                         tag, name, plane, sm_idx, byte_off, host.size());
-          return;
-        }
-        const uint8_t* p = host.data() + byte_off;
-        for (size_t line = 0; line < kDescBytes; line += 16) {
-          auto hex = format_hex16(p + line);
-          TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] tensormaps(%s)[%s] plane=%d sm_idx=%d off=%zu bytes[%zu..%zu]=%s",
-                         tag, name, plane, sm_idx, byte_off, line, line + 15, hex.data());
-        }
-      };
-
-      dump_plane(0, "A");
-      dump_plane(1, "B");
-      dump_plane(2, "SFA");
-      dump_plane(3, "SFB");
-    };
-
-    dump_tensormaps("pre_run");
-
-    // If requested, dump again after a successful run (useful for comparing to failing tiles).
-    // Note: the second dump happens below once `run_status` is known.
-    (void)dump_tensormaps;
-  }
-
-  // Run GEMM
-  auto run_status = gemm.run(stream);
-  TLLM_LOG_DEBUG("[SM120 MXFP4 MoE] run=%s", cutlassGetStatusString(run_status));
-  if (auto const* dump_env = std::getenv("TLLM_SM120_MOE_DUMP_TENSORMAPS_POSTRUN");
-      dump_env != nullptr && dump_env[0] == '1' &&
-      std::getenv("TLLM_SM120_MOE_DUMP_TENSORMAPS") != nullptr &&
-      run_status == cutlass::Status::kSuccess) {
-    // Re-run the same dump logic by toggling the main flag (the lambda is in the other block).
-    // We simply re-enter the block by duplicating minimal logic here (avoids refactoring further).
-    constexpr size_t kDescBytes = 128;
+  auto dump_tensormaps = [&](const char* tag) {
+    constexpr size_t kDescBytes = 128;  // sizeof(cute::TmaDescriptor) on these kernels
     const int sm_count = hw_info.sm_count;
     const size_t expected_bytes = size_t(4) * size_t(sm_count) * kDescBytes;
     const size_t copy_bytes = std::min(expected_bytes, tma_inputs.gemm_workspace_size);
@@ -850,17 +778,89 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
         host.data(), tma_inputs.gemm_workspace, copy_bytes, cudaMemcpyDeviceToHost, stream);
     cudaError_t sync_err = cudaStreamSynchronize(stream);
 
-    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] tensormaps(post_run): workspace=%p copy_bytes=%zu expected=%zu memcpy=%s sync=%s",
-                   tma_inputs.gemm_workspace, copy_bytes, expected_bytes,
+    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] tensormaps(%s): workspace=%p copy_bytes=%zu expected=%zu memcpy=%s sync=%s",
+                   tag, tma_inputs.gemm_workspace, copy_bytes, expected_bytes,
                    cudaGetErrorString(copy_err), cudaGetErrorString(sync_err));
+
+    auto format_hex16 = [](const uint8_t* p) {
+      std::array<char, 16 * 3 + 1> out{};
+      size_t off = 0;
+      for (int i = 0; i < 16; ++i) {
+        off += std::snprintf(out.data() + off, out.size() - off, "%02x%s",
+                             unsigned(p[i]), (i == 15) ? "" : " ");
+      }
+      return out;
+    };
+
+    // By default dump the slot corresponding to sm_idx=0 (matches the plane indexing formula).
+    int sm_idx = 0;
+    if (auto const* idx_env = std::getenv("TLLM_SM120_MOE_DUMP_TENSORMAPS_SMIDX");
+        idx_env != nullptr && idx_env[0] != '\0') {
+      sm_idx = std::atoi(idx_env);
+    }
+    sm_idx = std::max(0, std::min(sm_idx, sm_count - 1));
+
+    auto dump_plane = [&](int plane, const char* name) {
+      const size_t idx = size_t(sm_idx) + size_t(plane) * size_t(sm_count);
+      const size_t byte_off = idx * kDescBytes;
+      if (byte_off + kDescBytes > host.size()) {
+        TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] tensormaps(%s)[%s] plane=%d sm_idx=%d: OOB (byte_off=%zu host=%zu)",
+                       tag, name, plane, sm_idx, byte_off, host.size());
+        return;
+      }
+      const uint8_t* p = host.data() + byte_off;
+      for (size_t line = 0; line < kDescBytes; line += 16) {
+        auto hex = format_hex16(p + line);
+        TLLM_LOG_DEBUG("[SM120 MXFP4 MoE][dump] tensormaps(%s)[%s] plane=%d sm_idx=%d off=%zu bytes[%zu..%zu]=%s",
+                       tag, name, plane, sm_idx, byte_off, line, line + 15, hex.data());
+      }
+    };
+
+    dump_plane(0, "A");
+    dump_plane(1, "B");
+    dump_plane(2, "SFA");
+    dump_plane(3, "SFB");
+  };
+
+  bool const dump_pre = [&] {
+    if (auto const* dump_env = std::getenv("TLLM_SM120_MOE_DUMP_TENSORMAPS");
+        dump_env != nullptr && dump_env[0] == '1') {
+      return true;
+    }
+    return false;
+  }();
+  bool const dump_post = [&] {
+    if (auto const* dump_env = std::getenv("TLLM_SM120_MOE_DUMP_TENSORMAPS_POSTRUN");
+        dump_env != nullptr && dump_env[0] == '1') {
+      return true;
+    }
+    return false;
+  }();
+
+  if (dump_pre) {
+    dump_tensormaps("pre_run");
   }
+
+  // Run GEMM
+  auto run_status = gemm.run(stream);
+  TLLM_LOG_DEBUG("[SM120 MXFP4 MoE] run=%s", cutlassGetStatusString(run_status));
   if (run_status != cutlass::Status::kSuccess) {
     // Get the actual CUDA error for better diagnostics
     cudaError_t cuda_err = cudaGetLastError();
     TLLM_LOG_DEBUG("[SM120 MXFP4 MoE] CUDA error after run: %s (%d)", 
                    cudaGetErrorString(cuda_err), static_cast<int>(cuda_err));
+
+    if (dump_post) {
+      // Attempt to dump workspace even on failure (may help diagnose partial initialization).
+      dump_tensormaps("post_run_failure");
+    }
+
     TLLM_THROW("SM120 MXFP4 MoE: run failed: %s (CUDA: %s)", 
                cutlassGetStatusString(run_status), cudaGetErrorString(cuda_err));
+  }
+
+  if (dump_post) {
+    dump_tensormaps("post_run_success");
   }
 
   if (occupancy != nullptr) {
