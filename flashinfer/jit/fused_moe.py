@@ -32,6 +32,7 @@ from .gemm.cutlass.generate_kernels import generate_gemm_operations
 
 
 _FUSED_MOE_BUILD_PROFILE_ENV = "FLASHINFER_FUSED_MOE_BUILD_PROFILE"
+_SM120_TENSORMAP_INIT_ONLY_ENV = "FLASHINFER_SM120_TENSORMAP_INIT_ONLY"
 
 
 def _get_fused_moe_build_profile() -> str:
@@ -99,6 +100,12 @@ def gen_cutlass_fused_moe_sm120_module(
     if build_profile == "mxfp4_minimal":
         nvcc_flags += ["-DFLASHINFER_FUSED_MOE_MXFP4_MINIMAL"]
         module_suffix += "_mxfp4min"
+
+    # Debug-only: build an init-only kernel variant that initializes+commits tensormap
+    # descriptors and returns before any TMA loads. This helps isolate UTMALDG.4D traps.
+    if os.getenv(_SM120_TENSORMAP_INIT_ONLY_ENV, "").strip() == "1":
+        nvcc_flags += ["-DFLASHINFER_TENSORMAP_INIT_ONLY"]
+        module_suffix += "_tmainitonly"
 
     return gen_cutlass_fused_moe_module(
         nvcc_flags, f"120{module_suffix}", use_fast_build
