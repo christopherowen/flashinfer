@@ -33,6 +33,7 @@ from .gemm.cutlass.generate_kernels import generate_gemm_operations
 
 _FUSED_MOE_BUILD_PROFILE_ENV = "FLASHINFER_FUSED_MOE_BUILD_PROFILE"
 _SM120_TENSORMAP_INIT_ONLY_ENV = "FLASHINFER_SM120_TENSORMAP_INIT_ONLY"
+_SM120_TENSORMAP_CANARY_ENV = "FLASHINFER_SM120_TENSORMAP_CANARY"
 
 
 def _get_fused_moe_build_profile() -> str:
@@ -106,6 +107,12 @@ def gen_cutlass_fused_moe_sm120_module(
     if os.getenv(_SM120_TENSORMAP_INIT_ONLY_ENV, "").strip() == "1":
         nvcc_flags += ["-DFLASHINFER_TENSORMAP_INIT_ONLY"]
         module_suffix += "_tmainitonly"
+
+    # Debug-only: enable a device-side canary write right after tensormap commit and
+    # before the first TMA loads. Useful with cuda-gdb to see how far we get before trap.
+    if os.getenv(_SM120_TENSORMAP_CANARY_ENV, "").strip() == "1":
+        nvcc_flags += ["-DFLASHINFER_TENSORMAP_CANARY"]
+        module_suffix += "_tmacanary"
 
     return gen_cutlass_fused_moe_module(
         nvcc_flags, f"120{module_suffix}", use_fast_build
