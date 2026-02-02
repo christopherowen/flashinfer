@@ -399,25 +399,6 @@ def select_tile_mn_for_sm120(num_tokens: int) -> tuple[int, int]:
     Returns:
         Tile shape (M, N).
     """
-    # Debug-only: runtime file override (gated by environment variable).
-    # Set FLASHINFER_DEBUG_TILE_OVERRIDE=1 to enable reading from /tmp/flashinfer_moe_tile
-    if os.environ.get("FLASHINFER_DEBUG_TILE_OVERRIDE", "0") == "1":
-        tile_file = "/tmp/flashinfer_moe_tile"
-
-        @functools.cache
-        def _read_tile_override_once() -> Optional[tuple[int, int]]:
-            try:
-                with open(tile_file, "r") as f:
-                    tile_str = f.read().strip().lower()
-                    m, n = map(int, tile_str.split("x"))
-                    return (m, n)
-            except (FileNotFoundError, IOError, ValueError, AttributeError):
-                return None
-
-        override = _read_tile_override_once()
-        if override is not None and override in SM120_SUPPORTED_TILE_MN:
-            return override
-
     # Automatic tile selection based on batch size
     # For small batches (decode), use (64, 128) - validated native tile
     if num_tokens < 64:

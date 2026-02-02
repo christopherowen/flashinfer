@@ -32,13 +32,6 @@ from .gemm.cutlass.generate_kernels import generate_gemm_operations
 
 
 _FUSED_MOE_BUILD_PROFILE_ENV = "FLASHINFER_FUSED_MOE_BUILD_PROFILE"
-_SM120_TENSORMAP_INIT_ONLY_ENV = "FLASHINFER_SM120_TENSORMAP_INIT_ONLY"
-_SM120_TENSORMAP_CANARY_ENV = "FLASHINFER_SM120_TENSORMAP_CANARY"
-_SM120_PIPELINE_DEBUG_ENV = "FLASHINFER_SM120_PIPELINE_DEBUG"
-_SM120_GATED_FC1_LAUNCH_ENV = "FLASHINFER_GATED_FC1_LAUNCH"
-_SM120_GATED_FC1_CTA_N128_ENV = "FLASHINFER_GATED_FC1_CTA_N128"
-_SM120_GATED_FC1_TWO_GEMM_BRINGUP_ENV = "FLASHINFER_GATED_FC1_TWO_GEMM_BRINGUP"
-_SM120_GATED_FC1_TWO_GEMM_NO_GATE_OFFSET_ENV = "FLASHINFER_GATED_FC1_TWO_GEMM_NO_GATE_OFFSET"
 
 
 def _get_fused_moe_build_profile() -> str:
@@ -107,49 +100,14 @@ def gen_cutlass_fused_moe_sm120_module(
         nvcc_flags += ["-DFLASHINFER_FUSED_MOE_MXFP4_MINIMAL"]
         module_suffix += "_mxfp4min"
 
-    # Debug-only: build an init-only kernel variant that initializes+commits tensormap
-    # descriptors and returns before any TMA loads. This helps isolate UTMALDG.4D traps.
-    if os.getenv(_SM120_TENSORMAP_INIT_ONLY_ENV, "").strip() == "1":
-        nvcc_flags += ["-DFLASHINFER_TENSORMAP_INIT_ONLY"]
-        module_suffix += "_tmainitonly"
-
-    # Debug-only: enable a device-side canary write right after tensormap commit and
-    # before the first TMA loads. Useful with cuda-gdb to see how far we get before trap.
-    if os.getenv(_SM120_TENSORMAP_CANARY_ENV, "").strip() == "1":
-        nvcc_flags += ["-DFLASHINFER_TENSORMAP_CANARY"]
-        module_suffix += "_tmacanary"
-
-    # Debug-only: enable logging of sm90 pipeline barrier pointers/stage/phase before waits.
-    if os.getenv(_SM120_PIPELINE_DEBUG_ENV, "").strip() == "1":
-        nvcc_flags += ["-DFLASHINFER_SM90_PIPELINE_DEBUG"]
-        module_suffix += "_pipdbg"
-
-    # Experimental: enable gated FC1 kernel launch (fused SwiGLU in GEMM epilogue).
-    # This fuses the SwiGLU activation into the FC1 GEMM, eliminating the separate
-    # doGatedActivationKernel and saving one HBM round-trip.
-    # Requires both flags:
-    #   - FLASHINFER_GATED_FC1: enables gated path detection in gemm1()
-    #   - FLASHINFER_GATED_FC1_KERNEL_LAUNCH: enables actual kernel launch
-    if os.getenv(_SM120_GATED_FC1_LAUNCH_ENV, "").strip() == "1":
-        nvcc_flags += ["-DFLASHINFER_GATED_FC1", "-DFLASHINFER_GATED_FC1_KERNEL_LAUNCH"]
-        module_suffix += "_gatedfc1"
-
-    # Optional: experiment with CTA_N=128 for gated FC1 (may exceed SMEM without further work).
-    if os.getenv(_SM120_GATED_FC1_CTA_N128_ENV, "").strip() == "1":
-        nvcc_flags += ["-DFLASHINFER_GATED_FC1_CTA_N128"]
-        module_suffix += "_ctan128"
-
-    # Optional: two-GEMM bringup for gated FC1 (linear GEMM + gate GEMM w/ fused SwiGLU epilogue).
-    # Intended as a stepping stone to eliminate doGatedActivationKernel while avoiding 6-plane gated mainloop.
-    if os.getenv(_SM120_GATED_FC1_TWO_GEMM_BRINGUP_ENV, "").strip() == "1":
-        nvcc_flags += ["-DFLASHINFER_GATED_FC1_TWO_GEMM_BRINGUP"]
-        module_suffix += "_2gemm"
-
-    # Debug helper: force gate GEMM to reuse linear weight/SF pointers (no offset).
-    # Useful to diagnose whether NaNs come from offset computation vs epilogue wiring.
-    if os.getenv(_SM120_GATED_FC1_TWO_GEMM_NO_GATE_OFFSET_ENV, "").strip() == "1":
-        nvcc_flags += ["-DFLASHINFER_GATED_FC1_TWO_GEMM_NO_GATE_OFFSET"]
-        module_suffix += "_nogateoff"
+    # Layer 1A+: Enable gated FC1 with two-GEMM approach (fused SwiGLU in epilogue).
+    # This is the default and only path for SM120/121 MoE.
+    nvcc_flags += [
+        "-DFLASHINFER_GATED_FC1",
+        "-DFLASHINFER_GATED_FC1_KERNEL_LAUNCH",
+        "-DFLASHINFER_GATED_FC1_TWO_GEMM_BRINGUP",
+    ]
+    module_suffix += "_gatedfc1_2gemm"
 
     return gen_cutlass_fused_moe_module(
         nvcc_flags, f"120{module_suffix}", use_fast_build
