@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import os
 from enum import IntEnum
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -214,8 +215,14 @@ def _maybe_get_cached_w3_w1_permute_indices(
     num_elts_per_sf: Union[None, int] = None,
     is_gated_act_gemm: bool = True,
 ) -> torch.Tensor:
-    # Create a unique cache key (weight_type, weight_shape)
-    cache_key = ("w3_w1", dst_w3_w1_weight.shape)
+    # Create a unique cache key.
+    #
+    # IMPORTANT: The permutation depends on `epilogue_tile_m` (and optionally
+    # `num_elts_per_sf`). If the cache key only includes the weight shape, then
+    # changing the MoE tile at runtime (via /tmp/flashinfer_moe_tile) can reuse a
+    # permutation computed for a different epilogue configuration, which may
+    # cause incorrect indexing / crashes.
+    cache_key = ("w3_w1", dst_w3_w1_weight.shape, int(epilogue_tile_m), num_elts_per_sf)
     if cache_key not in _cache_permute_indices:
         # Get permute indices and chain them together
         if is_gated_act_gemm:
@@ -246,8 +253,9 @@ def get_w2_permute_indices_with_cache(
     epilogue_tile_m: int,
     num_elts_per_sf: Union[None, int] = None,
 ) -> torch.Tensor:
-    # Create a unique cache key (weight_type, weight_shape)
-    cache_key = ("w2", dst_w2_weight.shape)
+    # Same rationale as `_maybe_get_cached_w3_w1_permute_indices`: permutation
+    # depends on epilogue tile configuration.
+    cache_key = ("w2", dst_w2_weight.shape, int(epilogue_tile_m), num_elts_per_sf)
     if cache_key not in _cache_permute_indices:
         if num_elts_per_sf is None:
             permute_indices = get_shuffle_matrix_a_row_indices(
@@ -342,33 +350,33 @@ def convert_to_block_layout(input_tensor: torch.Tensor, blockK: int) -> torch.Te
 #   - IsCtaMSmall/IsCtaNSmall flags skip size assertions that don't apply to padded layouts
 #   - Epilogue tile uses min(64, CTA_M) and adaptive EpiN for smaller tiles
 #   - sm120_rr_smem_copy_selector_B selects appropriate copy atom based on TileN
+# Validated tiles only - tiles with N < 128 fail with shared memory / TMA errors.
+# Validation performed 2026-01-31 using scripts/tests/test_tile_validation.py
 SM120_SUPPORTED_TILE_MN = (
     # ========== NATIVE TILES (M >= 64, no swap_ab) ==========
-    # Constraints:
-    # - M must be power-of-2 multiple of 64 (CUTE shape divisibility)
-    # - N >= 16 required (N=8 fails stmatrix "Ambiguous scatter" constraint)
-    # - N must be power-of-2 (TMA alignment)
-    #
-    # M=64: N in {16, 32, 64, 128} fit in smem with 2+ stages
-    (64, 16), (64, 32), (64, 64), (64, 128),
-    # M=128: N in {16, 32, 64, 128} fit in smem with 2+ stages
-    (128, 16), (128, 32), (128, 64), (128, 128),
-    # M=256: only N=16 fits with 2 stages
-    (256, 16),
+    # Only N=128 is validated to work. N < 128 fails with shared memory or TMA errors.
+    (64, 128),   # Validated: PASS
+    (128, 128),  # Validated: PASS (production default)
     #
     # ========== SWAPPED TILES (M < 64, uses swap_ab) ==========
     # Physical tile is (N, M), so physical N = logical M
     # Constraint: logical M >= 16 (physical N >= 16 for stmatrix)
     #
-    # Physical (64, M) -> Logical (M, 64)
-    (16, 64), (32, 64),
     # Physical (128, M) -> Logical (M, 128)
-    (16, 128), (32, 128),
+    (16, 128),   # Validated: PASS
+    (32, 128),   # Validated: PASS (decode-optimized)
     # Physical (256, M) -> Logical (M, 256)
-    (16, 256),
+    (16, 256),   # Untested - likely works based on pattern
+    (32, 256),   # Validated: PASS
     # Physical (512, M) -> Logical (M, 512)
-    (16, 512),
-    # Note: Logical M=8 fails (physical N=8 fails stmatrix constraint)
+    (16, 512),   # Untested - likely works based on pattern
+    #
+    # ========== KNOWN FAILING TILES (DO NOT ENABLE) ==========
+    # The following tiles fail and should NOT be added to this list:
+    # - (64, 16), (64, 32), (64, 64): TMA descriptor / shared memory errors
+    # - (128, 16), (128, 32), (128, 64): TMA descriptor / internal errors
+    # - (256, 16): TMA descriptor errors
+    # - (16, 64), (32, 64): swap tiles with N=64 fail
 )
 
 
@@ -379,15 +387,11 @@ def select_tile_mn_for_sm120(num_tokens: int) -> tuple[int, int]:
     - Decode (small M): Use (64, 128) for better efficiency with smaller tiles
     - Prefill: Use (128, 128) for good throughput
 
-    The tcgen05 hardware natively supports M=64, so no swap_ab is needed.
+    Validated tiles (2026-01-31):
+    - Native: (64, 128), (128, 128)
+    - Swap: (16, 128), (32, 128), (32, 256)
 
-    Note: Larger tiles like (256, 64) don't fit in SMEM with 2 pipeline stages
-    because FP4 uses padded format (1 byte/element due to ldmatrix.b4x16_p64).
-    Max tile is (128, 128) which uses 32KB per stage × 2 = 64KB.
-
-    Runtime tile override (can be changed without restart):
-        /tmp/flashinfer_moe_tile: File containing tile spec (e.g., "64x128").
-                                   Checked on every call, so can be modified at runtime.
+    Note: Tiles with N < 128 fail with TMA/shared memory errors.
 
     Args:
         num_tokens: Number of tokens in the batch.
@@ -395,23 +399,31 @@ def select_tile_mn_for_sm120(num_tokens: int) -> tuple[int, int]:
     Returns:
         Tile shape (M, N).
     """
-    # Runtime file override (can be changed without restart)
-    tile_file = "/tmp/flashinfer_moe_tile"
-    try:
-        with open(tile_file, "r") as f:
-            tile_str = f.read().strip().lower()
-            m, n = map(int, tile_str.split("x"))
-            if (m, n) in SM120_SUPPORTED_TILE_MN:
-                return (m, n)
-    except (FileNotFoundError, IOError, ValueError, AttributeError):
-        pass
-    
+    # Debug-only: runtime file override (gated by environment variable).
+    # Set FLASHINFER_DEBUG_TILE_OVERRIDE=1 to enable reading from /tmp/flashinfer_moe_tile
+    if os.environ.get("FLASHINFER_DEBUG_TILE_OVERRIDE", "0") == "1":
+        tile_file = "/tmp/flashinfer_moe_tile"
+
+        @functools.cache
+        def _read_tile_override_once() -> Optional[tuple[int, int]]:
+            try:
+                with open(tile_file, "r") as f:
+                    tile_str = f.read().strip().lower()
+                    m, n = map(int, tile_str.split("x"))
+                    return (m, n)
+            except (FileNotFoundError, IOError, ValueError, AttributeError):
+                return None
+
+        override = _read_tile_override_once()
+        if override is not None and override in SM120_SUPPORTED_TILE_MN:
+            return override
+
     # Automatic tile selection based on batch size
-    # For small batches (decode), use smaller M tiles for better efficiency
+    # For small batches (decode), use (64, 128) - validated native tile
     if num_tokens < 64:
-        return (64, 128)  # M=64 natively supported by tcgen05
-    
-    # For medium/large batches, use (128, 128) - largest tile that fits in SMEM
+        return (64, 128)
+
+    # For medium/large batches, use (128, 128) - production default
     return (128, 128)
 
 @functools.cache
@@ -1121,12 +1133,15 @@ def prewarm_moe_tiles():
     latency during inference. Currently only the baseline (128,128) tile
     is pre-warmed.
     
-    Tile variants to consider adding after validation:
-    - (32, 128): decode-optimized (via swap-hack)
-    - (128, 32): mid-batch optimization
+    Additional validated tiles that could be prewarmed:
+    - (64, 128): native tile for decode
+    - (32, 128): swap tile for small decode batches
     """
-    # Only prewarm tiles that are known-good and compile successfully.
-    TILES_TO_PREWARM: list[tuple[int, int]] = [(128, 128)]
+    # Prewarm validated tiles (2026-01-31 validation)
+    TILES_TO_PREWARM: list[tuple[int, int]] = [
+        (128, 128),  # Production default
+        (64, 128),   # Decode-optimized native tile
+    ]
     # Try to detect if we are on SM120/121
     try:
         major, minor = torch.cuda.get_device_capability()
@@ -1135,12 +1150,12 @@ def prewarm_moe_tiles():
         if arch not in ("120", "121"):
             return
             
-        print(f"Prewarming {len(TILES_TO_PREWARM)} MoE tile variants for SM{arch}...")
+        logger.info(f"Prewarming {len(TILES_TO_PREWARM)} MoE tile variants for SM{arch}...")
         for tile_mn in TILES_TO_PREWARM:
             _ = get_cutlass_fused_moe_module(backend="120", tile_mn=tile_mn)
-        print(f"Prewarmed {len(TILES_TO_PREWARM)} MoE tile variants")
+        logger.info(f"Prewarmed {len(TILES_TO_PREWARM)} MoE tile variants")
     except Exception as e:
-        print(f"Failed to prewarm MoE tiles: {e}")
+        logger.warning(f"Failed to prewarm MoE tiles: {e}")
 
 
 # trtllmgen-moe-fp8

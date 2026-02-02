@@ -29,4 +29,40 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
     int multi_processor_count, cudaStream_t stream, int* occupancy,
     size_t* workspace_size);
 
+// Gated FC1 launcher: fuses linear + gate weights with SwiGLU activation
+template <typename T, typename WeightType, typename OutputType, typename EpilogueTag,
+          typename TileShape, typename ClusterShape, bool IsMXFP4>
+void sm120_gated_fc1_moe_gemm_kernelLauncher(
+    TmaWarpSpecializedGroupedGemmInput tma_inputs,
+    void* aux_output,           // [M, inter_size] BF16 output buffer
+    int64_t const* expert_first_token_offset,  // [num_experts+1] token offsets per expert
+    int64_t inter_size,
+    int64_t hidden_size,
+    int num_experts,
+    int multi_processor_count, 
+    cudaStream_t stream, 
+    int* occupancy,
+    size_t* workspace_size);
+
+// Two-GEMM bringup for gated FC1 (Path A):
+//   1) Linear GEMM: A @ W_linear -> linear_out [M, inter_size]
+//   2) Gate GEMM:   A @ W_gate   -> epilogue reads linear_out and writes SwiGLU output [M, inter_size] (BF16)
+//
+// This is intended to eliminate the standalone doGatedActivationKernel while avoiding the 6-plane
+// gated mainloop (Aux/SFAux) which currently traps on some small-N tiles.
+template <typename T, typename WeightType, typename OutputType, typename EpilogueTag,
+          typename TileShape, typename ClusterShape, bool IsMXFP4>
+void sm120_two_gemm_gated_fc1_kernelLauncher(
+    TmaWarpSpecializedGroupedGemmInput tma_inputs,
+    void* linear_output,         // [M, inter_size] BF16 staging buffer (linear GEMM output)
+    void* swiglu_output,         // [M, inter_size] BF16 output (SwiGLU)
+    int64_t const* expert_first_token_offset,  // [num_experts+1] token offsets per expert
+    int64_t inter_size,
+    int64_t hidden_size,
+    int num_experts,
+    int multi_processor_count,
+    cudaStream_t stream,
+    int* occupancy,
+    size_t* workspace_size);
+
 }  // namespace tensorrt_llm::kernels::cutlass_kernels_oss

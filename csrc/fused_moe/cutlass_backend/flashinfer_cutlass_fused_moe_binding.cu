@@ -30,6 +30,11 @@
 #include "tensorrt_llm/common/workspace.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h"
 
+// Debug-only: global pipeline debug buffer (written by CUTLASS sm90_pipeline.hpp when enabled).
+#if defined(FLASHINFER_SM90_PIPELINE_DEBUG)
+extern "C" __device__ __managed__ volatile unsigned long long flashinfer_sm90_pipeline_dbg[512] = {};
+#endif
+
 namespace common = tensorrt_llm::common;
 namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
 using ActivationParams = CUTLASS_MOE_GEMM_NAMESPACE::ActivationParams;
