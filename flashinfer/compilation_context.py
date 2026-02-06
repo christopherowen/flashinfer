@@ -36,25 +36,15 @@ class CompilationContext:
             for arch in os.environ["FLASHINFER_CUDA_ARCH_LIST"].split(" "):
                 major, minor = arch.split(".")
                 major = int(major)
-                # SM12x requires arch-specific codegen ("a" suffix) for
-                # block-scaled MMA and other SM12x-only instructions.
-                # Correct the common misconfiguration of "f" (forward-compat).
-                if major >= 12 and minor.endswith("f"):
-                    corrected = minor[:-1] + "a"
-                    logger.warning(
-                        f"FLASHINFER_CUDA_ARCH_LIST: correcting {major}.{minor}"
-                        f" → {major}.{corrected} (SM{major}x requires 'a' codegen)"
-                    )
-                    minor = corrected
                 self.TARGET_CUDA_ARCHS.add((int(major), str(minor)))
         else:
             try:
                 for device in range(torch.cuda.device_count()):
                     major, minor = torch.cuda.get_device_capability(device)
                     if major >= 12:
-                        # SM12x (Blackwell family): use the "a" variant by default.
-                        # NOTE: Users may override via FLASHINFER_CUDA_ARCH_LIST.
-                        minor = str(minor) + "a"
+                        # SM12x (Blackwell family) requires "f" suffix for FP4/FP8 tensor core features
+                        # The "a" suffix rejects block-scaled MMA and FP4 ldmatrix instructions
+                        minor = str(minor) + "f"
                     elif major >= 9:
                         minor = str(minor) + "a"
                     self.TARGET_CUDA_ARCHS.add((int(major), str(minor)))

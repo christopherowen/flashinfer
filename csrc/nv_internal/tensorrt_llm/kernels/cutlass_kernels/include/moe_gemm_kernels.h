@@ -213,33 +213,13 @@ struct TmaWarpSpecializedGroupedGemmInput {
 
   INT4GroupwiseParams int4_groupwise_params;
 
-  // Gated FC1 extension: pre-computed arrays for fused gated FC1 path.
-  // Allocated by configureWorkspace(), populated by computeStridesTmaWarpSpecializedKernel()
-  // when enabled=true, consumed directly by the gated launcher (no separate device kernel/sync).
-  struct GatedFC1 {
-    // Device arrays (allocated by configureWorkspace, filled by upstream stride kernel)
-    void const** ptr_weight_gate = nullptr;   // [E] gate weight pointers (linear + offset)
-    ElementSF const** sf_gate = nullptr;      // [E] gate SF pointers (linear SF + offset)
-    void** ptr_output = nullptr;              // [E] per-expert gated output pointers
-    void* stride_output = nullptr;            // [E] per-expert gated output strides (StrideD)
-
-    // Configuration metadata (set before stride kernel launch by setupTmaWarpSpecializedInputs)
-    int64_t gate_weight_offset_bytes = 0;     // byte offset: linear weight → gate weight
-    int64_t gate_sf_offset_elems = 0;         // element offset: linear SF → gate SF
-    int64_t output_row_stride_bytes = 0;      // bytes per row in gated output (inter_size * elem_size)
-    int64_t output_n = 0;                     // N dimension for gated output (= inter_size)
-    void* output_base = nullptr;              // base pointer for gated output buffer
-
-    bool enabled = false;                     // whether gated extension is active for this input
-  } gated_fc1;
-
   uint8_t* gemm_workspace = nullptr;
   size_t gemm_workspace_size = 0;
 
   // Whether to enable PDL (Programmatic Dependent Launch).
   bool enable_pdl{};
 
-  static std::array<size_t, 24> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
+  static std::array<size_t, 20> workspaceBuffers(int num_experts, FpXBlockScalingType scaling_type);
 
   static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);
 

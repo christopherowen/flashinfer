@@ -70,35 +70,6 @@
 using namespace tensorrt_llm::kernels;
 using namespace tensorrt_llm::common;
 
-// Forward declaration of gated FC1 launcher (defined in moe_gemm_sm120_mixed_input_launcher.inl).
-// Compiled when FLASHINFER_GATED_FC1 is defined (default ON for SM120+).
-#ifdef FLASHINFER_GATED_FC1
-namespace tensorrt_llm::kernels::cutlass_kernels_oss {
-
-// SwigluBias parameters for the fused gated FC1 kernel.
-// Device pointers passed straight through to the CUTLASS mainloop.
-struct GatedFC1SwigluParams {
-    float const* d_alpha = nullptr;
-    float const* d_beta  = nullptr;
-    float const* d_limit = nullptr;
-};
-
-template <typename T, typename WeightType, typename OutputType, typename EpilogueTag,
-          typename TileShape, typename ClusterShape, bool IsMXFP4>
-void sm120_gated_fc1_moe_gemm_kernelLauncher(
-    tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput tma_inputs,
-    int64_t inter_size,
-    int64_t hidden_size,
-    int num_experts,
-    int multi_processor_count,
-    cudaStream_t stream,
-    int* occupancy,
-    size_t* workspace_size,
-    GatedFC1SwigluParams swiglu_params = {});
-
-}  // namespace tensorrt_llm::kernels::cutlass_kernels_oss
-#endif  // FLASHINFER_GATED_FC1
-
 namespace tensorrt_llm::kernels::cutlass_kernels {
 /**
  * Takes the input maps and prepares the expanded maps for min latency
@@ -1186,10 +1157,14 @@ __device__ void computeTmaWarpSpecializedInputStrides(
     TmaWarpSpecializedGroupedGemmInput& layout_info, int gemm_m, int gemm_n, int gemm_k,
     int64_t out_idx) {
   if (layout_info.swap_ab) {
+    // swap_ab: Activation (originally RowMajor A) becomes ColumnMajor B operand.
+    // ColumnMajor B expects shape (K, N) for make_cute_packed_stride to produce
+    // correct stride (1, K). The activation in memory is (M, K) RowMajor, which
+    // when reinterpreted as ColumnMajor (K, M) needs shape (gemm_k, gemm_m).
     reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideB*>(
         layout_info.stride_act)[out_idx] =
         cutlass::make_cute_packed_stride(TmaWarpSpecializedGroupedGemmInput::StrideB{},
-                                         cute::make_shape(gemm_m, gemm_k, 1));
+                                         cute::make_shape(gemm_k, gemm_m, 1));
     reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideA*>(
         layout_info.stride_weight)[out_idx] =
         cutlass::make_cute_packed_stride(TmaWarpSpecializedGroupedGemmInput::StrideA{},
@@ -1232,15 +1207,6 @@ __device__ void computeTmaWarpSpecializedInputStrides(
                      : TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size),
             1));
   }
-
-  // Gated FC1 extension: compute gated output stride (N = output_n, not gemm_n)
-  if (layout_info.gated_fc1.enabled) {
-    int gated_n = static_cast<int>(layout_info.gated_fc1.output_n);
-    reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideD*>(
-        layout_info.gated_fc1.stride_output)[out_idx] =
-        cutlass::make_cute_packed_stride(TmaWarpSpecializedGroupedGemmInput::StrideD{},
-                                         cute::make_shape(gemm_m, gated_n, 1));
-  }
 }
 
 template <class T, class WeightType, class OutputType, class ScaleBiasType>
@@ -1280,24 +1246,6 @@ __device__ void computeTmaWarpSpecializedInputPointers(
              (layout_info.int4_groupwise_params.use_wfp4a16
                   ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size * 2
                   : TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size)));
-  }
-
-  // Gated FC1 extension: compute gate weight/SF pointers and gated output pointers
-  if (layout_info.gated_fc1.enabled) {
-    // Gate weight pointer: linear weight base + byte offset
-    auto* w_bytes = reinterpret_cast<char const*>(layout_info.ptr_weight[out_idx]);
-    layout_info.gated_fc1.ptr_weight_gate[out_idx] =
-        w_bytes + layout_info.gated_fc1.gate_weight_offset_bytes;
-
-    // Gate SF pointer: linear SF base + element offset
-    layout_info.gated_fc1.sf_gate[out_idx] =
-        layout_info.fpX_block_scaling_factors_weight[out_idx]
-        + layout_info.gated_fc1.gate_sf_offset_elems;
-
-    // Gated output pointer: base + tokens_before_expert * row_stride (bytes)
-    auto* base_bytes = reinterpret_cast<char*>(layout_info.gated_fc1.output_base);
-    layout_info.gated_fc1.ptr_output[out_idx] =
-        base_bytes + num_tokens_before_expert * layout_info.gated_fc1.output_row_stride_bytes;
   }
 }
 
@@ -2696,22 +2644,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
                                                 num_experts_per_node, getScalingType())
                                           : 0;
 
-  size_t gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
-
-#ifdef FLASHINFER_GATED_FC1
-  // Gated FC1 (Layer 1A) uses a gated SM120 block-scaled mainloop with 6 tensormap planes:
-  //   A, B, SFA, SFB, Aux, SFAux
-  // The standard MoE SM120 block-scaled path uses 4 planes (A, B, SFA, SFB).
-  //
-  // The gated kernel's `params.mainloop.base.tensormaps` lives at a fixed offset inside
-  // `gemm_workspace` (scheduler region), so the total required `gemm_workspace_size`
-  // increases by exactly 2 * sm_count * sizeof(cute::TmaDescriptor) when the gated path is used.
-  if (use_block_scaling && is_gated_activation) {
-    int const sm_count = tensorrt_llm::common::getMultiProcessorCount();
-    constexpr size_t kTmaDescBytes = 128;  // sizeof(cute::TmaDescriptor) on SM120/SM121
-    gemm_workspace_size += size_t(2) * size_t(sm_count) * kTmaDescBytes;
-  }
-#endif
+  size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
 
   // lora related
   size_t const lora_input_size =
@@ -3096,108 +3029,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     // ids
     TLLM_CHECK_WITH_INFO(fc1_expert_biases == nullptr, "Min latency mode does not support bias.");
     TLLM_CHECK(use_fp4);
-  }
-
-  // ==========================================================================
-  // GATED FC1 PATH (Layer 1A fusion) — runtime decision
-  // ==========================================================================
-  // When the gated mainloop is compiled (FLASHINFER_GATED_FC1, default ON for
-  // SM120+), the runtime automatically selects it for gated activations on
-  // block-scaled MXFP4 paths.  No environment variable is needed.
-  //
-  // This path:
-  //   1. Runs a fused dual-accumulator GEMM: A @ W_linear  and  A @ W_gate
-  //   2. Applies SwigluBias (alpha/beta/limit from vLLM) inline in the mainloop
-  //   3. Stores BF16 [M, inter_size] — skips doGatedActivation()
-  //   4. Runs doActivation(Identity) to quantize BF16 → FP8 for FC2
-  //
-  // Performance win vs unfused path:
-  //   - Eliminates one HBM read  of [M, 2*inter_size] BF16
-  //   - Eliminates one HBM write of [M, inter_size] BF16
-  //   - Eliminates one kernel launch (doGatedActivation)
-  // ==========================================================================
-
-#ifdef FLASHINFER_GATED_FC1
-  // Runtime decision: use the gated mainloop when all preconditions are met.
-  bool const use_gated_fc1 = use_block_scaling
-                          && is_gated_activation
-                          && (inter_size % 32 == 0);    // SF_VEC_SIZE alignment
-#else
-  bool const use_gated_fc1 = false;
-#endif
-
-  if (use_gated_fc1) {
-#ifdef FLASHINFER_GATED_FC1
-    // Guardrails
-    TLLM_CHECK(config.is_tma_warp_specialized);
-    TLLM_CHECK(is_gated_activation);
-    TLLM_CHECK_WITH_INFO(inter_size % 32 == 0,
-        "Gated FC1 requires inter_size divisible by 32 (SF_VEC_SIZE)");
-
-    TLLM_LOG_DEBUG("[SM120 MoE] Gated FC1: fused mainloop selected at runtime");
-    TLLM_LOG_DEBUG("[SM120 MoE]   inter_size=%ld, hidden_size=%ld, expanded_num_rows=%ld",
-        (long)inter_size, (long)hidden_size, (long)expanded_num_rows);
-
-    // Gate weight/SF pointers and gated output pointers/strides are already
-    // pre-computed by the upstream computeStridesTmaWarpSpecializedKernel
-    // (configured in setupTmaWarpSpecializedInputs).
-    auto tma_ws_input = tma_ws_input_template;
-
-    static int const multi_processor_count = tensorrt_llm::common::getMultiProcessorCount();
-
-    // Tile shape: default 64x64x128 (fits SM121 SMEM).
-#ifdef FLASHINFER_GATED_FC1_CTA_N128
-    using GatedTileShape = cute::Shape<cute::Int<64>, cute::Int<128>, cute::Int<128>>;
-#else
-    using GatedTileShape = cute::Shape<cute::Int<64>, cute::Int<64>, cute::Int<128>>;
-#endif
-    using GatedClusterShape = cute::Shape<cute::_1, cute::_1, cute::_1>;
-
-    // Pass device pointers straight through to the CUTLASS mainloop.
-    // The kernel reads them on-device — no cudaMemcpy, no sync, CUDA-graph safe.
-    tensorrt_llm::kernels::cutlass_kernels_oss::GatedFC1SwigluParams swiglu_p{
-      fc1_activation_type.swiglu_alpha,
-      fc1_activation_type.swiglu_beta,
-      fc1_activation_type.swiglu_limit
-    };
-
-    tensorrt_llm::kernels::cutlass_kernels_oss::sm120_gated_fc1_moe_gemm_kernelLauncher<
-        T, WeightType, OutputType, void, GatedTileShape, GatedClusterShape, /*IsMXFP4=*/true>(
-        tma_ws_input,
-        inter_size,
-        hidden_size,
-        num_experts_per_node,
-        multi_processor_count,
-        stream,
-        nullptr,   // occupancy
-        nullptr,   // workspace_size (already allocated)
-        swiglu_p); // SwigluBias activation params from vLLM
-
-    sync_check_cuda_error(stream);
-
-    // Quantize BF16 SwigluBias output → FP8 + scale factors for FC2.
-    // Use Identity activation since SwigluBias was already applied in the kernel.
-    {
-      ActivationParams act_params(ActivationType::Identity);
-      constexpr bool bias_is_broadcast_q = true;
-      constexpr bool use_per_expert_act_scale_q = false;
-      doActivation<T, UnfusedGemmOutputType, ScaleBiasType>(
-          output, reinterpret_cast<UnfusedGemmOutputType const*>(intermediate_result),
-          fc2_fp8_quant,
-          /*bias*/ static_cast<ScaleBiasType const*>(nullptr), bias_is_broadcast_q,
-          expert_first_token_offset, num_experts_per_node,
-          inter_size, expanded_num_rows,
-          act_params, quant_params, use_per_expert_act_scale_q,
-          fc2_fp4_act_flat,
-          enable_pdl, stream);
-      sync_check_cuda_error(stream);
-    }
-
-    TLLM_LOG_DEBUG("[SM120 MoE] Gated FC1 complete (SwigluBias + FP8 quantize)");
-
-    // Return early — standard path and doGatedActivation are bypassed.
-    return;
-#endif  // FLASHINFER_GATED_FC1
   }
 
   if (using_tma_ws_gemm1) {
@@ -3926,14 +3757,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 min_latency_params.active_expert_global_ids, enable_pdl);
     sync_check_cuda_error(stream);
 
-#if defined(FLASHINFER_TENSORMAP_INIT_ONLY)
-    // Debug-only: when the CUTLASS kernel is built in "tensormap init only" mode, GEMM1 does not
-    // produce valid outputs. Return early so GEMM2 doesn't run on garbage data (and so we can
-    // isolate faults to GEMM1 tensormap init/update/commit).
-    TLLM_LOG_DEBUG("[SM120 MoE][tmainitonly] Returning after GEMM1 (min-latency) debug run");
-    return;
-#endif
-
     auto gemm2_input =
         applyPrequantScale(smoothed_act_, fc1_result_, quant_params.groupwise.fc2.act_scales,
                            num_valid_tokens_ptr, expanded_num_rows, inter_size, use_awq, stream);
@@ -4041,12 +3864,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_, false, nullptr,
                 nullptr, enable_pdl);
     sync_check_cuda_error(stream);
-
-#if defined(FLASHINFER_TENSORMAP_INIT_ONLY)
-    // Debug-only: same as above, but for the non-min-latency path.
-    TLLM_LOG_DEBUG("[SM120 MoE][tmainitonly] Returning after GEMM1 debug run");
-    return;
-#endif
 
     if (use_lora) {
       loraFC2(inter_size, hidden_size, num_experts_per_node, start_expert, num_valid_tokens_ptr,
@@ -4229,23 +4046,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
     gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
 
-    // NOTE: For SM120/121 we JIT-compile one module per logical tile, and the module is compiled
-    // with `-DSWAP_AB={0,1}` (see `flashinfer/jit/fused_moe.py`). Runtime `swap_ab` must match
-    // the compiled mode, because it controls:
-    //  - how grouped problem shapes are written (M/N swapped)
-    //  - how ptr/stride/SF arrays are interpreted
-    //  - which stride packing is used for activations/weights
-    //
-    // Using the heuristic-selected `gemm*_config_->swap_ab` here can mismatch the compiled mode
-    // (e.g. compiled SWAP_AB=1 but default profile has swap_ab=false), which then produces
-    // inconsistent shapes/strides and crashes in the SM120 mainloop.
-#ifdef SWAP_AB
-    gemm1_tma_ws_input.swap_ab = static_cast<bool>(SWAP_AB);
-    gemm2_tma_ws_input.swap_ab = static_cast<bool>(SWAP_AB);
-#else
     gemm1_tma_ws_input.swap_ab = gemm1_config_->swap_ab;
     gemm2_tma_ws_input.swap_ab = gemm2_config_->swap_ab;
-#endif
     TLLM_CHECK_WITH_INFO(
         (gemm1_tma_ws_input.swap_ab && gemm2_tma_ws_input.swap_ab) || !use_w4_groupwise,
         "Hopper w4 mixed input groupwise requires swap_ab");
@@ -4297,26 +4099,6 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     }
 
     TLLM_CHECK_WITH_INFO(gemm1_input != gemm1_output, "Input and output buffers are overlapping");
-
-    // Configure gated FC1 extension: pre-compute gate weight/SF pointers and
-    // gated output pointers in the upstream stride kernel.  All work is done on
-    // the same stream — no cudaStreamSynchronize, CUDA-graph safe.
-#ifdef FLASHINFER_GATED_FC1
-    if (is_gated_activation) {
-      gemm1_tma_ws_input.gated_fc1.enabled = true;
-      // Gate weight is stored contiguously after linear weight: [linear|gate] each inter_size x hidden_size
-      // FP4: 2 elements per byte, so byte offset = (inter_size * hidden_size) / 2
-      gemm1_tma_ws_input.gated_fc1.gate_weight_offset_bytes = (inter_size * hidden_size) / 2;
-      // Gate SF is stored after linear SF: inter_size * ceil(hidden_size / 32) elements
-      gemm1_tma_ws_input.gated_fc1.gate_sf_offset_elems = inter_size * ((hidden_size + 31) / 32);
-      // Gated output: BF16 buffer with N = inter_size (only the activated half)
-      gemm1_tma_ws_input.gated_fc1.output_n = inter_size;
-      gemm1_tma_ws_input.gated_fc1.output_row_stride_bytes =
-          inter_size * static_cast<int64_t>(sizeof(UnfusedGemmOutputType));
-      gemm1_tma_ws_input.gated_fc1.output_base = gemm1_output;
-    }
-#endif
-
     return Self::computeStridesTmaWarpSpecialized(
         expert_first_token_offset_, gemm1_tma_ws_input, gemm2_tma_ws_input, num_rows,
         expanded_num_rows, fc1_out_size, hidden_size, hidden_size, inter_size, num_experts_per_node,

@@ -658,20 +658,6 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::getTmaWarpSpecializedCo
                    return config;
                  });
 
-  // SM120/121 fused-MoE JIT builds compile separate libraries per SWAP_AB setting.
-  // When SWAP_AB is defined, we must only return configs whose runtime swap_ab matches
-  // the compiled kernel variant, otherwise the runner may select an incompatible config
-  // (leading to invalid workspace queries or kernel launch failures).
-#if defined(SWAP_AB)
-  if (sm == 120 || sm == 121) {
-    bool const want_swap_ab = (SWAP_AB != 0);
-    tma_ws_configs.erase(
-        std::remove_if(tma_ws_configs.begin(), tma_ws_configs.end(),
-                       [&](auto const& config) { return config.swap_ab != want_swap_ab; }),
-        tma_ws_configs.end());
-  }
-#endif
-
   if (use_w4_groupwise) {
     // w4 groupwise implementation requires swap_ab to be true
     tma_ws_configs.erase(std::remove_if(tma_ws_configs.begin(), tma_ws_configs.end(),
@@ -820,24 +806,6 @@ void MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>::dispatchToArch(
         TLLM_CHECK_WITH_INFO(
             hopper_inputs.isValid(),
             "Calling TMA warp specialized configuration with invalid hopper config");
-
-        // For NoSmem epilogue schedule, output N must be 256-bit aligned.
-        // No need to check isGatedActivation here - inputs.n is already set correctly:
-        //   fc1_out_size = is_gated_activation ? inter_size * 2 : inter_size
-        // So gated activations naturally have better alignment (2x the size).
-        // Also, FINALIZE fusion is not supported with NO_SMEM.
-        // This check is here so the autotuner can catch invalid tactics during profiling.
-        if (inputs.gemm_config.epilogue_schedule ==
-            cutlass_extensions::EpilogueScheduleType::NO_SMEM) {
-          TLLM_CHECK_WITH_INFO(
-              inputs.n % (256 / cutlass::sizeof_bits<OutputType>::value) == 0,
-              "Output N %ld does not meet minimum alignment requirements for NO_SMEM epilogue %d",
-              (long)inputs.n, (int)(256 / cutlass::sizeof_bits<OutputType>::value));
-          TLLM_CHECK_WITH_INFO(
-              inputs.gemm_config.epilogue_fusion_type !=
-                  cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE,
-              "NO_SMEM epilogue schedule is not supported with FINALIZE fusion");
-        }
 
         // Select the appropriate fusion function
         auto select_function = [&]() {
