@@ -224,16 +224,21 @@ struct CollectiveMma<
   // "Warp Illegal Instruction Parameter" on UTMALDG.4D because the TMA
   // descriptor's swizzle mode expects 1024-byte-aligned SMEM base addresses.
   //
+  // CRITICAL: smem_SFA, smem_SFB, smem_SFAux MUST use alignas(16) to match
+  // CUTLASS v4.4's SM120 block-scaled MMA requirements.  Without this, the
+  // hardware scale factor load faults with "Warp Illegal Instruction Parameter".
+  // This was the fix added in CUTLASS v4.4 (see base kernel's TensorStorage).
+  //
   struct TensorStorage : cute::aligned_struct<128, _0> {
     // Base operands (same as Base::TensorStorage)
     alignas(1024) cute::ArrayEngine<SmemAllocTypeA, cute::cosize_v<SmemLayoutA>> smem_A;
     alignas(1024) cute::ArrayEngine<SmemAllocTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
-    cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFA>> smem_SFA;
-    cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB;
+    alignas(16)   cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFA>> smem_SFA;
+    alignas(16)   cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB;
     
     // Gated extension: Aux operand (gate weights, same layout as B)
     alignas(1024) cute::ArrayEngine<SmemAllocTypeB, cute::cosize_v<SmemLayoutAux>> smem_Aux;
-    cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFAux>> smem_SFAux;
+    alignas(16)   cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFAux>> smem_SFAux;
   };
 
   using SharedStorage = TensorStorage;
@@ -247,6 +252,16 @@ struct CollectiveMma<
                 "smem_B must be 1024-byte aligned within TensorStorage");
   static_assert(offsetof(TensorStorage, smem_Aux) % 1024 == 0,
                 "smem_Aux must be 1024-byte aligned within TensorStorage");
+
+  // [CT-6b] Scale factor alignment: smem_SFA, smem_SFB, smem_SFAux must be at
+  // 16-byte-aligned offsets.  CUTLASS v4.4 added this requirement for SM120
+  // block-scaled MMA.  Without it, the hardware scale factor load faults.
+  static_assert(offsetof(TensorStorage, smem_SFA) % 16 == 0,
+                "smem_SFA must be 16-byte aligned within TensorStorage");
+  static_assert(offsetof(TensorStorage, smem_SFB) % 16 == 0,
+                "smem_SFB must be 16-byte aligned within TensorStorage");
+  static_assert(offsetof(TensorStorage, smem_SFAux) % 16 == 0,
+                "smem_SFAux must be 16-byte aligned within TensorStorage");
 
   // [CT-7] Verify TensorStorage size is reasonable (should be < 100KB for SM12x)
   static_assert(sizeof(TensorStorage) <= 128 * 1024,

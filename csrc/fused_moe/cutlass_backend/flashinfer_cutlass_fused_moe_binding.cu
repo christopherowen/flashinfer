@@ -268,7 +268,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
               int64_t tp_rank, int64_t ep_size, int64_t ep_rank, int64_t cluster_size,
               int64_t cluster_rank, bool enable_alltoall, bool min_latency_mode,
               Optional<Array<int64_t>> profile_ids, bool enable_pdl,
-              ActivationType base_activation_type = ActivationType::Swiglu) {
+              ActivationType base_activation_type = ActivationType::Swiglu,
+              bool fuse_gated_fc1 = false) {
     std::lock_guard<std::mutex> lock(mMutex);
 
     TVM_FFI_ICHECK(cluster_size == 1 && cluster_rank == 0)
@@ -419,7 +420,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
         static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, enable_alltoall,
         use_lora, lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params,
-        enable_pdl, stream);
+        enable_pdl, stream, fuse_gated_fc1);
 #else
     mKernelRunner->runMoe(
         input.data_ptr(), input_sf.has_value() ? input_sf.value().data_ptr() : nullptr,
@@ -435,7 +436,8 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
         static_cast<int>(experts_per_token),
         static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
         static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
-        mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, enable_pdl, stream);
+        mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, enable_pdl, stream,
+        fuse_gated_fc1);
 #endif
   }
 
@@ -748,12 +750,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                  int64_t tp_size, int64_t tp_rank, int64_t ep_size, int64_t ep_rank,
                  int64_t cluster_size, int64_t cluster_rank, bool enable_alltoall,
                  bool min_latency_mode, Optional<Array<int64_t>> profile_ids, bool enable_pdl,
-                 int64_t base_activation_type) {
+                 int64_t base_activation_type, bool fuse_gated_fc1) {
             runMoe(output, input, token_selected_experts, token_final_scales, fc1_expert_weights,
                    fc1_expert_biases, fc2_expert_weights, fc2_expert_biases, quant_scales, input_sf,
                    swiglu_alpha, swiglu_beta, swiglu_limit, tp_size, tp_rank, ep_size, ep_rank,
                    cluster_size, cluster_rank, enable_alltoall, min_latency_mode, profile_ids,
-                   enable_pdl, static_cast<ActivationType>(base_activation_type));
+                   enable_pdl, static_cast<ActivationType>(base_activation_type), fuse_gated_fc1);
           });
     } else if (name == "run_moe_min_latency") {
       return Function::FromTyped(

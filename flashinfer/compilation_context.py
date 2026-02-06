@@ -42,9 +42,7 @@ class CompilationContext:
                 for device in range(torch.cuda.device_count()):
                     major, minor = torch.cuda.get_device_capability(device)
                     if major >= 12:
-                        # SM12x (Blackwell family) requires "f" suffix for FP4/FP8 tensor core features
-                        # The "a" suffix rejects block-scaled MMA and FP4 ldmatrix instructions
-                        minor = str(minor) + "f"
+                        minor = str(minor) + "a"
                     elif major >= 9:
                         minor = str(minor) + "a"
                     self.TARGET_CUDA_ARCHS.add((int(major), str(minor)))

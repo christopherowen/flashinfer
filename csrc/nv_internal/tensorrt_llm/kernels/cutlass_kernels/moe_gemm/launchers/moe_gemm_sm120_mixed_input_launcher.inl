@@ -469,7 +469,7 @@ using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;           
 using StrideA = typename CollectiveMainloop::StrideA;                                          \
 using StrideB = typename CollectiveMainloop::StrideB;                                          \
 using StrideAux = typename CollectiveMainloop::StrideAux;                                      \
-using StrideD = StrideOutput*;  /* Pointer array for grouped GEMM epilogue */                           \
+using StrideD = typename CollectiveEpilogue::StrideD;  /* Derived from CUTLASS CollectiveBuilder */ \
 using LayoutSFA = typename CollectiveMainloop::LayoutSFA;                                      \
 using LayoutSFB = typename CollectiveMainloop::LayoutSFB;                                      \
 using LayoutSFAux = typename CollectiveMainloop::LayoutSFAux;                                  \
@@ -510,11 +510,15 @@ DEFINE_SM120_MXFP4_STANDARD_NAMESPACE(sm120_mxfp4_bf16, LOGICAL_TILE_M, LOGICAL_
 #endif
 
 // Gated mode (FC1 with fused SwiGLU) - instantiated when FLASHINFER_GATED_FC1 is defined
-// Uses same tile shape as standard mode but with dual-accumulator mainloop
+// FIXED tile 64×64×128: the gated mainloop loads 6 TMA planes (A, B, Aux, SFA, SFB, SFAux)
+// which requires ~71KB SMEM. Larger tiles exceed the SM121 SMEM limit (101,376 bytes):
+//   128×128×128 → 129,024 bytes (over by 28KB)
+//    64×128×128 → 112,640 bytes (over by 11KB)
+//    64× 64×128 →  71,680 bytes (FITS with 29KB margin)
 #ifdef FLASHINFER_GATED_FC1
 #if !SWAP_AB
 // Gated mode only supports standard (non-swapped) layout for now
-DEFINE_SM120_MXFP4_GATED_NAMESPACE(sm120_mxfp4_bf16_gated, LOGICAL_TILE_M, LOGICAL_TILE_N, 128)
+DEFINE_SM120_MXFP4_GATED_NAMESPACE(sm120_mxfp4_bf16_gated, 64, 64, 128)
 #endif
 #endif  // FLASHINFER_GATED_FC1
 
@@ -1312,7 +1316,7 @@ __global__ void computeGatedPointersAndStrides(
   int64_t gemm_m = cute::get<0>(problem_shapes[e]);  // Tokens for this expert
   int64_t gemm_n = inter_size;
   stride_aux_output[e] = cutlass::make_cute_packed_stride(
-      StrideD{}, cute::make_shape(gemm_m, gemm_n, int64_t{1}));
+      StrideD{}, cute::make_shape(int(gemm_m), int(gemm_n), int(1)));
 
 #ifndef NDEBUG
   // Debug: verify pointer alignment and stride sanity
@@ -1543,15 +1547,47 @@ void sm120_gated_fc1_moe_gemm_kernelLauncher(
   //   - ptr_SFB: linear weight scale factors
   //   - ptr_SFAux: gate weight scale factors - computed by offset kernel
   
-  // Input strides: dereference from tma_inputs arrays (MoE uses uniform input strides)
-  StrideA stride_a = *reinterpret_cast<StrideA const*>(tma_inputs.stride_act);
-  StrideB stride_b = *reinterpret_cast<StrideB const*>(tma_inputs.stride_weight);
+  // Input strides: handle both pointer types (device arrays) and value types.
+  // For grouped GEMMs, CUTLASS expects stride *arrays* (pointer types) that the
+  // kernel dereferences on-device. Pass device pointers through in that case.
+  auto stride_a = [&]() -> StrideA {
+    if constexpr (std::is_pointer_v<StrideA>) {
+      return reinterpret_cast<StrideA>(tma_inputs.stride_act);
+    } else {
+      StrideA host_val{};
+      cudaMemcpy(&host_val, tma_inputs.stride_act, sizeof(StrideA), cudaMemcpyDeviceToHost);
+      return host_val;
+    }
+  }();
+  auto stride_b = [&]() -> StrideB {
+    if constexpr (std::is_pointer_v<StrideB>) {
+      return reinterpret_cast<StrideB>(tma_inputs.stride_weight);
+    } else {
+      StrideB host_val{};
+      cudaMemcpy(&host_val, tma_inputs.stride_weight, sizeof(StrideB), cudaMemcpyDeviceToHost);
+      return host_val;
+    }
+  }();
   StrideAux stride_aux = stride_b;  // Gate weights have same stride as linear
-  
-  LayoutSFA layout_sfa = *reinterpret_cast<LayoutSFA const*>(
-      tma_inputs.fpX_block_scaling_factors_stride_act);
-  LayoutSFB layout_sfb = *reinterpret_cast<LayoutSFB const*>(
-      tma_inputs.fpX_block_scaling_factors_stride_weight);
+
+  auto layout_sfa = [&]() -> LayoutSFA {
+    if constexpr (std::is_pointer_v<LayoutSFA>) {
+      return reinterpret_cast<LayoutSFA>(tma_inputs.fpX_block_scaling_factors_stride_act);
+    } else {
+      LayoutSFA host_val{};
+      cudaMemcpy(&host_val, tma_inputs.fpX_block_scaling_factors_stride_act, sizeof(LayoutSFA), cudaMemcpyDeviceToHost);
+      return host_val;
+    }
+  }();
+  auto layout_sfb = [&]() -> LayoutSFB {
+    if constexpr (std::is_pointer_v<LayoutSFB>) {
+      return reinterpret_cast<LayoutSFB>(tma_inputs.fpX_block_scaling_factors_stride_weight);
+    } else {
+      LayoutSFB host_val{};
+      cudaMemcpy(&host_val, tma_inputs.fpX_block_scaling_factors_stride_weight, sizeof(LayoutSFB), cudaMemcpyDeviceToHost);
+      return host_val;
+    }
+  }();
   LayoutSFAux layout_sfaux = layout_sfb;  // Gate SFs have same layout
 
   typename Gemm::Arguments arguments = {
@@ -1629,12 +1665,13 @@ void sm120_gated_fc1_moe_gemm_kernelLauncher(
 #if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4) && defined(FLASHINFER_GATED_FC1)
 
 // FP8 activations × FP4 weights → BF16 output (standard MXFP4)
+// Tile must be 64×64×128 to fit the 6-plane gated mainloop in SM121 SMEM (71KB < 101KB limit)
 template void sm120_gated_fc1_moe_gemm_kernelLauncher<
     __nv_fp8_e4m3,      // T (activation type)
     __nv_fp4_e2m1,      // WeightType
     __nv_bfloat16,      // OutputType
     void,               // EpilogueTag
-    cute::Shape<cute::Int<128>, cute::Int<128>, cute::Int<128>>,  // TileShape
+    cute::Shape<cute::Int<64>, cute::Int<64>, cute::Int<128>>,    // TileShape (fixed for gated SMEM)
     cute::Shape<cute::_1, cute::_1, cute::_1>,                    // ClusterShape
     true                // IsMXFP4
 >(

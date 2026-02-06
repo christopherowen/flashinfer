@@ -444,7 +444,7 @@ class CutlassMoeFCRunnerInterface {
                       MOEParallelismConfig parallelism_config, bool const enable_alltoall,
                       bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
                       bool min_latency_mode, MoeMinLatencyParams& min_latency_params,
-                      bool enable_pdl, cudaStream_t stream) = 0;
+                      bool enable_pdl, cudaStream_t stream, bool fuse_gated_fc1 = false) = 0;
 
   // Aliases for profiling the gemms
   virtual void gemm1(void const* const input, void* const output, void* const intermediate_result,
@@ -462,7 +462,7 @@ class CutlassMoeFCRunnerInterface {
                      bool bias_is_broadcast, bool use_deepseek_fp8_block_scale, cudaStream_t stream,
                      cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
                      int* num_active_experts_per, int* active_expert_global_ids,
-                     bool enable_pdl) = 0;
+                     bool enable_pdl, bool fuse_gated_fc1 = false) = 0;
 
   virtual void gemm2(
       void const* const input, void* const gemm_output, void* const final_output,
@@ -626,7 +626,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
               MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora,
               LoraParams& lora_params, bool use_deepseek_fp8_block_scale, bool min_latency_mode,
               MoeMinLatencyParams& min_latency_params, bool enable_pdl,
-              cudaStream_t stream) override;
+              cudaStream_t stream, bool fuse_gated_fc1 = false) override;
 
   // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
   static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
@@ -652,7 +652,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                     ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
                     bool bias_is_broadcast, cudaStream_t stream,
                     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-                    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl);
+                    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
+                    bool fuse_gated_fc1 = false);
 
   static void gemm2(
       MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,
@@ -690,7 +691,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
              ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
              bool bias_is_broadcast, bool use_deepseek_fp8_block_scale, cudaStream_t stream,
              cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-             int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) override {
+             int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
+             bool fuse_gated_fc1 = false) override {
     auto* block_scale_gemm_runner =
         use_deepseek_fp8_block_scale ? getDeepSeekBlockScaleGemmRunner() : nullptr;
     return Self::gemm1(moe_gemm_runner_, block_scale_gemm_runner, static_cast<T const*>(input),
@@ -702,7 +704,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                        expanded_num_rows, hidden_size, inter_size, num_experts_per_node,
                        fc1_activation_type, alpha_scale_ptr_array, bias_is_broadcast, stream,
                        config, min_latency_mode, num_active_experts_per, active_expert_global_ids,
-                       enable_pdl);
+                       enable_pdl, fuse_gated_fc1);
   }
 
   void gemm2(void const* const input, void* const gemm_output, void* const final_output,
@@ -807,7 +809,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                                 ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
                                 MoeMinLatencyParams& min_latency_params, bool use_lora,
                                 int start_expert, MOEParallelismConfig parallelism_config,
-                                bool enable_pdl, cudaStream_t stream);
+                                bool enable_pdl, cudaStream_t stream,
+                                bool fuse_gated_fc1 = false);
 
   static std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
   computeStridesTmaWarpSpecialized(
@@ -1065,4 +1068,24 @@ struct GemmProfilerBackend {
 void populateRandomBuffer(void* buffer_void, size_t size, cudaStream_t stream);
 
 }  // namespace cutlass_kernels
+
+// Forward declaration for gated FC1 launcher (defined in cutlass_kernels_oss namespace)
+namespace cutlass_kernels_oss {
+
+template <typename T, typename WeightType, typename OutputType, typename EpilogueTag,
+          typename TileShape, typename ClusterShape, bool IsMXFP4>
+void sm120_gated_fc1_moe_gemm_kernelLauncher(
+    cutlass_kernels::TmaWarpSpecializedGroupedGemmInput tma_inputs,
+    void* aux_output,
+    int64_t const* expert_first_token_offset,
+    int64_t inter_size,
+    int64_t hidden_size,
+    int num_experts,
+    int multi_processor_count,
+    cudaStream_t stream,
+    int* occupancy,
+    size_t* workspace_size);
+
+}  // namespace cutlass_kernels_oss
+
 }  // namespace tensorrt_llm::kernels

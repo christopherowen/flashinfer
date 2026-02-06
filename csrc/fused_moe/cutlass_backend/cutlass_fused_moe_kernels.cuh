@@ -3002,7 +3002,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     int64_t const inter_size, int const num_experts_per_node, ActivationParams fc1_activation_type,
     float const** alpha_scale_ptr_array, bool bias_is_broadcast, cudaStream_t stream,
     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
+    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
+    bool fuse_gated_fc1) {
   if (fp8_blockscale_gemm_runner) {
     TLLM_CHECK(!min_latency_mode);
     Self::BlockScaleFC1(*fp8_blockscale_gemm_runner, input, output, intermediate_result,
@@ -3017,8 +3018,16 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   bool const is_gated_activation = isGatedActivation(fc1_activation_type);
   bool const use_ampere_activation_fusion = gemm_runner.isFusedGatedActivation(
       config, fc1_activation_type.activation_type, inter_size, hidden_size);
+
+  // When using the fused gated FC1 kernel, fc1_out_size is inter_size (not 2*inter_size)
+  // because the fused kernel computes two GEMMs internally and applies SwiGLU inline.
+  // The fused path is a top-level choice: it uses its own fixed 64×64×128 tile and does
+  // not participate in swap_ab logic. The TMA setup forces swap_ab=false when this is active.
+  bool const use_fused_gated_fc1 = fuse_gated_fc1 && using_tma_ws_gemm1 &&
+      is_gated_activation && use_fp4;
   size_t const fc1_out_size =
-      ((!use_ampere_activation_fusion) && is_gated_activation) ? inter_size * 2 : inter_size;
+      ((!use_ampere_activation_fusion) && is_gated_activation && !use_fused_gated_fc1)
+          ? inter_size * 2 : inter_size;
 
   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
 
@@ -3037,6 +3046,87 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     TLLM_CHECK(!use_fp4 || fc1_fp4_act_flat);
     TLLM_CHECK(!use_fp4 || fc2_fp4_act_flat);
 
+    // =========================================================================
+    // Fused Gated FC1 Path (Layer 1A)
+    // =========================================================================
+    // When enabled, uses a dual-accumulator GEMM kernel that computes both
+    // A @ W_linear and A @ W_gate simultaneously, applying SwigluBias inline.
+    // This eliminates the separate doGatedActivation kernel and saves one HBM
+    // round-trip. Output is [M, inter_size] BF16 with SwiGLU already applied.
+    //
+    // After the fused GEMM, doActivation(Identity) handles FP8 quantization
+    // for FC2 input.
+    if (use_fused_gated_fc1) {
+#if defined(FLASHINFER_GATED_FC1)
+      TLLM_LOG_DEBUG("[SM120 MoE] Gated FC1: FUSED kernel dispatch (inter_size=%ld, hidden_size=%ld)",
+                     (long)inter_size, (long)hidden_size);
+
+      auto tma_ws_input = tma_ws_input_template;
+
+      // Get SM count for the launcher
+      int multi_processor_count = 0;
+      cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, 0);
+
+      // Call the fused gated FC1 launcher.
+      // The launcher internally:
+      //   1. Computes gate weight pointers by offsetting from linear pointers
+      //   2. Sets up per-expert output pointer/stride arrays
+      //   3. Runs the 6-plane TMA GEMM with inline SwigluBias
+      //
+      // Output goes to intermediate_result as BF16 [M, inter_size].
+      using namespace tensorrt_llm::kernels::cutlass_kernels_oss;
+      // Tile must be 64×64×128 for gated FC1 - the 6-plane TMA load (A, B, Aux,
+      // SFA, SFB, SFAux) uses ~71KB SMEM. Larger tiles exceed SM121's 101KB limit.
+      sm120_gated_fc1_moe_gemm_kernelLauncher<
+          T,                                                        // activation type (FP8)
+          WeightType,                                               // weight type (FP4)
+          OutputType,                                               // output type (BF16)
+          void,                                                     // EpilogueTag
+          cute::Shape<cute::Int<64>, cute::Int<64>, cute::Int<128>>,    // TileShape (fixed for SMEM)
+          cute::Shape<cute::_1, cute::_1, cute::_1>,                    // ClusterShape
+          true                                                          // IsMXFP4
+      >(tma_ws_input,
+        intermediate_result,        // aux_output: [M, inter_size] BF16
+        expert_first_token_offset,
+        inter_size,
+        hidden_size,
+        num_experts_per_node,
+        multi_processor_count,
+        stream,
+        nullptr,    // occupancy (not queried)
+        nullptr);   // workspace_size (not queried)
+
+      sync_check_cuda_error(stream);
+
+      // After fused GEMM: output has SwiGLU applied. Run doActivation(Identity)
+      // to handle FP8 quantization + scale factor computation for FC2 input.
+      using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
+      bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc2.use_per_expert_act_scale
+                                      : use_wfp4afp8
+                                          ? quant_params.fp8_mxfp4.fc2.use_per_expert_act_scale
+                                      : use_fp8 ? quant_params.fp8.fc2_use_per_expert_act_scale
+                                                : false;
+
+      // Use Identity activation - SwiGLU is already done by the fused kernel.
+      ActivationParams identity_activation(ActivationType::Identity);
+      doActivation<GatedActOutputType, UnfusedGemmOutputType>(
+          reinterpret_cast<GatedActOutputType*>(output),
+          static_cast<UnfusedGemmOutputType const*>(intermediate_result),
+          fc2_fp8_quant, nullptr,  // no bias (already applied in fused kernel)
+          bias_is_broadcast, expert_first_token_offset, num_experts_per_node, inter_size,
+          expanded_num_rows, identity_activation, quant_params, use_per_expert_act_scale,
+          fc2_fp4_act_flat, enable_pdl, stream);
+
+      sync_check_cuda_error(stream);
+      TLLM_LOG_DEBUG("[SM120 MoE] Gated FC1: FUSED path complete");
+#else
+      TLLM_THROW("Fused gated FC1 requested but FLASHINFER_GATED_FC1 was not compiled. "
+                  "Set FLASHINFER_ENABLE_GATED_FC1=1 and clear the JIT cache.");
+#endif
+    } else {
+    // =========================================================================
+    // Standard TMA Warp-Specialized Path (unfused)
+    // =========================================================================
     bool has_different_gemm_output_type = using_tma_ws_gemm1 && !std::is_same_v<T, OutputType>;
     bool const has_intermediate = has_different_gemm_output_type || is_gated_activation;
     TLLM_CHECK_WITH_INFO(has_intermediate || input != output,
@@ -3090,6 +3180,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         fc2_fp4_act_flat, enable_pdl, stream);
 
     sync_check_cuda_error(stream);
+    } // end else (standard unfused path)
   } else if (use_fp8) {
     TLLM_CHECK(!use_ampere_activation_fusion);
     TLLM_CHECK(!config.is_tma_warp_specialized);
@@ -3572,7 +3663,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     void* final_output_void, int* unpermuted_row_to_permuted_row,
     MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora,
     LoraParams& lora_params, bool use_deepseek_fp8_block_scale, bool min_latency_mode,
-    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream) {
+    MoeMinLatencyParams& min_latency_params, bool enable_pdl, cudaStream_t stream,
+    bool fuse_gated_fc1) {
   static constexpr bool int_scales_required = std::is_same<WeightType, uint8_t>::value ||
                                               std::is_same<WeightType, cutlass::uint4b_t>::value ||
                                               use_wfp4a16;
@@ -3742,7 +3834,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
         fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
         min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config,
-        enable_pdl, stream);
+        enable_pdl, stream, fuse_gated_fc1);
 
     // todo: input_activations_void should be nvfp4, waiting for yuxian's mr ready
     Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner,
@@ -3754,7 +3846,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
                 num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_, !use_lora,
                 stream, *gemm1_config_, true, min_latency_params.num_active_experts_per_node,
-                min_latency_params.active_expert_global_ids, enable_pdl);
+                min_latency_params.active_expert_global_ids, enable_pdl, fuse_gated_fc1);
     sync_check_cuda_error(stream);
 
     auto gemm2_input =
@@ -3831,7 +3923,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
         fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
         min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config,
-        enable_pdl, stream);
+        enable_pdl, stream, fuse_gated_fc1);
 
     if (use_lora) {
       bool all_token_without_lora = setupLoraWorkspace(
@@ -3862,7 +3954,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows,
                 hidden_size, inter_size, num_experts_per_node, fc1_activation_type,
                 alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_, false, nullptr,
-                nullptr, enable_pdl);
+                nullptr, enable_pdl, fuse_gated_fc1);
     sync_check_cuda_error(stream);
 
     if (use_lora) {
@@ -3997,7 +4089,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
                                   ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
                                   MoeMinLatencyParams& min_latency_params, bool use_lora,
                                   int start_expert, MOEParallelismConfig parallelism_config,
-                                  bool enable_pdl, cudaStream_t stream) {
+                                  bool enable_pdl, cudaStream_t stream,
+                                  bool fuse_gated_fc1) {
   auto gemm1_tma_ws_input = tma_ws_grouped_gemm1_input_;
   auto gemm2_tma_ws_input = tma_ws_grouped_gemm2_input_;
 
@@ -4013,7 +4106,10 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
                  !use_wfp4a16;
 
   bool is_gated_activation = isGatedActivation(fc1_activation_type);
-  int64_t const fc1_out_size = is_gated_activation ? inter_size * 2 : inter_size;
+  // For fused gated FC1, the GEMM operates on inter_size (not 2*inter_size)
+  // because the dual-accumulator kernel handles the gate internally.
+  int64_t const fc1_out_size = (is_gated_activation && !fuse_gated_fc1)
+      ? inter_size * 2 : inter_size;
 
   bool has_different_gemm_output_type = !std::is_same_v<T, UnfusedGemmOutputType>;
   bool const has_intermediate = has_different_gemm_output_type || is_gated_activation;
@@ -4046,7 +4142,10 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
     gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
 
-    gemm1_tma_ws_input.swap_ab = gemm1_config_->swap_ab;
+    // Fused gated FC1 is a top-level kernel choice with its own fixed 64×64×128 tile.
+    // It does not use swap_ab -- the small tile already satisfies M>=64 natively.
+    // Override the config's swap_ab for FC1 so the TMA problem shapes are correct.
+    gemm1_tma_ws_input.swap_ab = fuse_gated_fc1 ? false : gemm1_config_->swap_ab;
     gemm2_tma_ws_input.swap_ab = gemm2_config_->swap_ab;
     TLLM_CHECK_WITH_INFO(
         (gemm1_tma_ws_input.swap_ab && gemm2_tma_ws_input.swap_ab) || !use_w4_groupwise,
