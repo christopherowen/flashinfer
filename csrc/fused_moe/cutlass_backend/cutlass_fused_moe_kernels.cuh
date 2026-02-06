@@ -1020,12 +1020,12 @@ __device__ auto quantizePackedFPXValue(
     if constexpr (is_fp8) {
       return [](PackedVec<GemmOutputType>& vec, float /* ignored */, uint8_t* SFout) -> uint64_t {
         static_assert(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize == VecSize);
-        return cvt_warp_fp16_to_mxfp8<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD>(vec, SFout);
+        return cvt_warp_fp16_to_mxfp8<GemmOutputType, VecSize>(vec, SFout);
       };
     } else {
       return (scaling_type == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4)
-                 ? &cvt_warp_fp16_to_fp4<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD, false>
-                 : &cvt_warp_fp16_to_fp4<GemmOutputType, VecSize, CVT_ELTS_PER_THREAD, true>;
+                 ? &cvt_warp_fp16_to_fp4<GemmOutputType, VecSize, false>
+                 : &cvt_warp_fp16_to_fp4<GemmOutputType, VecSize, true>;
     }
   }();
 
@@ -3127,6 +3127,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 #endif
 
   if (use_gated_fc1) {
+#ifdef FLASHINFER_GATED_FC1
     // Guardrails
     TLLM_CHECK(config.is_tma_warp_specialized);
     TLLM_CHECK(is_gated_activation);
@@ -3196,6 +3197,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
     // Return early — standard path and doGatedActivation are bypassed.
     return;
+#endif  // FLASHINFER_GATED_FC1
   }
 
   if (using_tma_ws_gemm1) {
