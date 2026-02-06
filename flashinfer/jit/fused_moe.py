@@ -100,14 +100,20 @@ def gen_cutlass_fused_moe_sm120_module(
         nvcc_flags += ["-DFLASHINFER_FUSED_MOE_MXFP4_MINIMAL"]
         module_suffix += "_mxfp4min"
 
-    # Layer 1A+: Enable gated FC1 with two-GEMM approach (fused SwiGLU in epilogue).
-    # This is the default and only path for SM120/121 MoE.
-    nvcc_flags += [
-        "-DFLASHINFER_GATED_FC1",
-        "-DFLASHINFER_GATED_FC1_KERNEL_LAUNCH",
-        "-DFLASHINFER_GATED_FC1_TWO_GEMM_BRINGUP",
-    ]
-    module_suffix += "_gatedfc1_2gemm"
+    # Gated-FC1 fusion (Layer 1A): fused dual-accumulator GEMM with inline
+    # SwigluBias (alpha/beta/limit).  Default ON — the kernel is compiled and
+    # the runtime automatically selects it for gated activations on block-scaled
+    # MXFP4 paths.  Set FLASHINFER_ENABLE_GATED_FC1=0 to force the unfused path.
+    def _env_on(name: str, default: str = "1") -> bool:
+        v = os.getenv(name, default)
+        v = (v or "").strip()
+        return v not in ("", "0", "false", "False", "no", "No")
+
+    enable_gated_fc1 = _env_on("FLASHINFER_ENABLE_GATED_FC1", "1")
+
+    if enable_gated_fc1:
+        nvcc_flags += ["-DFLASHINFER_GATED_FC1"]
+        module_suffix += "_gatedfc1"
 
     return gen_cutlass_fused_moe_module(
         nvcc_flags, f"120{module_suffix}", use_fast_build

@@ -609,8 +609,17 @@ using StrideOutput = cutlass::detail::TagToStrideC_t<LayoutOutput*>;            
  * Since SwiGLU is now applied INSIDE the mainloop (single-accumulator mma()),                 \
  * we can use the STANDARD epilogue - it just stores the already-fused result.                 \
  * This allows using the standard GemmUniversal kernel instead of GemmUniversalGated!          \
+ *                                                                                             \
+ * Epilogue tile: use same auto-selection as standard mode.                                    \
+ * SM120 EpilogueTileAuto selects (64,32) which is the validated choice.                       \
+ * Hardcoding (64,64) causes "illegal instruction" at runtime because the                      \
+ * epilogue TMA store descriptor doesn't support 64-wide N on SM120.                           \
  */                                                                                            \
-using EpilogueTile_MN = cute::tuple<cute::C<64>, cute::C<64>>;                                 \
+constexpr int kGatedEpiTileN = (TILE_N_VAL < 32 ? TILE_N_VAL : 32);                            \
+using EpilogueTile_Explicit = cute::tuple<cute::C<64>, cute::C<kGatedEpiTileN>>;                \
+using EpilogueTile_Auto = cutlass::epilogue::collective::EpilogueTileAuto;                      \
+using EpilogueTile_MN = cute::conditional_t<(TILE_N_VAL >= 64),                                 \
+                                             EpilogueTile_Auto, EpilogueTile_Explicit>;         \
 using CollectiveEpilogue =                                                                     \
     typename cutlass::epilogue::collective::CollectiveBuilder<                                 \
         ArchTag, OperatorClass, TileShape_MNK, ClusterShape_MNK,                               \
@@ -1488,126 +1497,12 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
 
 #if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4) && defined(FLASHINFER_GATED_FC1)
 
-// -----------------------------------------------------------------------------
-// Offset Kernel: Compute gate weight/SF pointers AND output pointers/strides
-// -----------------------------------------------------------------------------
-// Runs once per expert (tiny: 8 experts × 24 layers = 192 ops total).
-// With CUDA graphs, the launch overhead is amortized.
-//
-// This kernel populates:
-// 1. Gate weight pointers: ptr_weight_gate[e] = ptr_weight_linear[e] + offset
-// 2. Gate SF pointers: sf_gate[e] = sf_linear[e] + offset
-// 3. Aux output pointers: ptr_aux_output[e] = aux_base + tokens_before_e * inter_size
-// 4. Aux output strides: stride_aux_output[e] = make_cute_packed_stride(shape)
-//
-template <typename ElementOutput, typename StrideD>
-__global__ void computeGatedPointersAndStrides(
-    // Gate weight inputs/outputs
-    void const* const* __restrict__ ptr_weight_linear,  // [E] linear base pointers
-    void const** __restrict__ ptr_weight_gate,          // [E] output: gate pointers
-    TmaWarpSpecializedGroupedGemmInput::ElementSF const* const* __restrict__ sf_linear,  // [E]
-    TmaWarpSpecializedGroupedGemmInput::ElementSF const** __restrict__ sf_gate,          // [E] output
-    int64_t gate_weight_bytes,   // (inter_size * hidden_size) / 2
-    int64_t gate_sf_elems,       // inter_size * ceil(hidden_size / 32)
-    // Aux output inputs/outputs
-    ElementOutput* aux_output_base,                     // Contiguous output buffer
-    ElementOutput** __restrict__ ptr_aux_output,        // [E] output: per-expert output pointers
-    StrideD* __restrict__ stride_aux_output,            // [E] output: per-expert output strides
-    int64_t const* __restrict__ expert_first_token_offset,  // [E+1] token offsets per expert
-    int64_t inter_size,                                 // Output N dimension (leading dim for row-major)
-    // Problem shape info for stride computation
-    cutlass::gemm::GroupProblemShape<cute::Shape<int64_t, int64_t, int64_t>>::UnderlyingProblemShape const* __restrict__ problem_shapes,
-    int num_experts) {
-
-  int e = threadIdx.x + blockIdx.x * blockDim.x;
-  if (e >= num_experts) return;
-
-  // 1. Gate weight pointer: linear_base + byte offset
-  auto w_linear = reinterpret_cast<char const*>(ptr_weight_linear[e]);
-  ptr_weight_gate[e] = w_linear + gate_weight_bytes;
-
-  // 2. Gate SF pointer: linear_sf + element offset
-  sf_gate[e] = sf_linear[e] + gate_sf_elems;
-
-  // 3. Aux output pointer: base + tokens_before_expert * inter_size (elements, not bytes)
-  // This assumes row-major layout where inter_size is the stride between rows
-  int64_t tokens_before_expert = expert_first_token_offset[e];
-  ptr_aux_output[e] = aux_output_base + tokens_before_expert * inter_size;
-
-  // 4. Aux output stride: use packed row-major stride
-  // StrideD for LayoutD=RowMajor is typically Stride<int64_t, Int<1>, Int<0>> -> (ld, 1, 0)
-  // For grouped GEMM with L=1: batch stride is 0 (single batch per expert)
-  // Note: cute::Int<0> means batch stride is unused (compile-time zero)
-  int64_t gemm_n = inter_size;
-  // Use default stride for batch dim (Int<0> from default construction)
-  // Only need to set the leading dimension
-  StrideD stride_val{};  // Default: (0, Int<1>{}, Int<0>{})
-  // For row-major: leading dim = N
-  cute::get<0>(stride_val) = gemm_n;
-  stride_aux_output[e] = stride_val;
-
-#ifndef NDEBUG
-  // Debug: verify pointer alignment and stride sanity
-  if (e == 0) {
-    auto gate_ptr = reinterpret_cast<uintptr_t>(ptr_weight_gate[0]);
-    auto aux_ptr = reinterpret_cast<uintptr_t>(ptr_aux_output[0]);
-    if (gate_ptr % 16 != 0) {
-      printf("[WARN] Gated FC1: gate weight pointer not 16-byte aligned: %p\n", 
-             (void*)gate_ptr);
-    }
-    if (aux_ptr % 16 != 0) {
-      printf("[WARN] Gated FC1: aux output pointer not 16-byte aligned: %p\n",
-             (void*)aux_ptr);
-    }
-  }
-#endif
-}
-
-// Workspace layout for gated FC1:
-// [0..gemm_ws_size): CUTLASS GEMM workspace (tensormaps, etc.)
-// [gemm_ws_size..): Pointer/stride arrays for grouped GEMM
-//   - ptr_weight_gate: num_experts * sizeof(void*)
-//   - sf_gate: num_experts * sizeof(ElementSF*)
-//   - ptr_aux_output: num_experts * sizeof(ElementOutput*)
-//   - stride_aux_output: num_experts * sizeof(StrideD)
-//
-// Note: stride_size must be passed in since StrideD type is template-dependent
-//
-struct GatedFC1WorkspaceLayout {
-  size_t gemm_workspace_offset;
-  size_t gemm_workspace_size;
-  size_t ptr_weight_gate_offset;
-  size_t sf_gate_offset;
-  size_t ptr_aux_output_offset;
-  size_t stride_aux_output_offset;
-  size_t total_size;
-  
-  static GatedFC1WorkspaceLayout compute(size_t base_gemm_ws_size, int num_experts, size_t stride_size) {
-    GatedFC1WorkspaceLayout layout{};
-    
-    // Align to 256 bytes for CUTLASS workspace requirements
-    constexpr size_t kAlign = 256;
-    auto align_up = [](size_t x, size_t a) { return (x + a - 1) / a * a; };
-    
-    layout.gemm_workspace_offset = 0;
-    layout.gemm_workspace_size = align_up(base_gemm_ws_size, kAlign);
-    
-    // Pointer arrays (16-byte aligned)
-    constexpr size_t kPtrAlign = 16;
-    size_t ptr_array_size = align_up(num_experts * sizeof(void*), kPtrAlign);
-    
-    // Stride array (16-byte aligned, size depends on StrideD type)
-    size_t stride_array_size = align_up(num_experts * stride_size, kPtrAlign);
-    
-    layout.ptr_weight_gate_offset = layout.gemm_workspace_size;
-    layout.sf_gate_offset = layout.ptr_weight_gate_offset + ptr_array_size;
-    layout.ptr_aux_output_offset = layout.sf_gate_offset + ptr_array_size;
-    layout.stride_aux_output_offset = layout.ptr_aux_output_offset + ptr_array_size;
-    layout.total_size = layout.stride_aux_output_offset + stride_array_size;
-    
-    return layout;
-  }
-};
+// Note: Gate weight/SF pointers and gated output pointers/strides are now
+// pre-computed by the upstream computeStridesTmaWarpSpecializedKernel and
+// stored in TmaWarpSpecializedGroupedGemmInput::gated_fc1.
+// The separate computeGatedPointersAndStrides kernel and GatedFC1WorkspaceLayout
+// have been removed - the gated launcher uses pre-computed arrays directly,
+// eliminating the cudaStreamSynchronize that broke CUDA graph capture.
 
 #endif  // CUTLASS_ARCH_MMA_SM12x_SUPPORTED && ENABLE_FP4 && FLASHINFER_GATED_FC1
 
@@ -1719,7 +1614,6 @@ struct TwoGemmFC1WorkspaceLayout {
   size_t ptr_linear_offset;
   size_t ptr_linear_c_offset;
   size_t stride_linear_offset;
-  size_t stride_c_offset;
   size_t ptr_out_offset;
   size_t stride_out_offset;
   size_t total_size;
@@ -1738,15 +1632,14 @@ struct TwoGemmFC1WorkspaceLayout {
     size_t ptr_array_size = align_up(size_t(num_experts) * sizeof(void*), kPtrAlign);
     size_t sf_array_size = align_up(size_t(num_experts) * sizeof(void*), kPtrAlign);
     size_t stride_array_size = align_up(size_t(num_experts) * sizeof(StrideT), kPtrAlign);
-    size_t stride_c_array_size = align_up(size_t(num_experts) * stride_c_elem_size, kPtrAlign);
+    (void)stride_c_elem_size;  // No longer needed; C stride aliases D stride.
 
     layout.ptr_weight_gate_offset = layout.gemm_workspace_size;
     layout.sf_gate_offset = layout.ptr_weight_gate_offset + ptr_array_size;
     layout.ptr_linear_offset = layout.sf_gate_offset + sf_array_size;
     layout.ptr_linear_c_offset = layout.ptr_linear_offset + ptr_array_size;
     layout.stride_linear_offset = layout.ptr_linear_c_offset + ptr_array_size;
-    layout.stride_c_offset = layout.stride_linear_offset + stride_array_size;
-    layout.ptr_out_offset = layout.stride_c_offset + stride_c_array_size;
+    layout.ptr_out_offset = layout.stride_linear_offset + stride_array_size;
     layout.stride_out_offset = layout.ptr_out_offset + ptr_array_size;
     layout.total_size = layout.stride_out_offset + stride_array_size;
     return layout;
@@ -1781,7 +1674,16 @@ void sm120_two_gemm_gated_fc1_kernelLauncher(
   hw_info.device_id = 0;
   hw_info.sm_count = multi_processor_count;
 
-  // Gate offsets
+  // Weight packing note (vLLM CUTLASS MoE):
+  // w1 is packed as [gate; up] along the output-N dimension (2*inter_size).
+  // SwiGLU expects: out = SiLU(gate) * up.
+  //
+  // Therefore:
+  // - First half (base)  : gate
+  // - Second half (+off) : up
+  //
+  // This two-GEMM bringup must compute UP first (to feed as C), then compute
+  // GATE in the accumulator and fuse: D = C * SiLU(acc_gate).
   int64_t const k_blocks = (hidden_size + 31) / 32;
   int64_t const gate_weight_bytes = (inter_size * hidden_size) / 2;
   int64_t const gate_sf_elems = inter_size * k_blocks;
@@ -1816,6 +1718,8 @@ void sm120_two_gemm_gated_fc1_kernelLauncher(
   static_assert(sizeof(StrideDVal) == sizeof(std::remove_pointer_t<typename GateNS::StrideD>),
                 "StrideD value types must match between linear and gate GEMMs");
   using StrideCVal = std::remove_pointer_t<typename GateNS::StrideC>;
+  static_assert(sizeof(StrideCVal) == sizeof(StrideDVal),
+                "Two-GEMM bringup assumes StrideCVal matches StrideDVal");
 
   auto ws_layout =
       TwoGemmFC1WorkspaceLayout::compute<StrideDVal>(base_ws, num_experts, sizeof(StrideCVal));
@@ -1839,7 +1743,6 @@ void sm120_two_gemm_gated_fc1_kernelLauncher(
   auto** ptr_linear_c =
       reinterpret_cast<cutlass::bfloat16_t const**>(ws_base + ws_layout.ptr_linear_c_offset);
   auto* stride_linear = reinterpret_cast<StrideDVal*>(ws_base + ws_layout.stride_linear_offset);
-  auto* stride_c = reinterpret_cast<StrideCVal*>(ws_base + ws_layout.stride_c_offset);
   auto** ptr_out = reinterpret_cast<cutlass::bfloat16_t**>(ws_base + ws_layout.ptr_out_offset);
   auto* stride_out = reinterpret_cast<StrideDVal*>(ws_base + ws_layout.stride_out_offset);
 
@@ -1851,7 +1754,7 @@ void sm120_two_gemm_gated_fc1_kernelLauncher(
         tma_inputs.shape_info.problem_shapes, num_experts, inter_size);
   }
 
-  // Compute pointer arrays and gate pointers.
+  // Compute pointer arrays and "up" (second-half) pointers.
   {
     int threads = 128;
     int blocks = (num_experts + threads - 1) / threads;
@@ -1860,21 +1763,191 @@ void sm120_two_gemm_gated_fc1_kernelLauncher(
         ptr_linear, stride_linear, expert_first_token_offset, inter_size, num_experts);
     computeOutputPointersAndStridesConst<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<cutlass::bfloat16_t*>(linear_output),
-        ptr_linear_c, stride_c, expert_first_token_offset, inter_size, num_experts);
+        ptr_linear_c, stride_linear, expert_first_token_offset, inter_size, num_experts);
     computeOutputPointersAndStrides<<<blocks, threads, 0, stream>>>(
         reinterpret_cast<cutlass::bfloat16_t*>(swiglu_output),
         ptr_out, stride_out, expert_first_token_offset, inter_size, num_experts);
     computeGateWeightAndSfPointers<<<blocks, threads, 0, stream>>>(
         tma_inputs.ptr_weight,
-        ptr_weight_gate,
+        ptr_weight_gate,  // NOTE: this is the UP half (second half)
         tma_inputs.fpX_block_scaling_factors_weight,
-        sf_gate,
+        sf_gate,          // NOTE: this is the UP half (second half)
         gate_weight_bytes, gate_sf_elems, num_experts);
   }
 
-  // 1) Linear GEMM: A @ W_linear -> linear_output
+  // The bringup path uses device-side pointer/stride kernels and then calls into
+  // CUTLASS initialize() on host. Per the Layer 1A plan (and prior observed
+  // segfault/garbage), we must ensure these kernels have completed before any
+  // host-side reads of device pointer arrays.
+  //
+  // Keep the stronger sync optional for perf experiments, but default to ON
+  // in bringup because correctness > performance here.
+  auto env_flag = [](char const* name) -> bool {
+    // Treat unset, empty, or "0" as false. Any other value enables the flag.
+    char const* v = std::getenv(name);
+    return (v != nullptr) && (v[0] != '\0') && (v[0] != '0');
+  };
+  const bool dbg_no_sync = env_flag("FLASHINFER_GATED_FC1_NO_SYNC");
+  auto is_stream_capturing = [&]() -> bool {
+    cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+    cudaError_t cap_err = cudaStreamIsCapturing(stream, &cap_status);
+    // If query fails, be conservative and assume we're not capturing.
+    if (cap_err != cudaSuccess) {
+      return false;
+    }
+    return cap_status != cudaStreamCaptureStatusNone;
+  }();
+  if (!dbg_no_sync && !is_stream_capturing) {
+    cudaError_t sync_err = cudaStreamSynchronize(stream);
+    if (sync_err != cudaSuccess) {
+      TLLM_THROW("SM120 two-GEMM gated FC1: sync after pointer kernels failed: %s",
+                 cudaGetErrorString(sync_err));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Instrumentation: validate bringup assumptions against Layer 1A plan.
+  //
+  // This bringup path relies on a set of invariants that, if violated, can
+  // produce *finite but garbage* output:
+  //   - Gate pointers must equal linear pointers + (inter_size * hidden_size)/2 bytes
+  //   - Gate SF pointers must equal linear SF pointers + inter_size * ceil(hidden_size/32) elems
+  //   - Per-expert output pointers must equal base + expert_first_token_offset[e] * inter_size
+  //   - CUTLASS initialize() must not observe partially-written pointer arrays
+  //
+  // The original implementation work tracked a real bug where host-side
+  // initialize() observed zero/garbage because device pointer kernels had not
+  // completed. Keep this optional and off by default.
+  // ---------------------------------------------------------------------------
+  const bool dbg_sync = env_flag("FLASHINFER_GATED_FC1_DEBUG_SYNC");
+  const bool dbg_validate = env_flag("FLASHINFER_GATED_FC1_DEBUG_VALIDATE_PTRS");
+  const bool dbg_validate_effective = (dbg_validate && !is_stream_capturing);
+  const bool dbg_sync_effective = (dbg_sync && !is_stream_capturing);
+  if ((dbg_sync_effective || dbg_validate_effective)) {
+    // Make sure the pointer/shape update kernels have completed before any
+    // host-side CUTLASS initialize() that may read device pointer arrays.
+    cudaError_t sync_err = cudaStreamSynchronize(stream);
+    if (sync_err != cudaSuccess) {
+      TLLM_LOG_WARNING(
+          "[SM120 two-GEMM gated FC1] cudaStreamSynchronize failed: %s",
+          cudaGetErrorString(sync_err));
+    }
+  }
+  if (dbg_validate && is_stream_capturing) {
+    // NOTE: cudaMemcpy(...DeviceToHost) and host synchronizes are not permitted
+    // during CUDA graph capture. Skip validation to avoid invalidating capture.
+    TLLM_LOG_WARNING(
+        "[SM120 two-GEMM gated FC1][DBG] skipping pointer validation during CUDA graph capture");
+  }
+  if (dbg_validate_effective) {
+    // Copy a few device pointer values back to host and validate arithmetic.
+    // NOTE: We only validate pointer values / offsets. We never dereference
+    // device pointers on host.
+    constexpr int kCheck = 4;
+    void const* h_gate_w[kCheck] = {nullptr};
+    void const* h_gate_sf[kCheck] = {nullptr};
+    void const* h_w_lin[kCheck] = {nullptr};
+    void const* h_sf_lin[kCheck] = {nullptr};
+    void const* h_lin_out[kCheck] = {nullptr};
+    void const* h_lin_c[kCheck] = {nullptr};
+    void const* h_out[kCheck] = {nullptr};
+    int64_t h_offsets[kCheck + 1] = {0};
+
+    cudaMemcpy(h_gate_w, ptr_weight_gate, sizeof(void*) * kCheck, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_gate_sf, sf_gate, sizeof(void*) * kCheck, cudaMemcpyDeviceToHost);
+    // Base weight pointers (linear half) and scaling-factor pointers.
+    // These are the reference for validating ptr_weight_gate / sf_gate arithmetic.
+    cudaMemcpy(h_w_lin, tma_inputs.ptr_weight, sizeof(void*) * kCheck, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_sf_lin, tma_inputs.fpX_block_scaling_factors_weight, sizeof(void*) * kCheck,
+               cudaMemcpyDeviceToHost);
+    // Linear output pointers (D pointers) and the alias used as C for the gate GEMM.
+    cudaMemcpy(h_lin_out, ptr_linear, sizeof(void*) * kCheck, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_lin_c, ptr_linear_c, sizeof(void*) * kCheck, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_out, ptr_out, sizeof(void*) * kCheck, cudaMemcpyDeviceToHost);
+    cudaMemcpy(h_offsets, expert_first_token_offset, sizeof(int64_t) * (kCheck + 1),
+               cudaMemcpyDeviceToHost);
+
+    TLLM_LOG_WARNING(
+        "[SM120 two-GEMM gated FC1][DBG] inter=%ld hidden=%ld k_blocks=%ld gate_weight_bytes=%ld gate_sf_elems=%ld",
+        (long)inter_size, (long)hidden_size, (long)k_blocks,
+        (long)gate_weight_bytes, (long)gate_sf_elems);
+    for (int i = 0; i < kCheck; ++i) {
+      auto w_lin = reinterpret_cast<uintptr_t>(h_w_lin[i]);
+      auto gate = reinterpret_cast<uintptr_t>(h_gate_w[i]);
+      auto gate_sf = reinterpret_cast<uintptr_t>(h_gate_sf[i]);
+      auto lin_out = reinterpret_cast<uintptr_t>(h_lin_out[i]);
+      auto lin_c = reinterpret_cast<uintptr_t>(h_lin_c[i]);
+      auto out = reinterpret_cast<uintptr_t>(h_out[i]);
+      int64_t tok0 = h_offsets[i];
+      int64_t tok1 = h_offsets[i + 1];
+
+      if (h_w_lin[i] == nullptr || h_out[i] == nullptr) {
+        TLLM_LOG_WARNING(
+            "[SM120 two-GEMM gated FC1][DBG] expert[%d] NULL ptrs: w_lin=%p out=%p gate=%p gate_sf=%p sf_lin=%p",
+            i, h_w_lin[i], h_out[i], h_gate_w[i], h_gate_sf[i], h_sf_lin[i]);
+      }
+      if (gate != w_lin + (uintptr_t)gate_weight_bytes) {
+        TLLM_LOG_WARNING(
+            "[SM120 two-GEMM gated FC1][DBG] expert[%d] up ptr mismatch: up=%p gate(base)=%p (delta=%ld expected=%ld)",
+            i, (void*)gate, (void*)w_lin,
+            (long)(gate - w_lin), (long)gate_weight_bytes);
+      }
+      // Gate SF pointer arithmetic is in elements. Validate delta in elements matches expected.
+      if (h_gate_sf[i] == nullptr) {
+        TLLM_LOG_WARNING("[SM120 two-GEMM gated FC1][DBG] expert[%d] gate_sf is NULL", i);
+      }
+      if (h_sf_lin[i] == nullptr) {
+        TLLM_LOG_WARNING("[SM120 two-GEMM gated FC1][DBG] expert[%d] sf_lin is NULL", i);
+      }
+      if (h_gate_sf[i] != nullptr && h_sf_lin[i] != nullptr) {
+        auto sf_lin_addr = reinterpret_cast<uintptr_t>(h_sf_lin[i]);
+        auto sf_gate_addr = reinterpret_cast<uintptr_t>(h_gate_sf[i]);
+        int64_t sf_delta_elems =
+            (int64_t)((sf_gate_addr - sf_lin_addr) / sizeof(TmaWarpSpecializedGroupedGemmInput::ElementSF));
+        if (sf_delta_elems != gate_sf_elems) {
+          TLLM_LOG_WARNING(
+              "[SM120 two-GEMM gated FC1][DBG] expert[%d] up_sf delta mismatch: up_sf=%p gate_sf(base)=%p (delta_elems=%ld expected=%ld)",
+              i, h_gate_sf[i], h_sf_lin[i], (long)sf_delta_elems, (long)gate_sf_elems);
+        }
+      }
+      // Validate that linear C pointer array matches linear output pointer array.
+      // Validate that linear C pointer array matches linear output pointer array.
+      if (lin_c != lin_out) {
+        TLLM_LOG_WARNING(
+            "[SM120 two-GEMM gated FC1][DBG] expert[%d] ptr_linear_c != ptr_linear: c=%p lin=%p",
+            i, (void*)lin_c, (void*)lin_out);
+      }
+      // Validate linear output pointer offset against expert_first_token_offset (same as swiglu out).
+      auto expected_lin_out = reinterpret_cast<uintptr_t>(linear_output) +
+                              (uintptr_t)tok0 * (uintptr_t)inter_size * sizeof(cutlass::bfloat16_t);
+      if (lin_out != expected_lin_out) {
+        TLLM_LOG_WARNING(
+            "[SM120 two-GEMM gated FC1][DBG] expert[%d] linear out ptr mismatch: lin_out=%p expected=%p (tok0=%ld tok1=%ld)",
+            i, (void*)lin_out, (void*)expected_lin_out, (long)tok0, (long)tok1);
+      }
+      // Validate output pointer offset against expert_first_token_offset.
+      auto expected_out = reinterpret_cast<uintptr_t>(swiglu_output) +
+                          (uintptr_t)tok0 * (uintptr_t)inter_size * sizeof(cutlass::bfloat16_t);
+      if (out != expected_out) {
+        TLLM_LOG_WARNING(
+            "[SM120 two-GEMM gated FC1][DBG] expert[%d] out ptr mismatch: out=%p expected=%p (tok0=%ld tok1=%ld)",
+            i, (void*)out, (void*)expected_out, (long)tok0, (long)tok1);
+      }
+      // Quick monotonicity check for offsets.
+      if (tok1 < tok0) {
+        TLLM_LOG_WARNING(
+            "[SM120 two-GEMM gated FC1][DBG] expert[%d] offsets not monotonic: %ld -> %ld",
+            i, (long)tok0, (long)tok1);
+      }
+    }
+  }
+
+  // 1) UP GEMM (second half): A @ W_up -> linear_output (used as epilogue source C)
   {
     auto tma_linear = tma_inputs;
+    // Use UP (second half) weights + SFs.
+    tma_linear.ptr_weight = ptr_weight_gate;
+    tma_linear.fpX_block_scaling_factors_weight = sf_gate;
     tma_linear.ptr_d = reinterpret_cast<void**>(ptr_linear);
     tma_linear.stride_d = reinterpret_cast<void*>(stride_linear);
     // No C source
@@ -1887,37 +1960,80 @@ void sm120_two_gemm_gated_fc1_kernelLauncher(
         tma_linear, num_experts, multi_processor_count, stream, nullptr, nullptr);
   }
 
-  // 2) Gate GEMM with fused SwiGLU epilogue: D = C * SiLU(alpha * acc_gate)
+  // 2) GATE GEMM (first half, base) with fused SwiGLU epilogue:
+  //    D = C(up) * SiLU(acc_gate)
   {
     auto tma_gate = tma_inputs;
-    // Swap weights + SFB pointers to gate half
-    tma_gate.ptr_weight = ptr_weight_gate;
-    tma_gate.fpX_block_scaling_factors_weight = sf_gate;
-    // Provide C (linear) and D (SwiGLU BF16)
+    // NOTE: For gate we use the BASE (first half) weights + SFs from tma_inputs.
+    // Provide C (linear) and D (SwiGLU BF16).
+    // IMPORTANT: avoid const-qualification casts by using a dedicated const** pointer array.
+    // Also alias C stride to D stride to avoid layout/tuple-order mismatches.
     tma_gate.ptr_c = reinterpret_cast<void const**>(ptr_linear_c);
-    tma_gate.stride_c = reinterpret_cast<void*>(stride_c);
+    tma_gate.stride_c = reinterpret_cast<void*>(stride_linear);
     tma_gate.ptr_d = reinterpret_cast<void**>(ptr_out);
     tma_gate.stride_d = reinterpret_cast<void*>(stride_out);
 
     // Build and run gate GEMM directly using the SwigluMul epilogue types.
+    //
+    // IMPORTANT: Match the standard SM120 launcher’s handling of stride/layout
+    // objects. Depending on the CUTLASS kernel specialization, these may be:
+    // - pointer types (device pointers passed through), or
+    // - value types stored in host-accessible memory (dereferenced here).
+    // Getting this wrong produces finite-but-garbage outputs.
+    auto strideA_arg = [&]() -> typename GateNS::StrideA {
+      if constexpr (std::is_pointer_v<typename GateNS::StrideA>) {
+        return reinterpret_cast<typename GateNS::StrideA>(tma_gate.stride_act);
+      } else {
+        return *reinterpret_cast<typename GateNS::StrideA const*>(tma_gate.stride_act);
+      }
+    }();
+    auto strideB_arg = [&]() -> typename GateNS::StrideB {
+      if constexpr (std::is_pointer_v<typename GateNS::StrideB>) {
+        return reinterpret_cast<typename GateNS::StrideB>(tma_gate.stride_weight);
+      } else {
+        return *reinterpret_cast<typename GateNS::StrideB const*>(tma_gate.stride_weight);
+      }
+    }();
+    auto strideC_arg = [&]() -> typename GateNS::StrideC {
+      if constexpr (std::is_pointer_v<typename GateNS::StrideC>) {
+        return reinterpret_cast<typename GateNS::StrideC>(tma_gate.stride_c);
+      } else {
+        return *reinterpret_cast<typename GateNS::StrideC const*>(tma_gate.stride_c);
+      }
+    }();
+    auto layoutSFA_arg = [&]() -> typename GateNS::LayoutSFA {
+      if constexpr (std::is_pointer_v<typename GateNS::LayoutSFA>) {
+        return reinterpret_cast<typename GateNS::LayoutSFA>(tma_gate.fpX_block_scaling_factors_stride_act);
+      } else {
+        return *reinterpret_cast<typename GateNS::LayoutSFA const*>(tma_gate.fpX_block_scaling_factors_stride_act);
+      }
+    }();
+    auto layoutSFB_arg = [&]() -> typename GateNS::LayoutSFB {
+      if constexpr (std::is_pointer_v<typename GateNS::LayoutSFB>) {
+        return reinterpret_cast<typename GateNS::LayoutSFB>(tma_gate.fpX_block_scaling_factors_stride_weight);
+      } else {
+        return *reinterpret_cast<typename GateNS::LayoutSFB const*>(tma_gate.fpX_block_scaling_factors_stride_weight);
+      }
+    }();
+
     GateNS::Gemm gemm;
     typename GateNS::Gemm::Arguments arguments = {
         cutlass::gemm::GemmUniversalMode::kGrouped,
         tma_gate.shape_info,
         {
           reinterpret_cast<typename GateNS::CollectiveMainloop::ElementA const**>(tma_gate.ptr_act),
-          reinterpret_cast<typename GateNS::StrideA>(tma_gate.stride_act),
+          strideA_arg,
           reinterpret_cast<typename GateNS::CollectiveMainloop::ElementB const**>(tma_gate.ptr_weight),
-          reinterpret_cast<typename GateNS::StrideB>(tma_gate.stride_weight),
+          strideB_arg,
           reinterpret_cast<typename GateNS::CollectiveMainloop::ElementSF const**>(tma_gate.fpX_block_scaling_factors_act),
-          reinterpret_cast<typename GateNS::LayoutSFA>(tma_gate.fpX_block_scaling_factors_stride_act),
+          layoutSFA_arg,
           reinterpret_cast<typename GateNS::CollectiveMainloop::ElementSF const**>(tma_gate.fpX_block_scaling_factors_weight),
-          reinterpret_cast<typename GateNS::LayoutSFB>(tma_gate.fpX_block_scaling_factors_stride_weight),
+          layoutSFB_arg,
         },
         {
           {}, // fusion args (alpha is set below)
           reinterpret_cast<typename GateNS::ElementC const**>(tma_gate.ptr_c),
-          reinterpret_cast<typename GateNS::StrideC>(tma_gate.stride_c),
+          strideC_arg,
           reinterpret_cast<typename GateNS::ElementD**>(tma_gate.ptr_d),
           reinterpret_cast<typename GateNS::StrideD>(tma_gate.stride_d),
         },
@@ -1941,6 +2057,19 @@ void sm120_two_gemm_gated_fc1_kernelLauncher(
     }
   }
 
+  // Restore the original grouped problem shape N (FC1 output dim) after bringup.
+  //
+  // Layer 1A bringup temporarily sets N=inter_size so each GEMM computes [M, inter_size].
+  // The owning fused-MoE call graph may reuse the same device-side problem_shapes buffer
+  // for subsequent GEMMs. Leaving it mutated can poison later GEMMs and produce
+  // "finite garbage" outputs.
+  {
+    int threads = 128;
+    int blocks = (num_experts + threads - 1) / threads;
+    setProblemShapesN<<<blocks, threads, 0, stream>>>(
+        tma_inputs.shape_info.problem_shapes, num_experts, inter_size * 2);
+  }
+
   if (occupancy != nullptr) {
     *occupancy = 1;
   }
@@ -1948,19 +2077,33 @@ void sm120_two_gemm_gated_fc1_kernelLauncher(
 
 #endif  // CUTLASS_ARCH_MMA_SM12x_SUPPORTED && ENABLE_FP4 && FLASHINFER_GATED_FC1_TWO_GEMM_BRINGUP
 
+// setProblemShapesN for the fused gated FC1 path.
+// (The two-GEMM bringup path defines its own copy above under a separate guard.)
+#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4) && defined(FLASHINFER_GATED_FC1) && !defined(FLASHINFER_GATED_FC1_TWO_GEMM_BRINGUP)
+__global__ void setProblemShapesN(
+    cutlass::gemm::GroupProblemShape<cute::Shape<int64_t, int64_t, int64_t>>::UnderlyingProblemShape* problem_shapes,
+    int num_experts,
+    int64_t new_n) {
+  int e = threadIdx.x + blockIdx.x * blockDim.x;
+  if (e >= num_experts) return;
+  auto ps = problem_shapes[e];
+  cute::get<1>(ps) = new_n;
+  problem_shapes[e] = ps;
+}
+#endif  // FLASHINFER_GATED_FC1 && !FLASHINFER_GATED_FC1_TWO_GEMM_BRINGUP
+
 template <typename T, typename WeightType, typename OutputType, typename EpilogueTag,
           typename TileShape, typename ClusterShape, bool IsMXFP4>
 void sm120_gated_fc1_moe_gemm_kernelLauncher(
     TmaWarpSpecializedGroupedGemmInput tma_inputs,
-    void* aux_output,           // [M, inter_size] BF16 output buffer
-    int64_t const* expert_first_token_offset,  // [num_experts+1] token offsets per expert
     int64_t inter_size,
     int64_t hidden_size,
     int num_experts,
-    int multi_processor_count, 
-    cudaStream_t stream, 
+    int multi_processor_count,
+    cudaStream_t stream,
     int* occupancy,
-    size_t* workspace_size) {
+    size_t* workspace_size,
+    GatedFC1SwigluParams swiglu_params) {
   TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
 #if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4) && defined(FLASHINFER_GATED_FC1)
@@ -1974,8 +2117,18 @@ void sm120_gated_fc1_moe_gemm_kernelLauncher(
       "SM120 Gated FC1 requires inter_size divisible by 32 (SF_VEC_SIZE)");
   TLLM_CHECK_WITH_INFO(!tma_inputs.swap_ab,
       "SM120 Gated FC1 does not support swap_ab mode");
-  TLLM_CHECK_WITH_INFO(expert_first_token_offset != nullptr,
-      "SM120 Gated FC1 requires expert_first_token_offset");
+
+  // Gated FC1 extension must be pre-populated by the upstream stride kernel
+  TLLM_CHECK_WITH_INFO(tma_inputs.gated_fc1.enabled,
+      "SM120 Gated FC1: gated_fc1 extension not enabled (was setupTmaWarpSpecializedInputs called?)");
+  TLLM_CHECK_WITH_INFO(tma_inputs.gated_fc1.ptr_weight_gate != nullptr,
+      "SM120 Gated FC1: ptr_weight_gate is null");
+  TLLM_CHECK_WITH_INFO(tma_inputs.gated_fc1.sf_gate != nullptr,
+      "SM120 Gated FC1: sf_gate is null");
+  TLLM_CHECK_WITH_INFO(tma_inputs.gated_fc1.ptr_output != nullptr,
+      "SM120 Gated FC1: ptr_output is null");
+  TLLM_CHECK_WITH_INFO(tma_inputs.gated_fc1.stride_output != nullptr,
+      "SM120 Gated FC1: stride_output is null");
 
   // Use gated namespace
   using namespace sm120_mxfp4_bf16_gated;
@@ -1989,166 +2142,57 @@ void sm120_gated_fc1_moe_gemm_kernelLauncher(
   hw_info.device_id = 0;
   hw_info.sm_count = multi_processor_count;
 
-  // Compute gate weight and scale factor offsets
-  int64_t const k_blocks = (hidden_size + 31) / 32;  // ceil(K/32)
-  int64_t const gate_weight_bytes = (inter_size * hidden_size) / 2;  // FP4: 2 elements/byte
-  int64_t const gate_sf_elems = inter_size * k_blocks;
-
   // Alignment check (debug)
+  int64_t const gate_weight_bytes = (inter_size * hidden_size) / 2;  // FP4: 2 elements/byte
   TLLM_CHECK_WITH_INFO(gate_weight_bytes % 16 == 0,
       "SM120 Gated FC1: gate weight offset must be 16-byte aligned for TMA");
 
-  TLLM_LOG_DEBUG("[SM120 Gated FC1] Gate offsets: weight=%ld bytes, SF=%ld elements",
-      (long)gate_weight_bytes, (long)gate_sf_elems);
-
   // Workspace size query
   if (workspace_size != nullptr) {
-    // Query base GEMM workspace size
-    // Epilogue args from CollectiveBuilder: {FusionArgs, ptr_C, ptr_D, strides...}
-    typename Gemm::Arguments ws_arguments = {
-        cutlass::gemm::GemmUniversalMode::kGrouped,
-        tma_inputs.shape_info,
-        // Mainloop args (placeholders)
-        {nullptr, StrideA{}, nullptr, StrideB{}, nullptr, LayoutSFA{}, nullptr, LayoutSFB{},
-         nullptr, StrideAux{}, nullptr, LayoutSFAux{}},
-        // Epilogue args (CollectiveBuilder format: {FusionArgs, ptr_C, ptr_D, strides})
-        {{}, nullptr, nullptr, nullptr, StrideD{}},
-        hw_info};
+    typename Gemm::Arguments ws_arguments{};
+    ws_arguments.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
+    ws_arguments.problem_shape = tma_inputs.shape_info;
+    // mainloop/epilogue fields left default-initialized (placeholders)
     ws_arguments.epilogue.thread.alpha = 1.0f;
     ws_arguments.epilogue.thread.beta = 0.0f;
-    size_t base_gemm_ws = gemm.get_workspace_size(ws_arguments);
-    
-    // Add space for gate pointer arrays + output pointer/stride arrays
-    // StrideD is std::remove_pointer_t of the epilogue stride type
-    using StrideDVal = std::remove_pointer_t<StrideD>;
-    auto layout = GatedFC1WorkspaceLayout::compute(base_gemm_ws, num_experts, sizeof(StrideDVal));
-    *workspace_size = layout.total_size;
-    
-    TLLM_LOG_DEBUG("[SM120 Gated FC1] workspace_size=%zu (gemm=%zu, ptr_arrays=%zu)",
-        layout.total_size, base_gemm_ws, layout.total_size - base_gemm_ws);
+    ws_arguments.hw_info = hw_info;
+    *workspace_size = gemm.get_workspace_size(ws_arguments);
+    TLLM_LOG_DEBUG("[SM120 Gated FC1] workspace_size=%zu", *workspace_size);
     return;
   }
 
   // Validate inputs
   TLLM_CHECK_WITH_INFO(tma_inputs.stride_act != nullptr, "SM120 Gated FC1: stride_act is null");
   TLLM_CHECK_WITH_INFO(tma_inputs.stride_weight != nullptr, "SM120 Gated FC1: stride_weight is null");
-  TLLM_CHECK_WITH_INFO(tma_inputs.stride_d != nullptr, "SM120 Gated FC1: stride_d is null");
   TLLM_CHECK_WITH_INFO(tma_inputs.gemm_workspace != nullptr, "SM120 Gated FC1: workspace is null");
-  TLLM_CHECK_WITH_INFO(aux_output != nullptr, "SM120 Gated FC1: aux_output is null");
 
-  // Compute workspace layout
-  // StrideD for grouped GEMM epilogue is the element type (value, not pointer)
-  // The epilogue expects StrideD* (array of per-expert strides)
   using StrideDVal = std::remove_pointer_t<StrideD>;
-  size_t base_gemm_ws = 0;
-  {
-    typename Gemm::Arguments ws_arguments = {
-        cutlass::gemm::GemmUniversalMode::kGrouped,
-        tma_inputs.shape_info,
-        {nullptr, StrideA{}, nullptr, StrideB{}, nullptr, LayoutSFA{}, nullptr, LayoutSFB{},
-         nullptr, StrideAux{}, nullptr, LayoutSFAux{}},
-        // Epilogue args (CollectiveBuilder format)
-        {{}, nullptr, nullptr, nullptr, StrideD{}},
-        hw_info};
-    ws_arguments.epilogue.thread.alpha = 1.0f;
-    ws_arguments.epilogue.thread.beta = 0.0f;
-    base_gemm_ws = gemm.get_workspace_size(ws_arguments);
-  }
-  auto ws_layout = GatedFC1WorkspaceLayout::compute(base_gemm_ws, num_experts, sizeof(StrideDVal));
-  
-  // Carve workspace for all pointer/stride arrays
-  char* ws_base = reinterpret_cast<char*>(tma_inputs.gemm_workspace);
-  void* gemm_workspace = ws_base + ws_layout.gemm_workspace_offset;
-  void const** ptr_weight_gate = reinterpret_cast<void const**>(ws_base + ws_layout.ptr_weight_gate_offset);
-  
-  // Scale factor pointer array (TmaInput ElementSF type)
+
+  // Gate weight/SF pointers and gated output pointers/strides are pre-computed
+  // by the upstream computeStridesTmaWarpSpecializedKernel - no separate device
+  // kernel or cudaStreamSynchronize needed here. This preserves CUDA graph compatibility.
+  void const** ptr_weight_gate = tma_inputs.gated_fc1.ptr_weight_gate;
   using TmaElementSF = TmaWarpSpecializedGroupedGemmInput::ElementSF;
   using MainloopElementSF = typename CollectiveMainloop::ElementSF;
   static_assert(sizeof(TmaElementSF) == sizeof(MainloopElementSF), "ElementSF size mismatch");
-  TmaElementSF const** sf_gate = reinterpret_cast<TmaElementSF const**>(ws_base + ws_layout.sf_gate_offset);
-  
-  // Aux output pointer and stride arrays (for grouped GEMM epilogue)
-  ElementOutput** ptr_aux_output = reinterpret_cast<ElementOutput**>(ws_base + ws_layout.ptr_aux_output_offset);
-  StrideDVal* stride_aux_output = reinterpret_cast<StrideDVal*>(ws_base + ws_layout.stride_aux_output_offset);
+  TmaElementSF const** sf_gate = tma_inputs.gated_fc1.sf_gate;
+  auto* ptr_gated_output = reinterpret_cast<ElementOutput**>(tma_inputs.gated_fc1.ptr_output);
+  auto* stride_gated_output = reinterpret_cast<StrideDVal*>(tma_inputs.gated_fc1.stride_output);
 
-  TLLM_LOG_DEBUG("[SM120 Gated FC1] Workspace carved: gemm=%p, ptr_gate=%p, sf_gate=%p, ptr_aux=%p, stride_aux=%p",
-      gemm_workspace, ptr_weight_gate, sf_gate, ptr_aux_output, stride_aux_output);
-
-  // Launch kernel to compute gate weight pointers, output pointers, and strides
-  {
-    int threads = std::min(num_experts, 128);
-    int blocks = (num_experts + threads - 1) / threads;
-    
-    // Get problem shapes for stride computation (device pointer)
-    using ProblemShape = typename Gemm::GemmKernel::ProblemShape;
-    auto* problem_shapes = tma_inputs.shape_info.problem_shapes;
-    
-    computeGatedPointersAndStrides<ElementOutput, StrideDVal><<<blocks, threads, 0, stream>>>(
-        // Gate weight inputs/outputs
-        tma_inputs.ptr_weight,
-        ptr_weight_gate,
-        tma_inputs.fpX_block_scaling_factors_weight,
-        sf_gate,
-        gate_weight_bytes,
-        gate_sf_elems,
-        // Aux output inputs/outputs
-        reinterpret_cast<ElementOutput*>(aux_output),
-        ptr_aux_output,
-        stride_aux_output,
-        expert_first_token_offset,
-        inter_size,
-        problem_shapes,
-        num_experts);
-    
-    TLLM_LOG_DEBUG("[SM120 Gated FC1] Launched pointer/stride kernel: blocks=%d, threads=%d", blocks, threads);
-    
-    // Check for kernel launch errors (user suggestion: catch errors early)
-    cudaError_t launch_err = cudaGetLastError();
-    if (launch_err != cudaSuccess) {
-      TLLM_THROW("SM120 Gated FC1: computeGatedPointersAndStrides launch failed: %s",
-                 cudaGetErrorString(launch_err));
-    }
-    
-    // Synchronize to ensure pointer arrays are populated before gemm.initialize()
-    // This is required because gemm.initialize() may access the pointer arrays on host
-    cudaError_t sync_err = cudaStreamSynchronize(stream);
-    if (sync_err != cudaSuccess) {
-      TLLM_THROW("SM120 Gated FC1: sync after pointer kernel failed: %s",
-                 cudaGetErrorString(sync_err));
-    }
-    TLLM_LOG_DEBUG("[SM120 Gated FC1] Pointer/stride kernel completed successfully");
-    
-    // Debug: verify gate pointers are non-null (copy first pointer back to host)
-    {
-      void const* host_gate_ptr = nullptr;
-      cudaMemcpy(&host_gate_ptr, ptr_weight_gate, sizeof(void*), cudaMemcpyDeviceToHost);
-      TmaElementSF const* host_sf_ptr = nullptr;
-      cudaMemcpy(&host_sf_ptr, sf_gate, sizeof(void*), cudaMemcpyDeviceToHost);
-      TLLM_LOG_DEBUG("[SM120 Gated FC1] Gate pointers after kernel: ptr_gate[0]=%p, sf_gate[0]=%p",
-          host_gate_ptr, host_sf_ptr);
-      if (host_gate_ptr == nullptr) {
-        TLLM_LOG_WARNING("[SM120 Gated FC1] WARNING: ptr_weight_gate[0] is NULL!");
-      }
-    }
-  }
-
-  // Build GEMM arguments
-  // Note: The gated mainloop expects:
+  // Build GEMM arguments using pre-computed pointer arrays.
+  // The gated mainloop expects:
   //   - ptr_A: activations (FP8)
   //   - ptr_B: linear weights (FP4)
-  //   - ptr_Aux: gate weights (FP4) - computed by offset kernel
+  //   - ptr_Aux: gate weights (FP4)
   //   - ptr_SFA: activation scale factors
   //   - ptr_SFB: linear weight scale factors
-  //   - ptr_SFAux: gate weight scale factors - computed by offset kernel
-  
+  //   - ptr_SFAux: gate weight scale factors
+
   // Input strides: handle both pointer and value types (matches non-gated launcher pattern)
-  // IMPORTANT: If stride type is a pointer, pass device pointer directly.
-  // If stride type is a value, we need to copy from device to host first.
   auto stride_a = [&]() -> StrideA {
     if constexpr (std::is_pointer_v<StrideA>) {
       return reinterpret_cast<StrideA>(tma_inputs.stride_act);
     } else {
-      // For value types, copy stride from device to host
       StrideA host_stride{};
       cudaMemcpy(&host_stride, tma_inputs.stride_act, sizeof(StrideA), cudaMemcpyDeviceToHost);
       return host_stride;
@@ -2172,7 +2216,7 @@ void sm120_gated_fc1_moe_gemm_kernelLauncher(
       return host_stride;
     }
   }();
-  
+
   auto layout_sfa = [&]() -> LayoutSFA {
     if constexpr (std::is_pointer_v<LayoutSFA>) {
       return reinterpret_cast<LayoutSFA>(tma_inputs.fpX_block_scaling_factors_stride_act);
@@ -2193,63 +2237,72 @@ void sm120_gated_fc1_moe_gemm_kernelLauncher(
   }();
   auto layout_sfaux = layout_sfb;  // Gate SFs have same layout as linear weights
 
-  // Type-safety checks for pointer arrays (user guidance point 5)
-  // Verify we're passing the correct pointer types to epilogue
+  // Type-safety checks
   using EpilogueElementD = typename CollectiveEpilogue::ElementD;
-  using EpilogueStrideD = typename CollectiveEpilogue::StrideD;
   static_assert(std::is_same_v<ElementOutput, EpilogueElementD>,
                 "ElementOutput must match CollectiveEpilogue::ElementD");
-  // Note: StrideD types may differ between internal (StrideDVal) and epilogue (EpilogueStrideD)
-  // but should be compatible for grouped GEMM output storage
   static_assert(std::is_trivially_copyable_v<StrideDVal>,
                 "StrideDVal must be trivially copyable");
 
-  typename Gemm::Arguments arguments = {
-      cutlass::gemm::GemmUniversalMode::kGrouped,
-      tma_inputs.shape_info,
-      // Mainloop args - cast scale factor pointers to mainloop types
-      {
-        reinterpret_cast<typename CollectiveMainloop::ElementA const**>(tma_inputs.ptr_act),
-        stride_a,
-        reinterpret_cast<typename CollectiveMainloop::ElementB const**>(tma_inputs.ptr_weight),
-        stride_b,
-        reinterpret_cast<MainloopElementSF const**>(tma_inputs.fpX_block_scaling_factors_act),
-        layout_sfa,
-        reinterpret_cast<MainloopElementSF const**>(tma_inputs.fpX_block_scaling_factors_weight),
-        layout_sfb,
-        // Gated extension: Aux pointers (gate weights)
-        reinterpret_cast<typename CollectiveMainloop::ElementAux const**>(ptr_weight_gate),
-        stride_aux,
-        reinterpret_cast<MainloopElementSF const**>(sf_gate),
-        layout_sfaux
-      },
-      // Epilogue args (CollectiveBuilder format: {thread_args, ptr_C, stride_C, ptr_D, stride_D})
-      // For grouped GEMM: ptr_D and stride_D are DEVICE POINTERS to per-expert arrays
-      {
-        {},  // thread args (will set alpha/beta below)
-        nullptr,  // ptr_C (not used)
-        nullptr,  // stride_C (not used)
-        ptr_aux_output,  // ptr_D: device pointer to [num_experts] array of output pointers
-        stride_aux_output  // stride_D: device pointer to [num_experts] array of output strides
-      },
-      hw_info
-  };
-  
-  // Set fusion params (alpha=1, beta=0 for passthrough)
+  // The upstream computeStridesTmaWarpSpecializedKernel writes per-expert shapes
+  // with N = gemm1_n = 2 * inter_size (the full FC1 weight width).  But the gated
+  // kernel runs two GEMMs (B and Aux), each with N = inter_size.  Fix in-place,
+  // matching the pattern used by the two-GEMM fallback launcher.
+  {
+    int threads = 128;
+    int blocks = (num_experts + threads - 1) / threads;
+    setProblemShapesN<<<blocks, threads, 0, stream>>>(
+        tma_inputs.shape_info.problem_shapes, num_experts, inter_size);
+  }
+
+  // Build Gemm::Arguments using field-by-field assignment.
+  // Aggregate brace-init of the outer struct triggers brace-elision issues with
+  // CUTLASS's deeply nested template types (StrideA, LayoutSFA, SwigluBiasParams).
+  // Field-by-field is the pattern used by CUTLASS examples for complex argument types.
+  typename Gemm::Arguments arguments{};
+  arguments.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
+  arguments.problem_shape = tma_inputs.shape_info;
+  // Mainloop args
+  arguments.mainloop.ptr_A   = reinterpret_cast<typename CollectiveMainloop::ElementA const**>(tma_inputs.ptr_act);
+  arguments.mainloop.dA      = stride_a;
+  arguments.mainloop.ptr_B   = reinterpret_cast<typename CollectiveMainloop::ElementB const**>(tma_inputs.ptr_weight);
+  arguments.mainloop.dB      = stride_b;
+  arguments.mainloop.ptr_SFA = reinterpret_cast<MainloopElementSF const**>(tma_inputs.fpX_block_scaling_factors_act);
+  arguments.mainloop.layout_SFA = layout_sfa;
+  arguments.mainloop.ptr_SFB = reinterpret_cast<MainloopElementSF const**>(tma_inputs.fpX_block_scaling_factors_weight);
+  arguments.mainloop.layout_SFB = layout_sfb;
+  // Gated extension: Aux pointers (gate weights) - pre-computed upstream
+  arguments.mainloop.ptr_Aux  = reinterpret_cast<typename CollectiveMainloop::ElementAux const**>(ptr_weight_gate);
+  arguments.mainloop.dAux     = stride_aux;
+  arguments.mainloop.ptr_SFAux = reinterpret_cast<MainloopElementSF const**>(sf_gate);
+  arguments.mainloop.layout_SFAux = layout_sfaux;
+  // SwigluBias activation parameters (assign fields directly to work around
+  // nvcc limitation with copy-assignment of nested structs in deep templates)
+  arguments.mainloop.swiglu.d_alpha = swiglu_params.d_alpha;
+  arguments.mainloop.swiglu.d_beta  = swiglu_params.d_beta;
+  arguments.mainloop.swiglu.d_limit = swiglu_params.d_limit;
+  // Epilogue args
   arguments.epilogue.thread.alpha = 1.0f;
-  arguments.epilogue.thread.beta = 0.0f;
+  arguments.epilogue.thread.beta  = 0.0f;
+  arguments.epilogue.ptr_D = ptr_gated_output;
+  arguments.epilogue.dD    = stride_gated_output;
+  // Hardware info
+  arguments.hw_info = hw_info;
+
+  TLLM_LOG_DEBUG("[SM120 Gated FC1] SwigluBias device ptrs: alpha=%p, beta=%p, limit=%p",
+      swiglu_params.d_alpha, swiglu_params.d_beta, swiglu_params.d_limit);
 
   // Debug: log key configuration
   TLLM_LOG_DEBUG("[SM120 Gated FC1] Arguments: num_groups=%d, inter_size=%ld, hidden_size=%ld",
       tma_inputs.shape_info.groups(), inter_size, hidden_size);
   TLLM_LOG_DEBUG("[SM120 Gated FC1] Workspace: gemm=%p, ptr_gate=%p, sf_gate=%p",
-      gemm_workspace, ptr_weight_gate, sf_gate);
+      tma_inputs.gemm_workspace, ptr_weight_gate, sf_gate);
   
   // Verify workspace size is sufficient
   size_t required_ws = gemm.get_workspace_size(arguments);
-  TLLM_LOG_DEBUG("[SM120 Gated FC1] Required workspace=%zu, have=%zu", required_ws, base_gemm_ws);
-  TLLM_CHECK_WITH_INFO(base_gemm_ws >= required_ws, 
-      "SM120 Gated FC1: workspace too small (have=%zu, need=%zu)", base_gemm_ws, required_ws);
+  TLLM_LOG_DEBUG("[SM120 Gated FC1] Required workspace=%zu, have=%zu", required_ws, tma_inputs.gemm_workspace_size);
+  TLLM_CHECK_WITH_INFO(tma_inputs.gemm_workspace_size >= required_ws, 
+      "SM120 Gated FC1: workspace too small (have=%zu, need=%zu)", tma_inputs.gemm_workspace_size, required_ws);
   
   // Check can_implement before initialize
   auto can_impl = gemm.can_implement(arguments);
@@ -2302,12 +2355,38 @@ void sm120_gated_fc1_moe_gemm_kernelLauncher(
     printf("Kernel SharedStorageSize:       %8zu B\n", kernel_total);
     printf("Device max SMEM:                %8d B\n", 101376);
     printf("Gap (need to save):             %8zd B\n", (ssize_t)kernel_total - 101376);
+    printf("\n");
+    printf("TMA Transaction Bytes (BASE CLASS):\n");
+    printf("  TmaTransactionBytesMK:        %8u B (A + SFA per stage)\n", Mainloop::Base::TmaTransactionBytesMK);
+    printf("  TmaTransactionBytesNK:        %8u B (B + SFB per stage)\n", Mainloop::Base::TmaTransactionBytesNK);
+    printf("  TmaTransactionBytes:          %8u B (total per stage)\n", Mainloop::Base::TmaTransactionBytes);
+    printf("  sizeof_bits<ElementA>:        %8d\n", (int)cutlass::sizeof_bits<typename Mainloop::ElementA>::value);
+    printf("  sizeof_bits<ElementB>:        %8d\n", (int)cutlass::sizeof_bits<typename Mainloop::ElementB>::value);
+    printf("  sizeof(SmemAllocTypeA):       %8zu\n", sizeof(typename Mainloop::SmemAllocTypeA));
+    printf("  sizeof(SmemAllocTypeB):       %8zu\n", sizeof(typename Mainloop::SmemAllocTypeB));
+    printf("  IsF8F6F4:                     %8d\n", (int)Mainloop::Base::IsF8F6F4);
+    
+    // Check for FP4 transaction byte mismatch
+    constexpr size_t smemLayoutB_size = cute::size(cute::take<0,2>(typename Mainloop::SmemLayoutB{}));
+    constexpr size_t smemLayoutB_cosize = cute::cosize(cute::take<0,2>(typename Mainloop::SmemLayoutB{}));
+    constexpr size_t actual_B_bytes_per_stage = smemLayoutB_cosize * sizeof(typename Mainloop::SmemAllocTypeB);
+    constexpr size_t formula_B_bytes = cutlass::bits_to_bytes(smemLayoutB_size * cutlass::sizeof_bits<typename Mainloop::ElementB>::value);
+    printf("  SmemLayoutB per stage:\n");
+    printf("    size():                     %8zu\n", smemLayoutB_size);
+    printf("    cosize():                   %8zu\n", smemLayoutB_cosize);
+    printf("    actual_B_bytes (cosize*sizeof(SmemAllocTypeB)): %8zu\n", actual_B_bytes_per_stage);
+    printf("    formula_B_bytes (bits_to_bytes(size*sizeof_bits<ElementB>)): %8zu\n", formula_B_bytes);
+    if (actual_B_bytes_per_stage != formula_B_bytes) {
+      printf("  *** MISMATCH: TMA transaction bytes for B are WRONG! ***\n");
+      printf("  *** TMA loads %zu bytes but barrier expects only %zu bytes ***\n",
+             actual_B_bytes_per_stage, formula_B_bytes);
+    }
     printf("============================================================\n");
     printf("\n");
   }
   
   // Initialize GEMM
-  auto init_status = gemm.initialize(arguments, gemm_workspace, stream);
+  auto init_status = gemm.initialize(arguments, tma_inputs.gemm_workspace, stream);
   if (init_status != cutlass::Status::kSuccess) {
     cudaError_t cuda_err = cudaGetLastError();
     // Also check device properties for max shared memory
@@ -2364,11 +2443,64 @@ void sm120_gated_fc1_moe_gemm_kernelLauncher(
     }
 
     TLLM_THROW("SM120 Gated FC1: initialize failed: %s (CUDA: %s). "
-               "SharedStorageSize=%d, maxSharedMem=%d",
+               "SharedStorageSize=%d, maxSharedMem=%zu",
                cutlassGetStatusString(init_status), cudaGetErrorString(cuda_err),
                int(Gemm::GemmKernel::SharedStorageSize), props.sharedMemPerBlockOptin);
   }
   TLLM_LOG_DEBUG("[SM120 Gated FC1] GEMM initialized successfully");
+
+  // ── Host-side TMA descriptor dump ──────────────────────────────────────
+  // Always dump the first 64 bytes of each host TMA descriptor right after
+  // initialize().  These blobs were created by cuTensorMapEncodeTiled() and
+  // contain the dimension/stride/swizzle fields that the GPU will use.
+  // A mismatch or all-zero descriptor means the descriptor is malformed.
+  {
+    auto const& p = gemm.params();
+
+    auto dump_tma_desc = [](const char* name, void const* desc) {
+      if (!desc) {
+        printf("[SM120 Gated FC1 TMA] %s: <null>\n", name);
+        return;
+      }
+      auto const* b = reinterpret_cast<uint8_t const*>(desc);
+      // Print first 4 × 16-byte lines (64 bytes): enough to see
+      // dataType, dims, globalStrides, boxDim, swizzle fields.
+      for (int line = 0; line < 4; ++line) {
+        printf("[SM120 Gated FC1 TMA] %s [%3d..%3d]:", name, line * 16, line * 16 + 15);
+        for (int i = 0; i < 16; ++i) printf(" %02x", unsigned(b[line * 16 + i]));
+        printf("\n");
+      }
+    };
+
+    dump_tma_desc("A   (base.tma_load_a)",   p.mainloop.base.tma_load_a.get_tma_descriptor());
+    dump_tma_desc("B   (base.tma_load_b)",   p.mainloop.base.tma_load_b.get_tma_descriptor());
+    dump_tma_desc("SFA (base.tma_load_sfa)", p.mainloop.base.tma_load_sfa.get_tma_descriptor());
+    dump_tma_desc("SFB (base.tma_load_sfb)", p.mainloop.base.tma_load_sfb.get_tma_descriptor());
+    dump_tma_desc("Aux (aux.tma_load_aux)",  p.mainloop.aux.tma_load_aux.get_tma_descriptor());
+    dump_tma_desc("SFAux(aux.tma_load_sfaux)", p.mainloop.aux.tma_load_sfaux.get_tma_descriptor());
+
+    // Quick all-zero check for each descriptor
+    auto is_all_zero = [](void const* desc) -> bool {
+      if (!desc) return true;
+      auto const* b = reinterpret_cast<uint8_t const*>(desc);
+      for (int i = 0; i < 128; ++i) if (b[i] != 0) return false;
+      return true;
+    };
+    const char* names[] = {"A", "B", "SFA", "SFB", "Aux", "SFAux"};
+    void const* descs[] = {
+      p.mainloop.base.tma_load_a.get_tma_descriptor(),
+      p.mainloop.base.tma_load_b.get_tma_descriptor(),
+      p.mainloop.base.tma_load_sfa.get_tma_descriptor(),
+      p.mainloop.base.tma_load_sfb.get_tma_descriptor(),
+      p.mainloop.aux.tma_load_aux.get_tma_descriptor(),
+      p.mainloop.aux.tma_load_sfaux.get_tma_descriptor(),
+    };
+    for (int i = 0; i < 6; ++i) {
+      if (is_all_zero(descs[i])) {
+        printf("[SM120 Gated FC1 TMA] *** WARNING: %s descriptor is ALL ZEROS ***\n", names[i]);
+      }
+    }
+  }
 
   // Extra debug: dump tensormap workspace bytes (A/B/SFA/SFB/Aux/SFAux planes) for one SM slot.
   //
@@ -2620,10 +2752,10 @@ void sm120_gated_fc1_moe_gemm_kernelLauncher(
   }
 
 #else
-  (void)tma_inputs; (void)aux_output; (void)expert_first_token_offset;
+  (void)tma_inputs;
   (void)inter_size; (void)hidden_size;
   (void)num_experts; (void)multi_processor_count; (void)stream;
-  (void)occupancy; (void)workspace_size;
+  (void)occupancy; (void)workspace_size; (void)swiglu_params;
   TLLM_THROW("SM120 Gated FC1 requires CUTLASS_ARCH_MMA_SM12x_SUPPORTED, ENABLE_FP4, and FLASHINFER_GATED_FC1");
 #endif
 }
@@ -2653,15 +2785,14 @@ template void sm120_gated_fc1_moe_gemm_kernelLauncher<
     true                // IsMXFP4
 >(
     TmaWarpSpecializedGroupedGemmInput tma_inputs,
-    void* aux_output,
-    int64_t const* expert_first_token_offset,
     int64_t inter_size,
     int64_t hidden_size,
     int num_experts,
     int multi_processor_count,
     cudaStream_t stream,
     int* occupancy,
-    size_t* workspace_size);
+    size_t* workspace_size,
+    GatedFC1SwigluParams swiglu_params);
 
 #endif  // CUTLASS_ARCH_MMA_SM12x_SUPPORTED && ENABLE_FP4 && FLASHINFER_GATED_FC1
 

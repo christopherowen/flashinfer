@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <limits>
+
 // Must include primary CollectiveMma template declaration BEFORE any specializations
 #include "cutlass/gemm/collective/collective_mma_decl.hpp"
 #include "cutlass/gemm/collective/sm120_blockscaled_mma_array_tma.hpp"
@@ -162,24 +164,93 @@ struct CollectiveMma<
   using SmemCopyAtomAux = SmemCopyAtomB;
   using SmemCopyAtomSFAux = SmemCopyAtomSFB;
 
+  // SMEM allocation types - must match base for TMA swizzle compatibility.
+  // For IsF8F6F4 (FP8×FP4), SmemAllocType is uint8_t, not the raw ValType.
+  // This ensures cosize_v<SmemLayout> counts uint8_t elements, matching TMA descriptors.
+  using SmemAllocTypeA = typename Base::SmemAllocTypeA;
+  using SmemAllocTypeB = typename Base::SmemAllocTypeB;
+
   static constexpr bool IsGated = true;
+
+  // ==========================================================================
+  // COMPILE-TIME VALIDATION
+  // ==========================================================================
+  // These static_asserts catch the classes of bugs that previously caused
+  // runtime "Warp Illegal Instruction Parameter" crashes:
+  //
+  //  1. SmemAllocType mismatch: Using TiledMma::ValType instead of
+  //     SmemAllocType causes sizeof mismatch between what the TMA descriptor
+  //     expects (uint8_t for FP8×FP4) and what SMEM actually holds.
+  //
+  //  2. Layout correspondence: Aux operands MUST use the same layouts as B
+  //     operands for TMA compatibility (same swizzle, same tile dimensions).
+  //
+  //  3. Transaction byte accounting: The gated kernel issues 6 TMA loads per
+  //     pipeline stage (not 4), so the barrier must wait for all 6.
+  //
+
+  // [CT-1] SmemAllocType must match base class exactly
+  static_assert(cute::is_same_v<SmemAllocTypeA, typename Base::SmemAllocTypeA>,
+                "SmemAllocTypeA mismatch: gated kernel must use same SMEM alloc type as base");
+  static_assert(cute::is_same_v<SmemAllocTypeB, typename Base::SmemAllocTypeB>,
+                "SmemAllocTypeB mismatch: gated kernel must use same SMEM alloc type as base");
+
+  // [CT-2] Aux layouts must be identical to B layouts (same TMA tile geometry)
+  static_assert(cute::is_same_v<SmemLayoutAux, SmemLayoutB>,
+                "SmemLayoutAux must match SmemLayoutB for TMA compatibility");
+  static_assert(cute::is_same_v<SmemLayoutSFAux, SmemLayoutSFB>,
+                "SmemLayoutSFAux must match SmemLayoutSFB for TMA compatibility");
+
+  // [CT-3] Transaction bytes: 6 TMA loads = base (4 loads) + NK (2 more for Aux+SFAux)
+  static_assert(Base::TmaTransactionBytes + Base::TmaTransactionBytesNK
+                > Base::TmaTransactionBytes,
+                "TmaTransactionBytesNK must be non-zero (Aux/SFAux loads require additional bytes)");
+
+  // [CT-4] Element sizes: Aux must match B (both are FP4 weights)
+  static_assert(sizeof_bits<ElementAux>::value == sizeof_bits<ElementB>::value,
+                "ElementAux must have same bit width as ElementB");
+
+  // [CT-5] Cosize validation: Aux SMEM arrays must have same cosize as B
+  static_assert(cute::cosize_v<SmemLayoutAux> == cute::cosize_v<SmemLayoutB>,
+                "Aux SMEM cosize must equal B SMEM cosize");
+  static_assert(cute::cosize_v<SmemLayoutSFAux> == cute::cosize_v<SmemLayoutSFB>,
+                "SFAux SMEM cosize must equal SFB SMEM cosize");
 
   //
   // Extended SharedStorage - base storage + Aux operand
   //
+  // CRITICAL: smem_A, smem_B, smem_Aux MUST use alignas(1024) to match the base
+  // kernel's TMA swizzle requirements.  Using alignas(128) causes
+  // "Warp Illegal Instruction Parameter" on UTMALDG.4D because the TMA
+  // descriptor's swizzle mode expects 1024-byte-aligned SMEM base addresses.
+  //
   struct TensorStorage : cute::aligned_struct<128, _0> {
     // Base operands (same as Base::TensorStorage)
-    cute::array_aligned<typename TiledMma::ValTypeA, cute::cosize_v<SmemLayoutA>, 128> smem_A;
-    cute::array_aligned<typename TiledMma::ValTypeB, cute::cosize_v<SmemLayoutB>, 128> smem_B;
-    cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFA>, 128> smem_SFA;
-    cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFB>, 128> smem_SFB;
+    alignas(1024) cute::ArrayEngine<SmemAllocTypeA, cute::cosize_v<SmemLayoutA>> smem_A;
+    alignas(1024) cute::ArrayEngine<SmemAllocTypeB, cute::cosize_v<SmemLayoutB>> smem_B;
+    cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFA>> smem_SFA;
+    cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFB>> smem_SFB;
     
-    // Gated extension: Aux operand (gate weights)
-    cute::array_aligned<typename TiledMma::ValTypeB, cute::cosize_v<SmemLayoutAux>, 128> smem_Aux;
-    cute::array_aligned<ElementSF, cute::cosize_v<SmemLayoutSFAux>, 128> smem_SFAux;
+    // Gated extension: Aux operand (gate weights, same layout as B)
+    alignas(1024) cute::ArrayEngine<SmemAllocTypeB, cute::cosize_v<SmemLayoutAux>> smem_Aux;
+    cute::ArrayEngine<ElementSF, cute::cosize_v<SmemLayoutSFAux>> smem_SFAux;
   };
 
   using SharedStorage = TensorStorage;
+
+  // [CT-6] TensorStorage alignment: smem_A, smem_B, smem_Aux must be at
+  // 1024-byte-aligned offsets within TensorStorage.  If they aren't, the TMA
+  // load instruction will fault with "Warp Illegal Instruction Parameter".
+  static_assert(offsetof(TensorStorage, smem_A) % 1024 == 0,
+                "smem_A must be 1024-byte aligned within TensorStorage");
+  static_assert(offsetof(TensorStorage, smem_B) % 1024 == 0,
+                "smem_B must be 1024-byte aligned within TensorStorage");
+  static_assert(offsetof(TensorStorage, smem_Aux) % 1024 == 0,
+                "smem_Aux must be 1024-byte aligned within TensorStorage");
+
+  // [CT-7] Verify TensorStorage size is reasonable (should be < 100KB for SM12x)
+  static_assert(sizeof(TensorStorage) <= 128 * 1024,
+                "TensorStorage exceeds 128KB shared memory limit");
 
   // ==========================================================================
   // SMEM Diagnostic - prints breakdown of shared memory usage
@@ -193,8 +264,8 @@ struct CollectiveMma<
     constexpr size_t smem_SFB_elements = cute::cosize_v<SmemLayoutSFB>;
     constexpr size_t smem_SFAux_elements = cute::cosize_v<SmemLayoutSFAux>;
     
-    constexpr size_t sizeof_A = sizeof(typename TiledMma::ValTypeA);
-    constexpr size_t sizeof_B = sizeof(typename TiledMma::ValTypeB);
+    constexpr size_t sizeof_A = sizeof(SmemAllocTypeA);
+    constexpr size_t sizeof_B = sizeof(SmemAllocTypeB);
     constexpr size_t sizeof_SF = sizeof(ElementSF);
     
     constexpr size_t smem_A_bytes = smem_A_elements * sizeof_A;
@@ -232,7 +303,7 @@ struct CollectiveMma<
            smem_SFAux_elements, sizeof_SF, smem_SFAux_bytes);
     printf("-----------------------------------------------------------------\n");
     printf("Raw total       |             |           | %8zu B |\n", raw_total);
-    printf("Alignment pad   |             |           | %8zu B | (128-byte aligned)\n", alignment_overhead);
+    printf("Alignment pad   |             |           | %8zu B | (1024-byte aligned data)\n", alignment_overhead);
     printf("TensorStorage   |             |           | %8zu B | sizeof(TensorStorage)\n", tensor_storage_size);
     printf("====================================================================\n");
     printf("\n");
@@ -261,7 +332,23 @@ struct CollectiveMma<
   };
 
   //
-  // Arguments - extended for Aux pointers
+  // SwigluBias parameters for the inline activation.
+  // Device pointers to per-expert float arrays from vLLM (swiglu_alpha/beta/limit).
+  // The kernel dereferences these on-device, avoiding any host-side cudaMemcpy
+  // and preserving CUDA graph compatibility.
+  //
+  // For gpt-oss-120b all experts share the same values; the kernel reads [0].
+  // For per-expert support, pass the expert index when it becomes available
+  // in the mma() call (requires future kernel interface change).
+  //
+  struct SwigluBiasParams {
+    float const* d_alpha = nullptr;   // Device ptr: sigmoid scaling [num_experts]
+    float const* d_beta  = nullptr;   // Device ptr: linear bias [num_experts]
+    float const* d_limit = nullptr;   // Device ptr: clamp bound [num_experts]
+  };
+
+  //
+  // Arguments - extended for Aux pointers and SwigluBias params
   //
   struct Arguments {
     // Base arguments
@@ -279,6 +366,9 @@ struct CollectiveMma<
     StrideAux dAux{};
     ElementSF const** ptr_SFAux = nullptr;
     LayoutSFAux layout_SFAux{};
+
+    // SwigluBias activation parameters (wired from vLLM runtime tensors)
+    SwigluBiasParams swiglu{};
   };
 
   //
@@ -302,10 +392,18 @@ struct CollectiveMma<
   struct Params {
     typename Base::Params base;  // Base params for A, B, SFA, SFB
     AuxParams aux;               // Aux params for gate weights
+    SwigluBiasParams swiglu;     // SwigluBias activation parameters
     
-    // Mirrored members from Base::Params for kernel compatibility
-    // The kernel accesses params.mainloop.tma_transaction_bytes directly
-    uint32_t tma_transaction_bytes = Base::TmaTransactionBytes;
+    // Mirrored members from Base::Params for kernel compatibility.
+    // The kernel accesses params.mainloop.tma_transaction_bytes directly.
+    //
+    // CRITICAL: The gated load issues TMA copies for 6 tensors per pipeline stage
+    // (A, B, Aux, SFA, SFB, SFAux) but the base only counts 4 (A, B, SFA, SFB).
+    // We MUST add the Aux + SFAux transaction bytes so the pipeline barrier waits
+    // for ALL 6 TMA loads to complete before signaling "ready" to the consumer.
+    // Aux uses SmemLayoutB and SFAux uses SmemLayoutSFB, so the additional bytes
+    // equal TmaTransactionBytesNK (= B_bytes + SFB_bytes).
+    uint32_t tma_transaction_bytes = Base::TmaTransactionBytes + Base::TmaTransactionBytesNK;
     uint32_t tma_transaction_bytes_mk = Base::TmaTransactionBytesMK;
     uint32_t tma_transaction_bytes_nk = Base::TmaTransactionBytesNK;
   };
@@ -313,6 +411,14 @@ struct CollectiveMma<
   // Static assert: Params must be trivially copyable (passed by value to kernel)
   static_assert(std::is_trivially_copyable_v<Params>, 
                 "Gated mainloop Params must be trivially copyable");
+
+  // [CT-8] Transaction bytes: verify the default value accounts for 6 TMA loads.
+  // The default initializer in Params sets tma_transaction_bytes to
+  //   Base::TmaTransactionBytes + Base::TmaTransactionBytesNK
+  // which must equal MK + NK + NK = MK + 2*NK (A+SFA + B+SFB + Aux+SFAux).
+  static_assert(Base::TmaTransactionBytes + Base::TmaTransactionBytesNK
+                == Base::TmaTransactionBytesMK + 2 * Base::TmaTransactionBytesNK,
+                "Gated tma_transaction_bytes must be MK + 2*NK (6 TMA loads)");
 
   //
   // LoadState - encapsulates all load tensors
@@ -367,6 +473,7 @@ struct CollectiveMma<
     Params result;
     result.base = base_params;
     result.aux = aux;
+    result.swiglu = args.swiglu;
     return result;
   }
 
@@ -452,25 +559,45 @@ struct CollectiveMma<
   tensormaps_perform_update(TensorMapStorage& shared_tensormaps, Params const& params,
                             TensorMapTuple const& input_tensormaps,
                             ProblemShape const& problem_shape, int32_t next_batch) {
-    // Replace global addresses for all 6 tensormaps for the next batch
-    // A, B, SFA, SFB (from base params)
-    cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_A,
-                                                    params.base.ptr_A[next_batch]);
-    cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_B,
-                                                    params.base.ptr_B[next_batch]);
-    cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_SFA,
-                                                    params.base.ptr_SFA[next_batch]);
-    cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_SFB,
-                                                    params.base.ptr_SFB[next_batch]);
-    // Aux, SFAux (from aux params)
-    cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_Aux,
-                                                    params.aux.ptr_Aux[next_batch]);
-    cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_SFAux,
-                                                    params.aux.ptr_SFAux[next_batch]);
-    
-    // For grouped GEMM, also update tensor dimensions and strides for all 6 tensormaps
-    if constexpr (Base::IsGroupedGemmKernel) {
-      tensormaps_replace_global_tensor_properties(shared_tensormaps, params, next_batch, problem_shape);
+    // CRITICAL: elect_one_sync() required - tensormap.replace.* PTX instructions
+    // are single-thread shared memory operations.  Without this guard, all 32 warp
+    // threads execute replace concurrently on the same 128-byte descriptor, causing
+    // data races that corrupt the TMA descriptor and produce "Warp Illegal
+    // Instruction Parameter" on the subsequent UTMALDG.4D.
+    // (Matches base class pattern in sm120_blockscaled_mma_array_tma.hpp)
+    if (cute::elect_one_sync()) {
+      // Debug: print replacement addresses for block 0
+      if (blockIdx.x == 0 && threadIdx.x == 0) {
+        printf("[GATED TMA UPDATE] batch=%d A=%p B=%p SFA=%p SFB=%p Aux=%p SFAux=%p\n",
+               next_batch,
+               (void const*)params.base.ptr_A[next_batch],
+               (void const*)params.base.ptr_B[next_batch],
+               (void const*)params.base.ptr_SFA[next_batch],
+               (void const*)params.base.ptr_SFB[next_batch],
+               (void const*)params.aux.ptr_Aux[next_batch],
+               (void const*)params.aux.ptr_SFAux[next_batch]);
+      }
+      
+      // Replace global addresses for all 6 tensormaps for the next batch
+      // A, B, SFA, SFB (from base params)
+      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_A,
+                                                      params.base.ptr_A[next_batch]);
+      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_B,
+                                                      params.base.ptr_B[next_batch]);
+      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_SFA,
+                                                      params.base.ptr_SFA[next_batch]);
+      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_SFB,
+                                                      params.base.ptr_SFB[next_batch]);
+      // Aux, SFAux (from aux params)
+      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_Aux,
+                                                      params.aux.ptr_Aux[next_batch]);
+      cute::tma_descriptor_replace_addr_in_shared_mem(shared_tensormaps.smem_tensormap_SFAux,
+                                                      params.aux.ptr_SFAux[next_batch]);
+      
+      // For grouped GEMM, also update tensor dimensions and strides for all 6 tensormaps
+      if constexpr (Base::IsGroupedGemmKernel) {
+        tensormaps_replace_global_tensor_properties(shared_tensormaps, params, next_batch, problem_shape);
+      }
     }
   }
   
@@ -534,6 +661,41 @@ struct CollectiveMma<
     for (uint64_t& stride : prob_stride_SFB) { stride = (stride * sizeof_bits_v<ElementSF>) / 8; }
     for (uint64_t& stride : prob_stride_Aux) { stride = (stride * sizeof_bits_v<TmaInternalElementB>) / 8; }
     for (uint64_t& stride : prob_stride_SFAux) { stride = (stride * sizeof_bits_v<ElementSF>) / 8; }
+    
+    // Debug: print shapes/strides for one block (block 0) to diagnose TMA descriptor issues
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+      printf("[GATED TMA DIAG] group=%d M=%d N=%d K=%d\n", next_group, int(M), int(N), int(K));
+      printf("[GATED TMA DIAG] A   shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
+             prob_shape_A[0], prob_shape_A[1], prob_shape_A[2], prob_shape_A[3], prob_shape_A[4],
+             (unsigned long)prob_stride_A[0], (unsigned long)prob_stride_A[1], (unsigned long)prob_stride_A[2],
+             (unsigned long)prob_stride_A[3], (unsigned long)prob_stride_A[4]);
+      printf("[GATED TMA DIAG] B   shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
+             prob_shape_B[0], prob_shape_B[1], prob_shape_B[2], prob_shape_B[3], prob_shape_B[4],
+             (unsigned long)prob_stride_B[0], (unsigned long)prob_stride_B[1], (unsigned long)prob_stride_B[2],
+             (unsigned long)prob_stride_B[3], (unsigned long)prob_stride_B[4]);
+      printf("[GATED TMA DIAG] Aux shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
+             prob_shape_Aux[0], prob_shape_Aux[1], prob_shape_Aux[2], prob_shape_Aux[3], prob_shape_Aux[4],
+             (unsigned long)prob_stride_Aux[0], (unsigned long)prob_stride_Aux[1], (unsigned long)prob_stride_Aux[2],
+             (unsigned long)prob_stride_Aux[3], (unsigned long)prob_stride_Aux[4]);
+      printf("[GATED TMA DIAG] SFA shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
+             prob_shape_SFA[0], prob_shape_SFA[1], prob_shape_SFA[2], prob_shape_SFA[3], prob_shape_SFA[4],
+             (unsigned long)prob_stride_SFA[0], (unsigned long)prob_stride_SFA[1], (unsigned long)prob_stride_SFA[2],
+             (unsigned long)prob_stride_SFA[3], (unsigned long)prob_stride_SFA[4]);
+      printf("[GATED TMA DIAG] SFB shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
+             prob_shape_SFB[0], prob_shape_SFB[1], prob_shape_SFB[2], prob_shape_SFB[3], prob_shape_SFB[4],
+             (unsigned long)prob_stride_SFB[0], (unsigned long)prob_stride_SFB[1], (unsigned long)prob_stride_SFB[2],
+             (unsigned long)prob_stride_SFB[3], (unsigned long)prob_stride_SFB[4]);
+      printf("[GATED TMA DIAG] SFAux shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
+             prob_shape_SFAux[0], prob_shape_SFAux[1], prob_shape_SFAux[2], prob_shape_SFAux[3], prob_shape_SFAux[4],
+             (unsigned long)prob_stride_SFAux[0], (unsigned long)prob_stride_SFAux[1], (unsigned long)prob_stride_SFAux[2],
+             (unsigned long)prob_stride_SFAux[3], (unsigned long)prob_stride_SFAux[4]);
+      // Print addresses being set
+      printf("[GATED TMA DIAG] Addrs: A=%p B=%p Aux=%p SFA=%p SFB=%p SFAux=%p\n",
+             (void const*)params.base.ptr_A[next_group], (void const*)params.base.ptr_B[next_group],
+             (void const*)params.aux.ptr_Aux[next_group],
+             (void const*)params.base.ptr_SFA[next_group], (void const*)params.base.ptr_SFB[next_group],
+             (void const*)params.aux.ptr_SFAux[next_group]);
+    }
     
     // Update all 6 tensormaps
     cute::tma_descriptor_replace_dims_strides_in_shared_mem(shared_tensormaps.smem_tensormap_A, prob_shape_A, prob_stride_A);
@@ -679,12 +841,12 @@ struct CollectiveMma<
 
     if (lane_predicate) {
       // Create SMEM tensors (base + Aux)
-      Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.data()), SmemLayoutA{});
-      Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.data()), SmemLayoutB{});
-      Tensor sAux = make_tensor(make_smem_ptr(shared_tensors.smem_Aux.data()), SmemLayoutAux{});
-      Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.data()), SmemLayoutSFA{});
-      Tensor sSFB = make_tensor(make_smem_ptr(shared_tensors.smem_SFB.data()), SmemLayoutSFB{});
-      Tensor sSFAux = make_tensor(make_smem_ptr(shared_tensors.smem_SFAux.data()), SmemLayoutSFAux{});
+      Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});
+      Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});
+      Tensor sAux = make_tensor(make_smem_ptr(shared_tensors.smem_Aux.begin()), SmemLayoutAux{});
+      Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.begin()), SmemLayoutSFA{});
+      Tensor sSFB = make_tensor(make_smem_ptr(shared_tensors.smem_SFB.begin()), SmemLayoutSFB{});
+      Tensor sSFAux = make_tensor(make_smem_ptr(shared_tensors.smem_SFAux.begin()), SmemLayoutSFAux{});
 
       // Extract from 6-tuple: (A, B, Aux, SFA, SFB, SFAux)
       auto gA_mkl = get<0>(load_inputs);
@@ -748,7 +910,7 @@ struct CollectiveMma<
         copy(params.base.tma_load_sfb.with(get<3>(input_tensormaps), *tma_barrier),
              tBgSFB(_, _, _, *k_tile_iter), tBsSFB(_, _, _, write_stage));
         
-        // Copy Aux and SFAux (gated extension, indices 4, 5 in tensormap tuple)
+        // Copy Aux and SFAux (indices 4, 5 in tensormap tuple)
         copy(params.aux.tma_load_aux.with(get<4>(input_tensormaps), *tma_barrier),
              tAuxgAux(_, _, _, *k_tile_iter), tAuxsAux(_, _, _, write_stage));
         copy(params.aux.tma_load_sfaux.with(get<5>(input_tensormaps), *tma_barrier),
@@ -772,6 +934,12 @@ struct CollectiveMma<
   //
   // mma - Dual accumulator pattern (for GemmUniversalGated kernel)
   //
+  // Follows the exact base class pipelined MMA pattern:
+  //   - K_BLOCK_MAX loop with copy-compute interleaving
+  //   - FP4 left-shift for B/Aux operands (required by tcgen05.mma)
+  //   - NamedBarrier sync between k_tiles
+  //   - Dual GEMM: accum0 += A @ B, accum1 += A @ Aux (reusing A/SFA fragments)
+  //
   template <class FrgTensorC>
   CUTLASS_DEVICE void
   mma(MainloopPipeline pipeline,
@@ -789,142 +957,345 @@ struct CollectiveMma<
     clear(accum1);
 
     // SMEM tensors
-    Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.data()), SmemLayoutA{});
-    Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.data()), SmemLayoutB{});
-    Tensor sAux = make_tensor(make_smem_ptr(shared_tensors.smem_Aux.data()), SmemLayoutAux{});
-    Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.data()), SmemLayoutSFA{});
-    Tensor sSFB = make_tensor(make_smem_ptr(shared_tensors.smem_SFB.data()), SmemLayoutSFB{});
-    Tensor sSFAux = make_tensor(make_smem_ptr(shared_tensors.smem_SFAux.data()), SmemLayoutSFAux{});
+    Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});
+    Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});
+    Tensor sAux = make_tensor(make_smem_ptr(shared_tensors.smem_Aux.begin()), SmemLayoutAux{});
+    Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.begin()), SmemLayoutSFA{});
+    Tensor sSFB = make_tensor(make_smem_ptr(shared_tensors.smem_SFB.begin()), SmemLayoutSFB{});
+    Tensor sSFAux = make_tensor(make_smem_ptr(shared_tensors.smem_SFAux.begin()), SmemLayoutSFAux{});
 
-    // Partition for MMA
+    //
+    // Define C accumulators and A/B/Aux partitioning
+    //
+
     TiledMma tiled_mma;
     auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
 
-    Tensor tCrA = thread_mma.partition_fragment_A(sA(_, _, Int<0>{}));
-    Tensor tCrB = thread_mma.partition_fragment_B(sB(_, _, Int<0>{}));
-    Tensor tCrAux = thread_mma.partition_fragment_B(sAux(_, _, Int<0>{}));
-    
+    // Allocate fragments and descriptors
+    Tensor tCrA = thread_mma.partition_fragment_A(sA(_, _, Int<0>{}));                         // (MMA,MMA_M,MMA_K)
+    Tensor tCrB = thread_mma.partition_fragment_B(sB(_, _, Int<0>{}));                         // (MMA,MMA_N,MMA_K)
+    Tensor tCrAux = thread_mma.partition_fragment_B(sAux(_, _, Int<0>{}));                     // (MMA,MMA_N,MMA_K)
+
     // Scale factor fragments - use base class helper functions
-    // Need to call on an instance since these are non-static members
     Base base_helper;
-    Tensor tCrSFA = base_helper.partition_fragment_SFA(sSFA(_, _, Int<0>{}), thread_mma);
-    Tensor tCrSFB = base_helper.partition_fragment_SFB(sSFB(_, _, Int<0>{}), thread_mma);
-    Tensor tCrSFAux = base_helper.partition_fragment_SFB(sSFAux(_, _, Int<0>{}), thread_mma);
+    Tensor tCrSFA = base_helper.partition_fragment_SFA(sSFA(_, _, Int<0>{}), thread_mma);      // (MMA,MMA_M,MMA_K)
+    Tensor tCrSFB = base_helper.partition_fragment_SFB(sSFB(_, _, Int<0>{}), thread_mma);      // (MMA,MMA_N,MMA_K)
+    Tensor tCrSFAux = base_helper.partition_fragment_SFB(sSFAux(_, _, Int<0>{}), thread_mma);  // (MMA,MMA_N,MMA_K)
 
-    // SMEM copy setup (same as base)
+    //
+    // Copy from smem to registers
+    //
+
+    // A
     auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
-    auto smem_thr_copy_A = smem_tiled_copy_A.get_thread_slice(thread_idx);
-    Tensor tCsA = smem_thr_copy_A.partition_S(as_position_independent_swizzle_tensor(sA));
-    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+    auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(thread_idx);
+    Tensor tCsA            = smem_thr_copy_A.partition_S(
+      as_position_independent_swizzle_tensor(sA));                                             // (CPY,CPY_M,CPY_K,PIPE)
+    Tensor tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);                                  //      (CPY,CPY_M,CPY_K)
 
+    // B + Aux (share copy atom since SmemLayoutAux == SmemLayoutB)
     auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
-    auto smem_thr_copy_B = smem_tiled_copy_B.get_thread_slice(thread_idx);
-    Tensor tCsB = smem_thr_copy_B.partition_S(as_position_independent_swizzle_tensor(sB));
-    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
-    Tensor tCsAux = smem_thr_copy_B.partition_S(as_position_independent_swizzle_tensor(sAux));
-    Tensor tCrAux_copy_view = smem_thr_copy_B.retile_D(tCrAux);
+    auto smem_thr_copy_B   = smem_tiled_copy_B.get_thread_slice(thread_idx);
+    Tensor tCsB            = smem_thr_copy_B.partition_S(
+      as_position_independent_swizzle_tensor(sB));                                             // (CPY,CPY_N,CPY_K,PIPE)
+    Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(tCrB);                                  //      (CPY,CPY_N,CPY_K)
+    Tensor tCsAux          = smem_thr_copy_B.partition_S(
+      as_position_independent_swizzle_tensor(sAux));                                           // (CPY,CPY_N,CPY_K,PIPE)
+    Tensor tCrAux_copy_view = smem_thr_copy_B.retile_D(tCrAux);                               //      (CPY,CPY_N,CPY_K)
 
-    // Scale factor copy setup (reuse base patterns)
+    // SFA
     auto tile_shape_mnk = tile_shape(tiled_mma);
     auto smem_tiled_copy_SFA = make_tiled_copy_impl(SmemCopyAtomSFA{},
-                                                     base_helper.get_layoutSFA_TV(tiled_mma),
-                                                     make_shape(size<0>(tile_shape_mnk), size<2>(tile_shape_mnk)));
-    auto smem_thr_copy_SFA = smem_tiled_copy_SFA.get_thread_slice(thread_idx);
-    Tensor tCsSFA = smem_thr_copy_SFA.partition_S(as_position_independent_swizzle_tensor(sSFA));
-    Tensor tCrSFA_copy_view = smem_thr_copy_SFA.retile_D(tCrSFA);
+                                                    base_helper.get_layoutSFA_TV(tiled_mma),
+                                                    make_shape(size<0>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+    auto smem_thr_copy_SFA   = smem_tiled_copy_SFA.get_thread_slice(thread_idx);
+    Tensor tCsSFA            = smem_thr_copy_SFA.partition_S(
+        as_position_independent_swizzle_tensor(sSFA));                                         // (CPY,CPY_M,CPY_K,PIPE)
+    Tensor tCrSFA_copy_view  = smem_thr_copy_SFA.retile_D(tCrSFA);                            //      (CPY,CPY_M,CPY_K)
 
+    // SFB + SFAux (share copy atom since SmemLayoutSFAux == SmemLayoutSFB)
     auto smem_tiled_copy_SFB = make_tiled_copy_impl(SmemCopyAtomSFB{},
-                                                     base_helper.get_layoutSFB_TV(tiled_mma),
-                                                     make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
-    auto smem_thr_copy_SFB = smem_tiled_copy_SFB.get_thread_slice(thread_idx);
-    Tensor tCsSFB = smem_thr_copy_SFB.partition_S(as_position_independent_swizzle_tensor(sSFB));
-    Tensor tCrSFB_copy_view = smem_thr_copy_SFB.retile_D(tCrSFB);
-    Tensor tCsSFAux = smem_thr_copy_SFB.partition_S(as_position_independent_swizzle_tensor(sSFAux));
-    Tensor tCrSFAux_copy_view = smem_thr_copy_SFB.retile_D(tCrSFAux);
+                                                    base_helper.get_layoutSFB_TV(tiled_mma),
+                                                    make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+    auto smem_thr_copy_SFB   = smem_tiled_copy_SFB.get_thread_slice(thread_idx);
+    Tensor tCsSFB            = smem_thr_copy_SFB.partition_S(
+      as_position_independent_swizzle_tensor(sSFB));                                           // (CPY,CPY_N,CPY_K,PIPE)
+    Tensor tCrSFB_copy_view  = smem_thr_copy_SFB.retile_D(tCrSFB);                            //      (CPY,CPY_N,CPY_K)
+    Tensor tCsSFAux          = smem_thr_copy_SFB.partition_S(
+      as_position_independent_swizzle_tensor(sSFAux));                                         // (CPY,CPY_N,CPY_K,PIPE)
+    Tensor tCrSFAux_copy_view = smem_thr_copy_SFB.retile_D(tCrSFAux);                         //      (CPY,CPY_N,CPY_K)
+
+    CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));                            // CPY_M
+    CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCrA_copy_view));                            // CPY_K
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(accum0));                                    // MMA_M
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(accum0));                                    // MMA_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCsA) == size<2>(tCsB));                                      // CPY_K
+    CUTE_STATIC_ASSERT_V(size<3>(tCsA) == size<3>(tCsB));                                      // PIPE
+    CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sA));                        // PIPE
+    CUTE_STATIC_ASSERT_V(Int<DispatchPolicy::Stages>{} == size<2>(sB));                        // PIPE
+
+    CUTE_STATIC_ASSERT_V(size<1>(tCsSFA) == size<1>(tCrSFA_copy_view));                        // CPY_M
+    CUTE_STATIC_ASSERT_V(size<2>(tCsSFA) == size<2>(tCrSFA_copy_view));                        // CPY_K
+    // For small CTA dimensions, SF layouts are padded to 128 but accumulator is smaller.
+    // Skip size assertions when M or N < 128.
+    if constexpr (!Base::IsCtaMSmall) { CUTE_STATIC_ASSERT_V(size<1>(tCrSFA) == size<1>(accum0)); }  // MMA_M
+    if constexpr (!Base::IsCtaNSmall) { CUTE_STATIC_ASSERT_V(size<1>(tCrSFB) == size<2>(accum0)); }  // MMA_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCsSFA) == size<2>(tCsSFB));                                  // CPY_K
+    CUTE_STATIC_ASSERT_V(size<3>(tCsSFA) == size<3>(tCsSFB));                                  // PIPE
+    CUTE_STATIC_ASSERT_V(size<2>(sA) == size<2>(sSFA));                                        // PIPE
+    CUTE_STATIC_ASSERT_V(size<2>(sB) == size<2>(sSFA));                                        // PIPE
 
     //
-    // PIPELINED MAIN LOOP - dual accumulator pattern
+    // PIPELINED MAIN LOOP  (follows base class pattern exactly)
     //
-    CUTLASS_PRAGMA_NO_UNROLL
-    for (; k_tile_count > 0; --k_tile_count) {
-      pipeline.consumer_wait(smem_pipe_read);
-      int read_stage = smem_pipe_read.index();
 
-      // Copy A, B, Aux and scale factors from SMEM to registers
-      copy(smem_tiled_copy_A, tCsA(_, _, _, read_stage), tCrA_copy_view);
-      copy(smem_tiled_copy_SFA, tCsSFA(_, _, _, read_stage), tCrSFA_copy_view);
-      copy(smem_tiled_copy_B, tCsB(_, _, _, read_stage), tCrB_copy_view);
-      copy(smem_tiled_copy_SFB, tCsSFB(_, _, _, read_stage), tCrSFB_copy_view);
-      copy(smem_tiled_copy_B, tCsAux(_, _, _, read_stage), tCrAux_copy_view);
-      copy(smem_tiled_copy_SFB, tCsSFAux(_, _, _, read_stage), tCrSFAux_copy_view);
+    // Size of the register pipeline
+    auto K_BLOCK_MAX = size<2>(tCrA);
 
-      // Dual GEMM: accum0 += A @ B, accum1 += A @ Aux
+    int read_stage = smem_pipe_read.index();
+    auto tCsA_stage     = tCsA(_,_,_,read_stage);
+    auto tCsB_stage     = tCsB(_,_,_,read_stage);
+    auto tCsAux_stage   = tCsAux(_,_,_,read_stage);
+    auto tCsSFA_stage   = tCsSFA(_,_,_,read_stage);
+    auto tCsSFB_stage   = tCsSFB(_,_,_,read_stage);
+    auto tCsSFAux_stage = tCsSFAux(_,_,_,read_stage);
+
+    auto copy_kblock = [&](auto k_block) {
+      // Copy smem->rmem for A, B, Aux operands
+      copy(smem_tiled_copy_A, tCsA_stage(_,_,k_block), tCrA_copy_view(_,_,k_block));
+      copy(smem_tiled_copy_B, tCsB_stage(_,_,k_block), tCrB_copy_view(_,_,k_block));
+      copy(smem_tiled_copy_B, tCsAux_stage(_,_,k_block), tCrAux_copy_view(_,_,k_block));
+
+      // Left shift A,B,Aux for FP4 (required: ld.matrix places FP4 in low 4 bits,
+      // but tcgen05.mma expects middle 4 bits -> shift left by 2)
+      using MMAOp = typename TiledMma::MMA_Op;
+      fp4_shift_A(MMAOp{}, tCrA_copy_view(_,_,k_block));
+      fp4_shift_B(MMAOp{}, tCrB_copy_view(_,_,k_block));
+      fp4_shift_B(MMAOp{}, tCrAux_copy_view(_,_,k_block));
+
+      // Copy smem->rmem for SFA, SFB, SFAux operands
+      copy(tCsSFA_stage(_,_,k_block), tCrSFA_copy_view(_,_,k_block));
+      copy(tCsSFB_stage(_,_,k_block), tCrSFB_copy_view(_,_,k_block));
+      copy(tCsSFAux_stage(_,_,k_block), tCrSFAux_copy_view(_,_,k_block));
+    };
+
+    auto gemm_kblock = [&](auto k_block) {
+      // Linear GEMM: accum0 += A @ B
       cute::gemm(tiled_mma,
-                 make_zip_tensor(tCrA, tCrSFA),
-                 make_zip_tensor(tCrB, tCrSFB),
+                 make_zip_tensor(tCrA(_,_,k_block), tCrSFA(_,_,k_block)),
+                 make_zip_tensor(tCrB(_,_,k_block), tCrSFB(_,_,k_block)),
                  accum0);
-      
+      // Gate GEMM: accum1 += A @ Aux
       cute::gemm(tiled_mma,
-                 make_zip_tensor(tCrA, tCrSFA),
-                 make_zip_tensor(tCrAux, tCrSFAux),
+                 make_zip_tensor(tCrA(_,_,k_block), tCrSFA(_,_,k_block)),
+                 make_zip_tensor(tCrAux(_,_,k_block), tCrSFAux(_,_,k_block)),
                  accum1);
+    };
 
-      pipeline.consumer_release(smem_pipe_read);
-      ++smem_pipe_read;
-    }
+    pipeline.consumer_wait(smem_pipe_read);
+
+    copy_kblock(_0{});
+    CUTLASS_PRAGMA_NO_UNROLL
+    for ( ; k_tile_count > 1; --k_tile_count) {
+      //
+      // Compute on k_tile
+      //
+      for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
+
+        auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+
+        if (k_block == K_BLOCK_MAX - 1) {
+          cutlass::arch::NamedBarrier::sync(
+          thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+          // UNLOCK smem_pipe_read, done _computing_ on it
+          pipeline.consumer_release(smem_pipe_read);
+          ++smem_pipe_read;
+          read_stage = smem_pipe_read.index();
+          tCsA_stage     = tCsA(_,_,_,read_stage);
+          tCsB_stage     = tCsB(_,_,_,read_stage);
+          tCsAux_stage   = tCsAux(_,_,_,read_stage);
+          tCsSFA_stage   = tCsSFA(_,_,_,read_stage);
+          tCsSFB_stage   = tCsSFB(_,_,_,read_stage);
+          tCsSFAux_stage = tCsSFAux(_,_,_,read_stage);
+          pipeline.consumer_wait(smem_pipe_read);
+        }
+
+        copy_kblock(k_block_next);
+        gemm_kblock(k_block);
+
+      });
+    } // k_tile_count
+
+    //
+    // Hoist out last k_tile
+    //
+    for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
+
+      auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+
+      if (k_block == K_BLOCK_MAX - 1) {
+        cutlass::arch::NamedBarrier::sync(
+        thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+        // UNLOCK smem_pipe_read, done _computing_ on it
+        pipeline.consumer_release(smem_pipe_read);
+        ++smem_pipe_read;
+      }
+
+      if (k_block_next > 0) {
+        copy_kblock(k_block_next);
+      }
+      gemm_kblock(k_block);
+
+    });
   }
 
   //
   // mma - Single accumulator pattern (for standard GemmUniversal kernel)
-  // 
-  // This allows using the STANDARD kernel and epilogue by applying SiLU INLINE.
-  // This is the TRT-LLM pattern: SwiGLU belongs in the consumer loop, not the epilogue.
   //
-  // TEMPORARY DEBUG: Simplified to only do linear GEMM (no gate) to isolate issue
+  // Computes: accum = A @ B  (linear GEMM only, gate GEMM result discarded)
+  // The SwiGLU activation is NOT applied here — that requires the dual-accumulator
+  // overload or a custom epilogue. This overload provides a valid single-output
+  // path so the standard GemmUniversal kernel can launch and produce meaningful
+  // (pre-activation) output.
   //
   template <class FrgTensorC>
   CUTLASS_DEVICE void
   mma(MainloopPipeline pipeline,
       PipelineState smem_pipe_read,
-      FrgTensorC& accum,     // Single output: already has SwiGLU applied
+      FrgTensorC& accum,     // Single output
       int k_tile_count,
       int thread_idx,
       TensorStorage& shared_tensors,
       Params const& params) {
-    
-    // TEMPORARY: Just call base class mma() for linear only (skip gate)
+
+    static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
+
+    clear(accum);
+
+    // SMEM tensors
+    Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});
+    Tensor sB = make_tensor(make_smem_ptr(shared_tensors.smem_B.begin()), SmemLayoutB{});
+    Tensor sSFA = make_tensor(make_smem_ptr(shared_tensors.smem_SFA.begin()), SmemLayoutSFA{});
+    Tensor sSFB = make_tensor(make_smem_ptr(shared_tensors.smem_SFB.begin()), SmemLayoutSFB{});
+
+    TiledMma tiled_mma;
+    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+
+    // Allocate fragments
+    Tensor tCrA = thread_mma.partition_fragment_A(sA(_, _, Int<0>{}));
+    Tensor tCrB = thread_mma.partition_fragment_B(sB(_, _, Int<0>{}));
+
+    // Scale factor fragments
     Base base_helper;
-    base_helper.mma(pipeline, smem_pipe_read, accum, k_tile_count, thread_idx,
-                    reinterpret_cast<typename Base::TensorStorage&>(shared_tensors), params.base);
-    return;
-    
-    // Allocate internal accumulators for dual GEMM
-    FrgTensorC accum_linear;
-    FrgTensorC accum_gate;
-    
-    // Call the dual-accumulator version
-    mma(pipeline, smem_pipe_read, accum_linear, accum_gate, 
-        k_tile_count, thread_idx, shared_tensors, params);
-    
-    // Validate accumulator layout match (same shape for element-wise ops)
-    static_assert(cute::rank(FrgTensorC{}) >= 1, "Accumulator must have at least rank 1");
-    
-    // Apply SwiGLU: output = linear * silu(gate)
-    // SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < size(accum_linear); ++i) {
-      float linear_val = float(accum_linear(i));
-      float gate_val = float(accum_gate(i));
-      // SiLU activation on gate
-      float silu_gate = gate_val / (1.0f + expf(-gate_val));
-      // SwiGLU = linear * silu(gate)
-      accum(i) = typename FrgTensorC::value_type(linear_val * silu_gate);
+    Tensor tCrSFA = base_helper.partition_fragment_SFA(sSFA(_, _, Int<0>{}), thread_mma);
+    Tensor tCrSFB = base_helper.partition_fragment_SFB(sSFB(_, _, Int<0>{}), thread_mma);
+
+    // Copy atoms: smem -> rmem
+    auto smem_tiled_copy_A = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
+    auto smem_thr_copy_A   = smem_tiled_copy_A.get_thread_slice(thread_idx);
+    Tensor tCsA            = smem_thr_copy_A.partition_S(
+      as_position_independent_swizzle_tensor(sA));
+    Tensor tCrA_copy_view  = smem_thr_copy_A.retile_D(tCrA);
+
+    auto smem_tiled_copy_B = make_tiled_copy_B(SmemCopyAtomB{}, tiled_mma);
+    auto smem_thr_copy_B   = smem_tiled_copy_B.get_thread_slice(thread_idx);
+    Tensor tCsB            = smem_thr_copy_B.partition_S(
+      as_position_independent_swizzle_tensor(sB));
+    Tensor tCrB_copy_view  = smem_thr_copy_B.retile_D(tCrB);
+
+    auto tile_shape_mnk = tile_shape(tiled_mma);
+    auto smem_tiled_copy_SFA = make_tiled_copy_impl(SmemCopyAtomSFA{},
+                                                    base_helper.get_layoutSFA_TV(tiled_mma),
+                                                    make_shape(size<0>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+    auto smem_thr_copy_SFA   = smem_tiled_copy_SFA.get_thread_slice(thread_idx);
+    Tensor tCsSFA            = smem_thr_copy_SFA.partition_S(
+        as_position_independent_swizzle_tensor(sSFA));
+    Tensor tCrSFA_copy_view  = smem_thr_copy_SFA.retile_D(tCrSFA);
+
+    auto smem_tiled_copy_SFB = make_tiled_copy_impl(SmemCopyAtomSFB{},
+                                                    base_helper.get_layoutSFB_TV(tiled_mma),
+                                                    make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
+    auto smem_thr_copy_SFB   = smem_tiled_copy_SFB.get_thread_slice(thread_idx);
+    Tensor tCsSFB            = smem_thr_copy_SFB.partition_S(
+      as_position_independent_swizzle_tensor(sSFB));
+    Tensor tCrSFB_copy_view  = smem_thr_copy_SFB.retile_D(tCrSFB);
+
+    // Size of the register pipeline
+    auto K_BLOCK_MAX = size<2>(tCrA);
+
+    int read_stage = smem_pipe_read.index();
+    auto tCsA_stage     = tCsA(_,_,_,read_stage);
+    auto tCsB_stage     = tCsB(_,_,_,read_stage);
+    auto tCsSFA_stage   = tCsSFA(_,_,_,read_stage);
+    auto tCsSFB_stage   = tCsSFB(_,_,_,read_stage);
+
+    auto copy_kblock = [&](auto k_block) {
+      copy(smem_tiled_copy_A, tCsA_stage(_,_,k_block), tCrA_copy_view(_,_,k_block));
+      copy(smem_tiled_copy_B, tCsB_stage(_,_,k_block), tCrB_copy_view(_,_,k_block));
+
+      using MMAOp = typename TiledMma::MMA_Op;
+      fp4_shift_A(MMAOp{}, tCrA_copy_view(_,_,k_block));
+      fp4_shift_B(MMAOp{}, tCrB_copy_view(_,_,k_block));
+
+      copy(tCsSFA_stage(_,_,k_block), tCrSFA_copy_view(_,_,k_block));
+      copy(tCsSFB_stage(_,_,k_block), tCrSFB_copy_view(_,_,k_block));
+    };
+
+    auto gemm_kblock = [&](auto k_block) {
+      cute::gemm(tiled_mma,
+                 make_zip_tensor(tCrA(_,_,k_block), tCrSFA(_,_,k_block)),
+                 make_zip_tensor(tCrB(_,_,k_block), tCrSFB(_,_,k_block)),
+                 accum);
+    };
+
+    pipeline.consumer_wait(smem_pipe_read);
+
+    copy_kblock(_0{});
+    CUTLASS_PRAGMA_NO_UNROLL
+    for ( ; k_tile_count > 1; --k_tile_count) {
+      for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
+        auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+
+        if (k_block == K_BLOCK_MAX - 1) {
+          cutlass::arch::NamedBarrier::sync(
+          thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+          pipeline.consumer_release(smem_pipe_read);
+          ++smem_pipe_read;
+          read_stage = smem_pipe_read.index();
+          tCsA_stage     = tCsA(_,_,_,read_stage);
+          tCsB_stage     = tCsB(_,_,_,read_stage);
+          tCsSFA_stage   = tCsSFA(_,_,_,read_stage);
+          tCsSFB_stage   = tCsSFB(_,_,_,read_stage);
+          pipeline.consumer_wait(smem_pipe_read);
+        }
+
+        copy_kblock(k_block_next);
+        gemm_kblock(k_block);
+      });
     }
+
+    // Last k_tile
+    for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
+      auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+
+      if (k_block == K_BLOCK_MAX - 1) {
+        cutlass::arch::NamedBarrier::sync(
+        thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+        pipeline.consumer_release(smem_pipe_read);
+        ++smem_pipe_read;
+      }
+
+      if (k_block_next > 0) {
+        copy_kblock(k_block_next);
+      }
+      gemm_kblock(k_block);
+    });
   }
 
+  /// Perform a Consumer Epilogue to release all buffers
+  /// No-op: the pipelined main loop already releases all pipeline stages.
   CUTLASS_DEVICE void
-  mma_tail(MainloopPipeline pipeline, PipelineState smem_pipe_release, int k_tile_count) {
-    pipeline.consumer_release(smem_pipe_release);
+  mma_tail(MainloopPipeline, PipelineState, int) {
   }
 };
 

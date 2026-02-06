@@ -1,16 +1,20 @@
 /***************************************************************************************************
- * SM120 Gated SwiGLU Epilogue
+ * SM120 Gated SwigluBias Epilogue
  *
- * This epilogue receives two accumulators (linear and gate) and applies SwiGLU:
- *   output = SiLU(gate) * linear
+ * This epilogue receives two accumulators (linear and gate) and applies SwigluBias:
  *
- * where SiLU(x) = x * sigmoid(x)
+ *   gate_clamped   = min(gate, limit)
+ *   linear_clamped = clamp(linear, -limit, limit)
+ *   output = gate_clamped * sigmoid(gate_clamped * alpha) * (linear_clamped + beta)
  *
+ * This exactly matches the SwigluBiasAdaptor formula used in doGatedActivation.
  * The output is stored as BF16 to an auxiliary buffer.
  *
  **************************************************************************************************/
 
 #pragma once
+
+#include <limits>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/numeric_types.h"
@@ -27,11 +31,11 @@ using namespace cute;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Simple gated SwiGLU epilogue for SM120
+/// Gated SwigluBias epilogue for SM120
 ///
-/// This is a minimal implementation that:
+/// This implementation:
 /// 1. Receives two accumulator fragments (linear and gate)
-/// 2. Applies SwiGLU: output = SiLU(gate) * linear
+/// 2. Applies exact SwigluBias: gate_c * sigmoid(gate_c * alpha) * (linear_c + beta)
 /// 3. Stores BF16 result to global memory
 ///
 template <
@@ -49,7 +53,6 @@ struct Sm120GatedSwiGLUEpilogue {
   using ElementCompute = float;
   
   // Required by gemm_universal_adapter.h (kernel concept conformance)
-  // This epilogue doesn't use a traditional ThreadEpilogueOp pattern
   using ThreadEpilogueOp = void;
   using GmemTiledCopyC = void;
   using GmemTiledCopyD = void;
@@ -70,7 +73,9 @@ struct Sm120GatedSwiGLUEpilogue {
   struct Arguments {
     ElementOutput* ptr_output = nullptr;    // Output buffer [M, N]
     StrideOutput stride_output{};           // Output stride
-    float alpha = 1.0f;                     // Optional scaling (usually 1.0)
+    float swiglu_alpha = 1.0f;             // Sigmoid scaling: sigmoid(gate * alpha)
+    float swiglu_beta  = 0.0f;             // Linear bias: (linear + beta)
+    float swiglu_limit = std::numeric_limits<float>::infinity();  // Clamp bound
   };
 
   //
@@ -79,7 +84,9 @@ struct Sm120GatedSwiGLUEpilogue {
   struct Params {
     ElementOutput* ptr_output = nullptr;
     StrideOutput stride_output{};
-    float alpha = 1.0f;
+    float swiglu_alpha = 1.0f;
+    float swiglu_beta  = 0.0f;
+    float swiglu_limit = std::numeric_limits<float>::infinity();
   };
 
   template <class ProblemShape>
@@ -88,7 +95,8 @@ struct Sm120GatedSwiGLUEpilogue {
       Arguments const& args,
       void* workspace) {
     (void)workspace;
-    return {args.ptr_output, args.stride_output, args.alpha};
+    return {args.ptr_output, args.stride_output,
+            args.swiglu_alpha, args.swiglu_beta, args.swiglu_limit};
   }
 
   template <class ProblemShape>
@@ -105,33 +113,24 @@ struct Sm120GatedSwiGLUEpilogue {
   Sm120GatedSwiGLUEpilogue() {}
 
   //
-  // SiLU activation: x * sigmoid(x)
+  // SwigluBias activation (exact match to SwigluBiasAdaptor):
+  //   gate_clamped   = min(gate, limit)
+  //   linear_clamped = max(min(linear, limit), -limit)
+  //   output = gate_clamped * sigmoid(gate_clamped * alpha) * (linear_clamped + beta)
   //
   CUTLASS_DEVICE
-  static ElementCompute silu(ElementCompute x) {
-    // Fast SiLU: x * sigmoid(x) = x / (1 + exp(-x))
-    return x / (ElementCompute(1) + expf(-x));
-  }
-
-  //
-  // SwiGLU: SiLU(gate) * linear
-  //
-  CUTLASS_DEVICE
-  static ElementCompute swiglu(ElementCompute linear, ElementCompute gate) {
-    return silu(gate) * linear;
+  static ElementCompute swiglu_bias(
+      ElementCompute linear, ElementCompute gate,
+      float alpha, float beta, float limit) {
+    ElementCompute gate_clamped   = fminf(gate, limit);
+    ElementCompute linear_clamped = fmaxf(fminf(linear, limit), -limit);
+    ElementCompute sigmoid_val    = ElementCompute(1) / (ElementCompute(1) + expf(-(gate_clamped * alpha)));
+    return gate_clamped * sigmoid_val * (linear_clamped + beta);
   }
 
   //
   // Main epilogue operator
   //
-  /// Process a tile of accumulators and store the gated result
-  ///
-  /// @param accum_linear  Linear accumulator fragment (A @ W_linear)
-  /// @param accum_gate    Gate accumulator fragment (A @ W_gate)
-  /// @param tile_coord    Tile coordinates (m, n, k, l)
-  /// @param params        Epilogue parameters
-  /// @param thread_idx    Thread index within CTA
-  ///
   template <class FrgTensorC, class TileCoord>
   CUTLASS_DEVICE void
   operator()(
@@ -157,9 +156,9 @@ struct Sm120GatedSwiGLUEpilogue {
     // Slice to this tile
     Tensor gD = local_tile(mD, TileShape{}, make_coord(m_coord, n_coord));
     
-    // Process elements
-    // Note: This is a simplified version. A full implementation would use
-    // vectorized stores and proper thread/warp partitioning.
+    float const alpha = params.swiglu_alpha;
+    float const beta  = params.swiglu_beta;
+    float const limit = params.swiglu_limit;
     
     CUTLASS_PRAGMA_UNROLL
     for (int v = 0; v < size<0>(accum_linear); ++v) {
@@ -167,19 +166,13 @@ struct Sm120GatedSwiGLUEpilogue {
       for (int m = 0; m < size<1>(accum_linear); ++m) {
         CUTLASS_PRAGMA_UNROLL
         for (int n = 0; n < size<2>(accum_linear); ++n) {
-          // Get accumulator values
           ElementCompute linear_val = static_cast<ElementCompute>(accum_linear(v, m, n));
-          ElementCompute gate_val = static_cast<ElementCompute>(accum_gate(v, m, n));
+          ElementCompute gate_val   = static_cast<ElementCompute>(accum_gate(v, m, n));
           
-          // Apply SwiGLU
-          ElementCompute output_val = swiglu(linear_val, gate_val);
+          ElementCompute output_val = swiglu_bias(linear_val, gate_val, alpha, beta, limit);
           
-          // Apply alpha scaling
-          output_val *= params.alpha;
-          
-          // Convert to output type and store
           // Note: Proper implementation would compute thread-specific indices
-          // and use vectorized stores. This is illustrative.
+          // and use vectorized stores. This is for reference/documentation.
           // gD(m, n) = static_cast<ElementOutput>(output_val);
         }
       }
@@ -187,19 +180,21 @@ struct Sm120GatedSwiGLUEpilogue {
   }
 
   //
-  // Alternative: Return processed accumulators for external store
+  // Apply SwigluBias to accumulator fragments (for use by mainloop inline path)
   //
   template <class FrgTensorC>
   CUTLASS_DEVICE auto
-  apply_swiglu(FrgTensorC const& accum_linear, FrgTensorC const& accum_gate) {
-    // Create output tensor with same shape
+  apply_swiglu_bias(
+      FrgTensorC const& accum_linear, FrgTensorC const& accum_gate,
+      float alpha, float beta, float limit) {
     FrgTensorC result;
     
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(accum_linear); ++i) {
       ElementCompute linear_val = static_cast<ElementCompute>(accum_linear(i));
-      ElementCompute gate_val = static_cast<ElementCompute>(accum_gate(i));
-      result(i) = static_cast<typename FrgTensorC::value_type>(swiglu(linear_val, gate_val));
+      ElementCompute gate_val   = static_cast<ElementCompute>(accum_gate(i));
+      result(i) = static_cast<typename FrgTensorC::value_type>(
+          swiglu_bias(linear_val, gate_val, alpha, beta, limit));
     }
     
     return result;

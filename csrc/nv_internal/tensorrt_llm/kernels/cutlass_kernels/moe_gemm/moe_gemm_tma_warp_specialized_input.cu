@@ -23,7 +23,7 @@
 #include "tensorrt_llm/common/logger.h"
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
-std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
+std::array<size_t, 24> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
     int num_experts, FpXBlockScalingType scaling_type) {
   size_t problem_shape_size = sizeof(ProblemShape::UnderlyingProblemShape) * num_experts;
   size_t stride_act_size = std::max(sizeof(StrideA), sizeof(StrideB)) * num_experts;
@@ -50,6 +50,13 @@ std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
 
   size_t ptr_token_map_size = sizeof(int**) * num_experts;
 
+  // Gated FC1 extension: gate weight pointers, gate SF pointers,
+  // gated output pointers, and gated output strides
+  size_t gated_ptr_weight_gate_size = ptr_buf_size;
+  size_t gated_sf_gate_size = sizeof(ElementSF*) * num_experts;
+  size_t gated_ptr_output_size = ptr_buf_size;
+  size_t gated_stride_output_size = stride_d_size;
+
   return std::array{problem_shape_size,
                     stride_act_size,
                     stride_weight_size,
@@ -69,7 +76,11 @@ std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
                     int4_groupwise_stride_sf_a_size,
                     ptr_buf_size,
                     scale_buf_size,
-                    ptr_token_map_size};
+                    ptr_token_map_size,
+                    gated_ptr_weight_gate_size,
+                    gated_sf_gate_size,
+                    gated_ptr_output_size,
+                    gated_stride_output_size};
 }
 
 size_t TmaWarpSpecializedGroupedGemmInput::workspaceSize(int num_experts,
@@ -83,10 +94,10 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, i
                                                             size_t gemm_workspace_size,
                                                             FpXBlockScalingType scaling_type) {
   auto buffers = workspaceBuffers(num_experts, scaling_type);
-  std::array<int8_t*, 20> pointers{};
+  std::array<int8_t*, 24> pointers{};
   TLLM_CHECK_WITH_INFO(pointers.size() == buffers.size(),
                        "Mismatching workspace size and number of buffers");
-  for (int i = 0; i < buffers.size(); i++) {
+  for (size_t i = 0; i < buffers.size(); i++) {
     pointers[i] = start_ptr;
     start_ptr = tensorrt_llm::common::nextWorkspacePtr(start_ptr, buffers[i]);
   }
@@ -122,6 +133,12 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, i
   fused_finalize_epilogue.ptr_bias = reinterpret_cast<void const**>(pointers[17]);
   fused_finalize_epilogue.ptr_router_scales = reinterpret_cast<float const**>(pointers[18]);
   fused_finalize_epilogue.ptr_source_token_index = reinterpret_cast<int const**>(pointers[19]);
+
+  // Gated FC1 extension arrays (always allocated, only populated when gated_fc1.enabled)
+  gated_fc1.ptr_weight_gate = reinterpret_cast<void const**>(pointers[20]);
+  gated_fc1.sf_gate = reinterpret_cast<ElementSF const**>(pointers[21]);
+  gated_fc1.ptr_output = reinterpret_cast<void**>(pointers[22]);
+  gated_fc1.stride_output = reinterpret_cast<void*>(pointers[23]);
 
   this->gemm_workspace = reinterpret_cast<uint8_t*>(gemm_workspace);
   this->gemm_workspace_size = gemm_workspace_size;

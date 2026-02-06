@@ -1,0 +1,81 @@
+CompileFlags:
+  # See CUTLASS IDE setup guidance:
+  # https://docs.nvidia.com/cutlass/latest/media/docs/cpp/ide_setup.html
+  #
+  # NOTE: This config is for clangd indexing/intellisense only.
+  # FlashInfer/CUTLASS are C++17 (not C++20).
+  Add:
+    - --std=c++17
+    - -stdlib=libstdc++
+    # Ensure clangd sees the real libstdc++ headers.
+    - -isystem/usr/include/c++/13
+    - -isystem/usr/include/aarch64-linux-gnu/c++/13
+    - -isystem/usr/include/c++/13/backward
+    - -isystem/usr/lib/gcc/aarch64-linux-gnu/13/include
+    - -isystem/usr/include/aarch64-linux-gnu
+    - -isystem/usr/include
+
+    # FlashInfer includes.
+    - -I/home/swank/projects/flashinfer/include
+    - -I/home/swank/projects/flashinfer/csrc
+    # Also support the common Docker mount location.
+    - -I/workspace/flashinfer/include
+    - -I/workspace/flashinfer/csrc
+
+    # CUTLASS include paths (FlashInfer submodule).
+    - -I/home/swank/projects/flashinfer/3rdparty/cutlass/include
+    - -I/home/swank/projects/flashinfer/3rdparty/cutlass/tools/util/include
+    - -I/home/swank/projects/flashinfer/3rdparty/cutlass/examples/common
+    - -I/workspace/flashinfer/3rdparty/cutlass/include
+    - -I/workspace/flashinfer/3rdparty/cutlass/tools/util/include
+    - -I/workspace/flashinfer/3rdparty/cutlass/examples/common
+
+    # Common clangd/intellisense defines.
+    - "-D__INTELLISENSE__"
+    - "-D__CLANGD__"
+
+    # CUTLASS/CUDA headers can trigger constexpr diagnostics in clangd.
+    - "-Wno-invalid-constexpr"
+
+  Remove:
+    # Strip nvcc-only / fatbin flags that confuse clangd.
+    - "-Xfatbin*"
+    - "-gencode*"
+    - "--generate-code*"
+    - "-ccbin*"
+    - "--compiler-options*"
+    - "--expt-extended-lambda"
+    - "--expt-relaxed-constexpr"
+    - "-forward-unknown-to-host-compiler"
+    - "-Werror=cross-execution-space-call"
+
+Diagnostics:
+  Suppress:
+    - "variadic_device_fn"
+    - "attributes_not_allowed"
+
+---
+# Enable CUDA parsing only for CUDA translation units and CUDA-heavy headers.
+If:
+  PathMatch: .*(\.(cu)$|/include/flashinfer/.*\.cuh$|/csrc/.*\.(cu|cuh|inl)$).*
+CompileFlags:
+  Add:
+    - --cuda-path=/usr/local/cuda
+    # clangd (LLVM 18) may not recognize sm_12x yet; use sm_90a for parsing.
+    - --cuda-gpu-arch=sm_90a
+    - --no-cuda-version-check
+    - -I/usr/local/cuda/include
+    - "-D__CUDACC_VER_MAJOR__=13"
+    - "-D__CUDACC_VER_MINOR__=0"
+
+---
+# Only force SM121-specific compile-time paths for the SM12x GEMM/MoE code we
+# actively edit. Defining __CUDA_ARCH__ globally makes clangd treat host-only
+# utilities (e.g. std::atomic in utils) as device code and produces noisy errors.
+If:
+  PathMatch: .*(/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/|/include/flashinfer/gemm/|/csrc/fused_moe/).*
+CompileFlags:
+  Add:
+    - "-D__CUDA_ARCH__=1210"
+    - "-D__CUDA_ARCH_FEAT_SM121_ALL"
+    - "-DCUTLASS_ARCH_MMA_SM121_SUPPORTED=1"
