@@ -36,6 +36,10 @@ class CompilationContext:
             for arch in os.environ["FLASHINFER_CUDA_ARCH_LIST"].split(" "):
                 major, minor = arch.split(".")
                 major = int(major)
+                # Normalize: SM12x and SM9x require 'a' suffix for gencode,
+                # not 'f'. Accept either in the env var but always emit 'a'.
+                if major >= 9:
+                    minor = minor.rstrip("af") + "a"
                 self.TARGET_CUDA_ARCHS.add((int(major), str(minor)))
         else:
             try:

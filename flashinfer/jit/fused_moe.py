@@ -50,14 +50,21 @@ def _get_fused_moe_build_profile() -> str:
 def gen_cutlass_fused_moe_sm120_module(
     use_fast_build: bool = False,
     tile_mn: tuple[int, int] = (128, 128),
+    fuse_activation: bool = False,
 ) -> JitSpec:
     """Generate SM120 MoE module with configurable logical GEMM tile (M,N).
+
+    Produces either a standard (unfused) or fused-activation module depending
+    on ``fuse_activation``.  Both variants are cached as separate ``.so`` files
+    distinguished by a ``_fusedact`` suffix in the module name.
 
     Args:
         use_fast_build: Enable fast build mode (reduced optimizations).
         tile_mn: Logical (M,N) tile for the MoE GEMM (K is fixed by kernel family).
             This is *logical* in the sense of D = A @ W (M=tokens, N=output feature dim).
             Some logical tiles may be implemented via internal swap/transpose tricks.
+        fuse_activation: When True, compile with ``-DFLASHINFER_FUSED_ACTIVATION``
+            (SwiGLU fused into the GEMM epilogue).  Incompatible with swap_ab tiles.
 
     Returns:
         JitSpec for the configured MoE module.
@@ -69,6 +76,12 @@ def gen_cutlass_fused_moe_sm120_module(
     # we use swap_ab to transpose the problem: physical (N, M) -> logical (M, N).
     # For logical M >= 64, we use the native (non-swapped) path.
     swap_ab = logical_m < 64
+
+    if fuse_activation and swap_ab:
+        raise ValueError(
+            f"Fused activation is incompatible with swap_ab tiles (tile_mn={tile_mn}). "
+            "The 6-plane TMA mainloop requires a non-transposed layout."
+        )
 
     nvcc_flags = [
         "-DCOMPILE_BLACKWELL_TMA_GEMMS",
@@ -91,6 +104,12 @@ def gen_cutlass_fused_moe_sm120_module(
     if (logical_m, logical_n) != (128, 128):
         module_suffix = f"_M{logical_m}N{logical_n}"
 
+    # Fused activation: add define and suffix so the module is cached
+    # separately from its unfused counterpart for the same tile.
+    if fuse_activation:
+        nvcc_flags += ["-DFLASHINFER_FUSED_ACTIVATION"]
+        module_suffix += "_fusedact"
+
     # Optional: reduce compilation surface area for SM120/121 MXFP4 iteration.
     # Default to minimal for SM120/121 unless explicitly overridden.
     env_val = os.getenv(_FUSED_MOE_BUILD_PROFILE_ENV)
@@ -99,21 +118,6 @@ def gen_cutlass_fused_moe_sm120_module(
     if build_profile == "mxfp4_minimal":
         nvcc_flags += ["-DFLASHINFER_FUSED_MOE_MXFP4_MINIMAL"]
         module_suffix += "_mxfp4min"
-
-    # Gated-FC1 fusion (Layer 1A): fused dual-accumulator GEMM with inline
-    # SwigluBias (alpha/beta/limit).  Default ON — the kernel is compiled and
-    # the runtime automatically selects it for gated activations on block-scaled
-    # MXFP4 paths.  Set FLASHINFER_ENABLE_GATED_FC1=0 to force the unfused path.
-    def _env_on(name: str, default: str = "1") -> bool:
-        v = os.getenv(name, default)
-        v = (v or "").strip()
-        return v not in ("", "0", "false", "False", "no", "No")
-
-    enable_gated_fc1 = _env_on("FLASHINFER_ENABLE_GATED_FC1", "1")
-
-    if enable_gated_fc1:
-        nvcc_flags += ["-DFLASHINFER_GATED_FC1"]
-        module_suffix += "_gatedfc1"
 
     return gen_cutlass_fused_moe_module(
         nvcc_flags, f"120{module_suffix}", use_fast_build

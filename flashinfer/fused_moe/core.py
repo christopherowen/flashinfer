@@ -385,6 +385,31 @@ SM120_SUPPORTED_TILE_MN = (
 )
 
 
+# Supported tile shapes for fused-activation modules on SM120/121.
+# The fused mainloop loads 6 TMA planes (A, B, Aux, SFA, SFB, SFAux) which
+# requires ~71KB SMEM for a 64x64x128 tile.  Larger tiles exceed SM121's
+# 101,376-byte limit.  Only non-swap_ab tiles are supported.
+SM120_FUSED_SUPPORTED_TILE_MN = (
+    (64, 64),    # ~71KB SMEM - fits with 29KB margin
+)
+
+
+def select_tile_mn_for_sm120_fused(num_tokens: int) -> tuple[int, int]:
+    """Select logical (M,N) tile for SM120/121 fused-activation MoE GEMM.
+
+    Currently only 64x64 is validated for the fused path.  As more tiles
+    are validated, this function will implement batch-size-aware selection
+    analogous to ``select_tile_mn_for_sm120``.
+
+    Args:
+        num_tokens: Number of tokens in the batch.
+
+    Returns:
+        Tile shape (M, N).
+    """
+    return (64, 64)
+
+
 def select_tile_mn_for_sm120(num_tokens: int) -> tuple[int, int]:
     """Select logical (M,N) tile for SM120/121 MoE GEMM.
 
@@ -417,6 +442,7 @@ def get_cutlass_fused_moe_module(
     backend: str = "100",
     use_fast_build: bool = False,
     tile_mn: tuple[int, int] = (128, 128),
+    fuse_activation: bool = False,
 ):
     """Get JIT-compiled CUTLASS MoE module.
 
@@ -424,66 +450,66 @@ def get_cutlass_fused_moe_module(
         backend: GPU architecture backend (e.g., "120", "100", "90").
         use_fast_build: Enable fast build mode.
         tile_mn: Logical (M,N) tile (only used for SM120/121).
+        fuse_activation: If True, compile with -DFLASHINFER_FUSED_ACTIVATION.
+            The module is cached separately from its unfused counterpart
+            (SM120/121 only).
 
     Returns:
         Compiled MoE module with attached MoERunner class.
     """
 
     if backend in ("120", "121"):
-        logical_m, logical_n = tile_mn
-        # SM120/121 block-scaled MXFP4 constraints:
-        # - Physical M must be >= 64 (tcgen05 hardware minimum)
-        # - For logical M < 64, swap_ab is used (physical tile is (N, M))
-        # - N must be a power of 2 in {8, 16, 32, 64, 128, 256}
-        # - Total tile must fit in smem with >= 2 pipeline stages
-        
-        valid_ns = (8, 16, 32, 64, 128, 256, 512)
-        valid_swapped_ms = (8, 16, 32)  # Logical M for swapped tiles
-        
-        # Check if this is a swapped tile (logical M < 64)
-        is_swapped = logical_m < 64
-        
-        if is_swapped:
-            # Swapped tile: physical (N, M) -> logical (M, N)
-            # Physical M = logical N, physical N = logical M
-            # Physical M must be >= 64
-            if logical_m not in valid_swapped_ms:
-                raise ValueError(
-                    f"Unsupported SM120/121 logical tile_mn={tile_mn}: for swapped tiles "
-                    f"(M < 64), M must be in {valid_swapped_ms}."
-                )
-            if logical_n < 64:
-                raise ValueError(
-                    f"Unsupported SM120/121 logical tile_mn={tile_mn}: for swapped tiles "
-                    f"(M < 64), N must be >= 64 (becomes physical M after swap)."
-                )
-        else:
-            # Native tile: M must be multiple of 64
-            if logical_m <= 0 or logical_m % 64 != 0:
-                raise ValueError(
-                    f"Unsupported SM120/121 logical tile_mn={tile_mn}: M must be a positive "
-                    f"multiple of 64 (tcgen05 constraint), or use swapped tiles for M < 64."
-                )
-        
-        # N must be a power of 2 for both native and swapped tiles
-        if logical_n not in valid_ns:
+        # Validate tile against supported set
+        supported = SM120_FUSED_SUPPORTED_TILE_MN if fuse_activation else SM120_SUPPORTED_TILE_MN
+        if tile_mn not in supported:
+            kind = "fused" if fuse_activation else "unfused"
             raise ValueError(
-                f"Unsupported SM120/121 logical tile_mn={tile_mn}: N must be a power of 2 "
-                f"in {valid_ns} (smem layout atom constraint)."
-            )
-        
-        # Check smem capacity (simplified check for known bad combinations)
-        # Full list is in SM120_SUPPORTED_TILE_MN
-        if tile_mn not in SM120_SUPPORTED_TILE_MN:
-            raise ValueError(
-                f"Unsupported SM120/121 logical tile_mn={tile_mn}: tile exceeds smem capacity "
-                f"or is not in supported set. Valid tiles: {SM120_SUPPORTED_TILE_MN}"
+                f"Unsupported SM120/121 {kind} tile_mn={tile_mn}. "
+                f"Valid {kind} tiles: {supported}"
             )
 
-        # SM120/121: Support logical (M,N) tile selection
+        if not fuse_activation:
+            logical_m, logical_n = tile_mn
+            # SM120/121 block-scaled MXFP4 constraints:
+            # - Physical M must be >= 64 (tcgen05 hardware minimum)
+            # - For logical M < 64, swap_ab is used (physical tile is (N, M))
+            # - N must be a power of 2 in {8, 16, 32, 64, 128, 256}
+            # - Total tile must fit in smem with >= 2 pipeline stages
+
+            valid_ns = (8, 16, 32, 64, 128, 256, 512)
+            valid_swapped_ms = (8, 16, 32)  # Logical M for swapped tiles
+
+            # Check if this is a swapped tile (logical M < 64)
+            is_swapped = logical_m < 64
+
+            if is_swapped:
+                if logical_m not in valid_swapped_ms:
+                    raise ValueError(
+                        f"Unsupported SM120/121 logical tile_mn={tile_mn}: for swapped tiles "
+                        f"(M < 64), M must be in {valid_swapped_ms}."
+                    )
+                if logical_n < 64:
+                    raise ValueError(
+                        f"Unsupported SM120/121 logical tile_mn={tile_mn}: for swapped tiles "
+                        f"(M < 64), N must be >= 64 (becomes physical M after swap)."
+                    )
+            else:
+                if logical_m <= 0 or logical_m % 64 != 0:
+                    raise ValueError(
+                        f"Unsupported SM120/121 logical tile_mn={tile_mn}: M must be a positive "
+                        f"multiple of 64 (tcgen05 constraint), or use swapped tiles for M < 64."
+                    )
+
+            if logical_n not in valid_ns:
+                raise ValueError(
+                    f"Unsupported SM120/121 logical tile_mn={tile_mn}: N must be a power of 2 "
+                    f"in {valid_ns} (smem layout atom constraint)."
+                )
+
         module = gen_cutlass_fused_moe_sm120_module(
             use_fast_build=use_fast_build,
             tile_mn=tile_mn,
+            fuse_activation=fuse_activation,
         ).build_and_load()
     elif backend == "103":
         module = gen_cutlass_fused_moe_sm103_module(use_fast_build).build_and_load()
@@ -688,7 +714,7 @@ def get_cutlass_fused_moe_module(
         enable_pdl: Optional[bool] = None,
         activation_type: ActivationType = ActivationType.Swiglu,
         use_packed_weights: bool = False,
-        fuse_gated_fc1: bool = False,
+        fuse_activation: bool = False,
     ) -> List[torch.Tensor]:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(input.device)
@@ -815,7 +841,7 @@ def get_cutlass_fused_moe_module(
             [gemm_tactic_1, gemm_tactic_2],
             enable_pdl,
             activation_type,
-            fuse_gated_fc1,
+            fuse_activation,
         )
 
         return (
@@ -859,7 +885,7 @@ def get_cutlass_fused_moe_module(
         tune_max_num_tokens: int = 8192,
         enable_pdl: Optional[bool] = None,
         use_packed_weights: bool = False,
-        fuse_gated_fc1: bool = False,
+        fuse_activation: bool = False,
     ):
         seq_len = input.shape[0]
         hidden_size = fc2_expert_weights.shape[1]
@@ -917,7 +943,7 @@ def cutlass_fused_moe(
     enable_pdl: Optional[bool] = None,
     activation_type: ActivationType = ActivationType.Swiglu,
     auto_tile_select: bool = True,
-    fuse_gated_fc1: bool = False,
+    fuse_activation: bool = False,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -1079,11 +1105,16 @@ def cutlass_fused_moe(
             output, output_shape, output_dtype, input.device, "output"
         )
 
-    tile_mn = (128, 128)
-    if auto_tile_select:
+    if fuse_activation:
+        tile_mn = select_tile_mn_for_sm120_fused(num_rows)
+    elif auto_tile_select:
         tile_mn = select_tile_mn_for_sm120(num_rows)
+    else:
+        tile_mn = (128, 128)
 
-    return get_cutlass_fused_moe_module(device_arch, tile_mn=tile_mn).cutlass_fused_moe(
+    return get_cutlass_fused_moe_module(
+        device_arch, tile_mn=tile_mn, fuse_activation=fuse_activation,
+    ).cutlass_fused_moe(
         output,
         input,
         token_selected_experts,
@@ -1113,38 +1144,36 @@ def cutlass_fused_moe(
         tune_max_num_tokens=tune_max_num_tokens,
         enable_pdl=enable_pdl,
         activation_type=activation_type,
-        fuse_gated_fc1=fuse_gated_fc1,
+        fuse_activation=fuse_activation,
     )
 
 
 def prewarm_moe_tiles():
-    """Pre-compile tile variants during server startup.
-    
-    Pre-warms the MoE GEMM kernel for SM120/121 to avoid JIT compilation
-    latency during inference. Currently only the baseline (128,128) tile
-    is pre-warmed.
-    
-    Additional validated tiles that could be prewarmed:
-    - (64, 128): native tile for decode
-    - (32, 128): swap tile for small decode batches
+    """Pre-compile all MoE tile variants during server startup.
+
+    Compiles both fused and unfused modules so that runtime selection
+    via VLLM_MXFP4_FUSE_ACTIVATION has no JIT latency penalty.
     """
-    # Prewarm validated tiles (2026-01-31 validation)
-    TILES_TO_PREWARM: list[tuple[int, int]] = [
-        (128, 128),  # Production default
-        (64, 128),   # Decode-optimized native tile
+    # (tile_mn, fuse_activation) pairs to prewarm
+    MODULES_TO_PREWARM: list[tuple[tuple[int, int], bool]] = [
+        # Unfused tiles
+        ((128, 128), False),  # Prefill default
+        ((64, 128), False),   # Decode-optimized native tile
+        # Fused tiles
+        ((64, 64), True),     # Fused activation (SwiGLU in GEMM epilogue)
     ]
-    # Try to detect if we are on SM120/121
     try:
         major, minor = torch.cuda.get_device_capability()
         arch = f"{major}{minor}"
-        # Only prewarm for Blackwell SM120/121
         if arch not in ("120", "121"):
             return
-            
-        logger.info(f"Prewarming {len(TILES_TO_PREWARM)} MoE tile variants for SM{arch}...")
-        for tile_mn in TILES_TO_PREWARM:
-            _ = get_cutlass_fused_moe_module(backend="120", tile_mn=tile_mn)
-        logger.info(f"Prewarmed {len(TILES_TO_PREWARM)} MoE tile variants")
+
+        logger.info(f"Prewarming {len(MODULES_TO_PREWARM)} MoE modules for SM{arch}...")
+        for tile_mn, fuse in MODULES_TO_PREWARM:
+            _ = get_cutlass_fused_moe_module(
+                backend="120", tile_mn=tile_mn, fuse_activation=fuse,
+            )
+        logger.info(f"Prewarmed {len(MODULES_TO_PREWARM)} MoE modules")
     except Exception as e:
         logger.warning(f"Failed to prewarm MoE tiles: {e}")
 

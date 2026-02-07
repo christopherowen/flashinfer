@@ -509,18 +509,18 @@ DEFINE_SM120_MXFP4_TRANSPOSED_NAMESPACE(sm120_mxfp4_bf16, LOGICAL_TILE_M)
 DEFINE_SM120_MXFP4_STANDARD_NAMESPACE(sm120_mxfp4_bf16, LOGICAL_TILE_M, LOGICAL_TILE_N, 128)
 #endif
 
-// Gated mode (FC1 with fused SwiGLU) - instantiated when FLASHINFER_GATED_FC1 is defined
-// FIXED tile 64×64×128: the gated mainloop loads 6 TMA planes (A, B, Aux, SFA, SFB, SFAux)
+// Fused activation mode (FC1 with fused SwiGLU) - instantiated when FLASHINFER_FUSED_ACTIVATION is defined
+// FIXED tile 64×64×128: the fused mainloop loads 6 TMA planes (A, B, Aux, SFA, SFB, SFAux)
 // which requires ~71KB SMEM. Larger tiles exceed the SM121 SMEM limit (101,376 bytes):
 //   128×128×128 → 129,024 bytes (over by 28KB)
 //    64×128×128 → 112,640 bytes (over by 11KB)
 //    64× 64×128 →  71,680 bytes (FITS with 29KB margin)
-#ifdef FLASHINFER_GATED_FC1
+#ifdef FLASHINFER_FUSED_ACTIVATION
 #if !SWAP_AB
-// Gated mode only supports standard (non-swapped) layout for now
+// Fused activation only supports standard (non-swapped) layout
 DEFINE_SM120_MXFP4_GATED_NAMESPACE(sm120_mxfp4_bf16_gated, 64, 64, 128)
 #endif
-#endif  // FLASHINFER_GATED_FC1
+#endif  // FLASHINFER_FUSED_ACTIVATION
 
 #endif  // CUTLASS_ARCH_MMA_SM12x_SUPPORTED && ENABLE_FP4
 
@@ -1262,7 +1262,7 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
 //   - Scale offset: (inter_size * ceil(K/32)) elements (MXFP4)
 //
 
-#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4) && defined(FLASHINFER_GATED_FC1)
+#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4) && defined(FLASHINFER_FUSED_ACTIVATION)
 
 // -----------------------------------------------------------------------------
 // Offset Kernel: Compute gate weight/SF pointers AND output pointers/strides
@@ -1381,11 +1381,11 @@ struct GatedFC1WorkspaceLayout {
   }
 };
 
-#endif  // CUTLASS_ARCH_MMA_SM12x_SUPPORTED && ENABLE_FP4 && FLASHINFER_GATED_FC1
+#endif  // CUTLASS_ARCH_MMA_SM12x_SUPPORTED && ENABLE_FP4 && FLASHINFER_FUSED_ACTIVATION
 
 template <typename T, typename WeightType, typename OutputType, typename EpilogueTag,
           typename TileShape, typename ClusterShape, bool IsMXFP4>
-void sm120_gated_fc1_moe_gemm_kernelLauncher(
+void sm120_fused_act_moe_gemm_kernelLauncher(
     TmaWarpSpecializedGroupedGemmInput tma_inputs,
     void* aux_output,           // [M, inter_size] BF16 output buffer
     int64_t const* expert_first_token_offset,  // [num_experts+1] token offsets per expert
@@ -1398,7 +1398,7 @@ void sm120_gated_fc1_moe_gemm_kernelLauncher(
     size_t* workspace_size) {
   TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
-#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4) && defined(FLASHINFER_GATED_FC1)
+#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4) && defined(FLASHINFER_FUSED_ACTIVATION)
 
   // Only MXFP4 supported
   static_assert(IsMXFP4,
@@ -1406,15 +1406,15 @@ void sm120_gated_fc1_moe_gemm_kernelLauncher(
 
   // Guardrails
   TLLM_CHECK_WITH_INFO(inter_size % 32 == 0,
-      "SM120 Gated FC1 requires inter_size divisible by 32 (SF_VEC_SIZE)");
+      "SM120 fused activation requires inter_size divisible by 32 (SF_VEC_SIZE)");
   TLLM_CHECK_WITH_INFO(!tma_inputs.swap_ab,
-      "SM120 Gated FC1 does not support swap_ab mode");
+      "SM120 fused activation does not support swap_ab mode");
   TLLM_CHECK_WITH_INFO(expert_first_token_offset != nullptr,
-      "SM120 Gated FC1 requires expert_first_token_offset");
+      "SM120 fused activation requires expert_first_token_offset");
 
-  // Use gated namespace
+  // Use fused activation namespace
   using namespace sm120_mxfp4_bf16_gated;
-  TLLM_LOG_DEBUG("[SM120 Gated FC1] tile_mn=(%d,%d) inter_size=%ld hidden_size=%ld num_experts=%d",
+  TLLM_LOG_DEBUG("[SM120 Fused Activation] tile_mn=(%d,%d) inter_size=%ld hidden_size=%ld num_experts=%d",
       LOGICAL_TILE_M, LOGICAL_TILE_N, (long)inter_size, (long)hidden_size, num_experts);
 
   Gemm gemm;
@@ -1652,26 +1652,26 @@ void sm120_gated_fc1_moe_gemm_kernelLauncher(
   (void)inter_size; (void)hidden_size;
   (void)num_experts; (void)multi_processor_count; (void)stream;
   (void)occupancy; (void)workspace_size;
-  TLLM_THROW("SM120 Gated FC1 requires CUTLASS_ARCH_MMA_SM12x_SUPPORTED, ENABLE_FP4, and FLASHINFER_GATED_FC1");
+  TLLM_THROW("SM120 fused activation requires CUTLASS_ARCH_MMA_SM12x_SUPPORTED, ENABLE_FP4, and FLASHINFER_FUSED_ACTIVATION");
 #endif
 }
 
 // =============================================================================
-// EXPLICIT TEMPLATE INSTANTIATIONS for gated FC1 launcher
+// EXPLICIT TEMPLATE INSTANTIATIONS for fused-activation launcher
 // =============================================================================
 // These are required because the template is defined here but called from
 // cutlass_fused_moe_kernels.cuh with specific types.
 //
-#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4) && defined(FLASHINFER_GATED_FC1)
+#if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4) && defined(FLASHINFER_FUSED_ACTIVATION)
 
 // FP8 activations × FP4 weights → BF16 output (standard MXFP4)
-// Tile must be 64×64×128 to fit the 6-plane gated mainloop in SM121 SMEM (71KB < 101KB limit)
-template void sm120_gated_fc1_moe_gemm_kernelLauncher<
+// Tile must be 64×64×128 to fit the 6-plane fused mainloop in SM121 SMEM (71KB < 101KB limit)
+template void sm120_fused_act_moe_gemm_kernelLauncher<
     __nv_fp8_e4m3,      // T (activation type)
     __nv_fp4_e2m1,      // WeightType
     __nv_bfloat16,      // OutputType
     void,               // EpilogueTag
-    cute::Shape<cute::Int<64>, cute::Int<64>, cute::Int<128>>,    // TileShape (fixed for gated SMEM)
+    cute::Shape<cute::Int<64>, cute::Int<64>, cute::Int<128>>,    // TileShape (fixed for fused SMEM)
     cute::Shape<cute::_1, cute::_1, cute::_1>,                    // ClusterShape
     true                // IsMXFP4
 >(
@@ -1686,6 +1686,6 @@ template void sm120_gated_fc1_moe_gemm_kernelLauncher<
     int* occupancy,
     size_t* workspace_size);
 
-#endif  // CUTLASS_ARCH_MMA_SM12x_SUPPORTED && ENABLE_FP4 && FLASHINFER_GATED_FC1
+#endif  // CUTLASS_ARCH_MMA_SM12x_SUPPORTED && ENABLE_FP4 && FLASHINFER_FUSED_ACTIVATION
 
 }  // namespace tensorrt_llm::kernels::cutlass_kernels_oss
