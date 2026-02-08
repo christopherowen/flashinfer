@@ -300,7 +300,7 @@ struct CollectiveMma<
     
     printf("\n");
     printf("====================================================================\n");
-    printf("GATED FC1 SMEM BREAKDOWN\n");
+    printf("FUSED FC1 SMEM BREAKDOWN\n");
     printf("====================================================================\n");
     printf("Component       | Elements    | Elem Size | Bytes      | Type\n");
     printf("-----------------------------------------------------------------\n");
@@ -583,7 +583,7 @@ struct CollectiveMma<
     if (cute::elect_one_sync()) {
       // Debug: print replacement addresses for block 0
       if (blockIdx.x == 0 && threadIdx.x == 0) {
-        printf("[GATED TMA UPDATE] batch=%d A=%p B=%p SFA=%p SFB=%p Aux=%p SFAux=%p\n",
+        printf("[FUSED TMA UPDATE] batch=%d A=%p B=%p SFA=%p SFB=%p Aux=%p SFAux=%p\n",
                next_batch,
                (void const*)params.base.ptr_A[next_batch],
                (void const*)params.base.ptr_B[next_batch],
@@ -679,33 +679,33 @@ struct CollectiveMma<
     
     // Debug: print shapes/strides for one block (block 0) to diagnose TMA descriptor issues
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-      printf("[GATED TMA DIAG] group=%d M=%d N=%d K=%d\n", next_group, int(M), int(N), int(K));
-      printf("[GATED TMA DIAG] A   shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
+      printf("[FUSED TMA DIAG] group=%d M=%d N=%d K=%d\n", next_group, int(M), int(N), int(K));
+      printf("[FUSED TMA DIAG] A   shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
              prob_shape_A[0], prob_shape_A[1], prob_shape_A[2], prob_shape_A[3], prob_shape_A[4],
              (unsigned long)prob_stride_A[0], (unsigned long)prob_stride_A[1], (unsigned long)prob_stride_A[2],
              (unsigned long)prob_stride_A[3], (unsigned long)prob_stride_A[4]);
-      printf("[GATED TMA DIAG] B   shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
+      printf("[FUSED TMA DIAG] B   shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
              prob_shape_B[0], prob_shape_B[1], prob_shape_B[2], prob_shape_B[3], prob_shape_B[4],
              (unsigned long)prob_stride_B[0], (unsigned long)prob_stride_B[1], (unsigned long)prob_stride_B[2],
              (unsigned long)prob_stride_B[3], (unsigned long)prob_stride_B[4]);
-      printf("[GATED TMA DIAG] Aux shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
+      printf("[FUSED TMA DIAG] Aux shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
              prob_shape_Aux[0], prob_shape_Aux[1], prob_shape_Aux[2], prob_shape_Aux[3], prob_shape_Aux[4],
              (unsigned long)prob_stride_Aux[0], (unsigned long)prob_stride_Aux[1], (unsigned long)prob_stride_Aux[2],
              (unsigned long)prob_stride_Aux[3], (unsigned long)prob_stride_Aux[4]);
-      printf("[GATED TMA DIAG] SFA shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
+      printf("[FUSED TMA DIAG] SFA shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
              prob_shape_SFA[0], prob_shape_SFA[1], prob_shape_SFA[2], prob_shape_SFA[3], prob_shape_SFA[4],
              (unsigned long)prob_stride_SFA[0], (unsigned long)prob_stride_SFA[1], (unsigned long)prob_stride_SFA[2],
              (unsigned long)prob_stride_SFA[3], (unsigned long)prob_stride_SFA[4]);
-      printf("[GATED TMA DIAG] SFB shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
+      printf("[FUSED TMA DIAG] SFB shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
              prob_shape_SFB[0], prob_shape_SFB[1], prob_shape_SFB[2], prob_shape_SFB[3], prob_shape_SFB[4],
              (unsigned long)prob_stride_SFB[0], (unsigned long)prob_stride_SFB[1], (unsigned long)prob_stride_SFB[2],
              (unsigned long)prob_stride_SFB[3], (unsigned long)prob_stride_SFB[4]);
-      printf("[GATED TMA DIAG] SFAux shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
+      printf("[FUSED TMA DIAG] SFAux shape=(%u,%u,%u,%u,%u) stride=(%lu,%lu,%lu,%lu,%lu)\n",
              prob_shape_SFAux[0], prob_shape_SFAux[1], prob_shape_SFAux[2], prob_shape_SFAux[3], prob_shape_SFAux[4],
              (unsigned long)prob_stride_SFAux[0], (unsigned long)prob_stride_SFAux[1], (unsigned long)prob_stride_SFAux[2],
              (unsigned long)prob_stride_SFAux[3], (unsigned long)prob_stride_SFAux[4]);
       // Print addresses being set
-      printf("[GATED TMA DIAG] Addrs: A=%p B=%p Aux=%p SFA=%p SFB=%p SFAux=%p\n",
+      printf("[FUSED TMA DIAG] Addrs: A=%p B=%p Aux=%p SFA=%p SFB=%p SFAux=%p\n",
              (void const*)params.base.ptr_A[next_group], (void const*)params.base.ptr_B[next_group],
              (void const*)params.aux.ptr_Aux[next_group],
              (void const*)params.base.ptr_SFA[next_group], (void const*)params.base.ptr_SFB[next_group],

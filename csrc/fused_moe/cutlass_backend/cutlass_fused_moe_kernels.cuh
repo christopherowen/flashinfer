@@ -1249,6 +1249,121 @@ __device__ void computeTmaWarpSpecializedInputPointers(
   }
 }
 
+// =============================================================================
+// Fused Activation TMA Stride Kernel
+// =============================================================================
+// Sets up TMA descriptors specifically for the fused (dual-accumulator) GEMM1.
+// Unlike the shared kernel below, this distinguishes the logical problem N
+// (inter_size) from the physical weight N (2*inter_size), preventing stride
+// mismatches that cause illegal instructions.
+template <class T, class WeightType, class OutputType, class ScaleBiasType>
+__global__ void computeStridesFusedActivationKernel(
+    int64_t const* expert_first_token_offset,
+    TmaWarpSpecializedGroupedGemmInput layout_info,
+    int64_t gemm1_n,       // logical problem N = inter_size
+    int64_t gemm1_k,       // K = hidden_size
+    int64_t weight_physical_n,  // physical weight N = 2 * inter_size
+    int64_t const num_experts_per_node,
+    T const* input,
+    WeightType const* weights,
+    float const* alpha_scale_flat,
+    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fp4_act_flat,
+    QuantParams quant_params,
+    OutputType* output) {
+  int const expert = blockIdx.x * blockDim.x + threadIdx.x;
+  if (expert >= num_experts_per_node) {
+    return;
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
+  auto const num_tokens_before_expert = expert_first_token_offset[expert];
+  auto const num_tokens_including_expert = expert_first_token_offset[expert + 1];
+  // Use int for dimensions -- matches make_cute_packed_stride(Shape<int,int,int>)
+  int const gemm_m = static_cast<int>(num_tokens_including_expert - num_tokens_before_expert);
+  int const gemm_n = static_cast<int>(gemm1_n);
+  int const gemm_k = static_cast<int>(gemm1_k);
+  int const phys_n = static_cast<int>(weight_physical_n);
+
+  // Problem shape uses the logical N (inter_size) -- what the GEMM computes.
+  // swap_ab is always false for fused activation.
+  layout_info.shape_info.problem_shapes[expert] =
+      TmaWarpSpecializedGroupedGemmInput::ProblemShape::UnderlyingProblemShape(
+          gemm_m, gemm_n, gemm_k);
+
+  if (alpha_scale_flat) {
+    layout_info.alpha_scale_ptr_array[expert] = alpha_scale_flat + expert;
+  }
+
+  // Block scaling factors (MXFP4 path)
+  // IMPORTANT: the Gated mainloop splits the weight SFs into two halves (linear + gate).
+  // SFB and SFAux each describe ONE half, so LayoutSF must use LOGICAL N (= inter_size).
+  // But the per-expert SF buffer stores BOTH halves contiguously [2*inter_size, K/block_size],
+  // so the per-expert OFFSET into the flat buffer must use PHYSICAL N (= 2*inter_size).
+  //
+  // We call setupFP4BlockScalingFactors with logical N for correct LayoutSF, then fix up
+  // the weight SF pointer with the correct physical-N offset.
+  auto setupIfSelected = [&](auto bs_config, auto quant_type) {
+    if (quant_type.fc1.weight_block_scale) {
+      // Step 1: Set LayoutSF with LOGICAL N (describes one half for the Gated mainloop)
+      setupFP4BlockScalingFactors<decltype(bs_config)>(
+          layout_info, expert, gemm_m, gemm_n, gemm_k, fp4_act_flat,
+          quant_type.fc1.weight_block_scale, num_tokens_before_expert);
+
+      // Step 2: Fix up weight SF pointer with PHYSICAL N offset
+      // setupFP4BlockScalingFactors computed offset with logical N (inter_size), but the
+      // flat SF buffer uses physical N (2*inter_size) per expert. Recompute and overwrite.
+      auto scaling_type =
+          std::is_same_v<decltype(bs_config), TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaledConfig>
+              ? TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4
+              : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX;
+      layout_info.fpX_block_scaling_factors_weight[expert] =
+          quant_type.fc1.weight_block_scale +
+          getOffsetWeightSF(expert, static_cast<int64_t>(phys_n), static_cast<int64_t>(gemm_k), scaling_type);
+    }
+  };
+  setupIfSelected(TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaledConfig{}, quant_params.fp4);
+  setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
+                  quant_params.fp8_mxfp4);
+  setupIfSelected(TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaledConfig{},
+                  quant_params.mxfp8_mxfp4);
+
+  // Activation stride: (M, K) row-major → StrideA
+  reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideA*>(
+      layout_info.stride_act)[expert] =
+      cutlass::make_cute_packed_stride(TmaWarpSpecializedGroupedGemmInput::StrideA{},
+                                       cute::make_shape(gemm_m, gemm_k, 1));
+
+  // Weight stride: use PHYSICAL layout N (2*inter_size), not logical N.
+  // The physical weight per expert is [2*inter_size, hidden_size] (linear + gate concatenated).
+  // The fused launcher offsets into the second half for the gate.
+  reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideB*>(
+      layout_info.stride_weight)[expert] =
+      cutlass::make_cute_packed_stride(TmaWarpSpecializedGroupedGemmInput::StrideB{},
+                                       cute::make_shape(phys_n, gemm_k, 1));
+
+  // Output stride: uses logical N (inter_size) -- the fused output shape.
+  reinterpret_cast<TmaWarpSpecializedGroupedGemmInput::StrideD*>(
+      layout_info.stride_d)[expert] =
+      cutlass::make_cute_packed_stride(TmaWarpSpecializedGroupedGemmInput::StrideD{},
+                                       cute::make_shape(gemm_m, gemm_n, 1));
+
+  // Activation pointer: K elements per token
+  layout_info.ptr_act[expert] = safe_inc_ptr(input, num_tokens_before_expert * gemm1_k);
+
+  // Weight pointer: use PHYSICAL N for per-expert offset
+  layout_info.ptr_weight[expert] = safe_inc_ptr(weights, expert * (weight_physical_n * gemm1_k));
+
+  // Output pointer: uses logical N
+  layout_info.ptr_d[expert] = safe_inc_ptr(output, num_tokens_before_expert * gemm1_n);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 // TODO Some of this setup could be cached
 template <class T, class WeightType, class OutputType, class ScaleBiasType>
 __global__ void computeStridesTmaWarpSpecializedKernel(
@@ -2644,7 +2759,16 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType,
                                                 num_experts_per_node, getScalingType())
                                           : 0;
 
-  size_t const gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
+  size_t gemm_workspace_size = moe_gemm_runner_.getMaxWorkspaceSize(num_experts_per_node);
+  // The fused-activation GEMM (dual-accumulator, 64x64x128 tile) may need more workspace
+  // than the standard GEMM. Rather than querying the fused kernel (which drags in heavy
+  // CUTLASS template machinery), just double the workspace. This is a few tens of KB --
+  // negligible compared to the multi-GB model weights.
+  if constexpr (use_block_scaling) {
+    if (is_gated_activation && moe_gemm_runner_.getSM() >= 120 && moe_gemm_runner_.getSM() <= 121) {
+      gemm_workspace_size = std::max(gemm_workspace_size, size_t(128 * 1024));
+    }
+  }
 
   // lora related
   size_t const lora_input_size =
@@ -2986,6 +3110,149 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>:
   return gemm_input;
 }
 
+// =============================================================================
+// gemm1_fused -- Self-contained fused activation building block (Level 2)
+// =============================================================================
+// Owns its complete data pipeline: TMA setup, kernel launch, post-processing.
+// Does NOT share TMA stride computation with the unfused path. This eliminates
+// the problem-shape / weight-stride mismatch bug (crash #3 in the plan).
+//
+// Data flow:
+//   1. Launch dedicated TMA stride kernel (computeStridesFusedActivationKernel)
+//      - Problem shape N = inter_size (logical)
+//      - Weight stride N = 2*inter_size (physical)
+//      - swap_ab = false
+//   2. Call sm120_fused_act_moe_gemm_kernelLauncher (6-plane dual-accumulator GEMM)
+//   3. Call doActivation(Identity) for FP8 quantization to FC2 input
+template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
+          class Enable>
+void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::gemm1_fused(
+    TmaWarpSpecializedGroupedGemmInput tma_ws_input_template,
+    T const* const input, T* const output, void* const intermediate_result,
+    int64_t const* const expert_first_token_offset,
+    WeightType const* const fc1_expert_weights,
+    float const* const fc2_fp8_quant,
+    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
+    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat,
+    QuantParams quant_params, int64_t const expanded_num_rows,
+    int64_t const hidden_size, int64_t const inter_size,
+    int const num_experts_per_node, float const** alpha_scale_ptr_array,
+    bool enable_pdl, cudaStream_t stream) {
+#if defined(FLASHINFER_FUSED_ACTIVATION)
+  TLLM_LOG_DEBUG("[SM120 MoE] gemm1_fused: dispatch (inter_size=%ld, hidden_size=%ld)",
+                 (long)inter_size, (long)hidden_size);
+
+  // --- Step 1: Set up TMA input with fused-specific stride kernel ---
+  auto tma_ws_input = tma_ws_input_template;
+  tma_ws_input.enable_pdl = enable_pdl;
+  tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
+  tma_ws_input.swap_ab = false;  // Fused activation never uses swap_ab
+  tma_ws_input.ptr_c = nullptr;
+  tma_ws_input.stride_c = nullptr;
+  tma_ws_input.fused_finalize_epilogue.ptr_bias = nullptr;
+  tma_ws_input.int4_groupwise_params.enabled = false;
+
+  tma_ws_input.fpX_block_scaling_type = getScalingType();
+
+  // Alpha scale
+  auto alpha_scale_flat = use_fp4        ? quant_params.fp4.fc1.global_scale
+                          : use_wfp4afp8 ? quant_params.fp8_mxfp4.fc1.global_scale
+                          : use_fp8      ? quant_params.fp8.dequant_fc1
+                                         : nullptr;
+  if (!alpha_scale_flat) {
+    tma_ws_input.alpha_scale_ptr_array = nullptr;
+  }
+
+  // Launch fused-specific stride kernel
+  int const threads = std::min(1024, num_experts_per_node);
+  int const blocks = (num_experts_per_node + threads - 1) / threads;
+
+  auto* stride_kernel = &computeStridesFusedActivationKernel<T, WeightType,
+      UnfusedGemmOutputType, ScaleBiasType>;
+
+  cudaLaunchConfig_t launch_config;
+  launch_config.gridDim = blocks;
+  launch_config.blockDim = threads;
+  launch_config.dynamicSmemBytes = 0;
+  launch_config.stream = stream;
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = enable_pdl;
+  launch_config.numAttrs = 1;
+  launch_config.attrs = attrs;
+
+  cudaLaunchKernelEx(&launch_config, stride_kernel,
+      expert_first_token_offset, tma_ws_input,
+      inter_size,              // logical problem N
+      hidden_size,             // K
+      int64_t(2) * inter_size, // physical weight N
+      int64_t(num_experts_per_node),
+      input, fc1_expert_weights, alpha_scale_flat, fc1_fp4_act_flat,
+      quant_params,
+      reinterpret_cast<UnfusedGemmOutputType*>(intermediate_result));
+
+  sync_check_cuda_error(stream);
+
+  // --- Step 2: Launch the fused GEMM kernel ---
+  int multi_processor_count = 0;
+  cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, 0);
+
+  using namespace tensorrt_llm::kernels::cutlass_kernels_oss;
+  // Tile must be 64×64×128 for fused activation - the 6-plane TMA load (A, B, Aux,
+  // SFA, SFB, SFAux) uses ~71KB SMEM. Larger tiles exceed SM121's 101KB limit.
+  sm120_fused_act_moe_gemm_kernelLauncher<
+      T,                                                        // activation type (FP8)
+      WeightType,                                               // weight type (FP4)
+      OutputType,                                               // output type (BF16)
+      void,                                                     // EpilogueTag
+      cute::Shape<cute::Int<64>, cute::Int<64>, cute::Int<128>>,    // TileShape (fixed for SMEM)
+      cute::Shape<cute::_1, cute::_1, cute::_1>,                    // ClusterShape
+      true                                                          // IsMXFP4
+  >(tma_ws_input,
+    intermediate_result,        // aux_output: [M, inter_size] BF16
+    expert_first_token_offset,
+    inter_size,
+    hidden_size,
+    num_experts_per_node,
+    multi_processor_count,
+    stream,
+    nullptr,    // occupancy (not queried)
+    nullptr);   // workspace_size (not queried)
+
+  sync_check_cuda_error(stream);
+
+  // --- Step 3: Post-process with Identity activation (FP8 quantization for FC2) ---
+  using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
+  bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc2.use_per_expert_act_scale
+                                  : use_wfp4afp8
+                                      ? quant_params.fp8_mxfp4.fc2.use_per_expert_act_scale
+                                  : use_fp8 ? quant_params.fp8.fc2_use_per_expert_act_scale
+                                            : false;
+
+  ActivationParams identity_activation(ActivationType::Identity);
+  doActivation<GatedActOutputType, UnfusedGemmOutputType>(
+      reinterpret_cast<GatedActOutputType*>(output),
+      static_cast<UnfusedGemmOutputType const*>(intermediate_result),
+      fc2_fp8_quant,
+      static_cast<ScaleBiasType const*>(nullptr),  // no bias (already applied in fused kernel)
+      /*bias_is_broadcast=*/ true, expert_first_token_offset, num_experts_per_node, inter_size,
+      expanded_num_rows, identity_activation, quant_params, use_per_expert_act_scale,
+      fc2_fp4_act_flat, enable_pdl, stream);
+
+  sync_check_cuda_error(stream);
+  TLLM_LOG_DEBUG("[SM120 MoE] gemm1_fused: path complete");
+#else
+  TLLM_THROW("Fused activation requested but FLASHINFER_FUSED_ACTIVATION was not compiled. "
+              "Load the fused-activation module (fuse_activation=True) and clear the JIT cache.");
+#endif
+}
+
+// =============================================================================
+// gemm1 -- Unfused path only (Level 2)
+// =============================================================================
+// The fused path is handled entirely by gemm1_fused() above. This function
+// no longer has any fused-activation branching -- it dispatches between
+// TMA warp-specialized, FP8, legacy gated, and legacy ungated paths.
 template <class T, class WeightType, class OutputType, class InputType, class BackBoneType,
           class Enable>
 void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::gemm1(
@@ -3002,8 +3269,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     int64_t const inter_size, int const num_experts_per_node, ActivationParams fc1_activation_type,
     float const** alpha_scale_ptr_array, bool bias_is_broadcast, cudaStream_t stream,
     cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
-    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl,
-    bool fuse_activation) {
+    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
   if (fp8_blockscale_gemm_runner) {
     TLLM_CHECK(!min_latency_mode);
     Self::BlockScaleFC1(*fp8_blockscale_gemm_runner, input, output, intermediate_result,
@@ -3019,14 +3285,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   bool const use_ampere_activation_fusion = gemm_runner.isFusedGatedActivation(
       config, fc1_activation_type.activation_type, inter_size, hidden_size);
 
-  // When using the fused activation kernel, fc1_out_size is inter_size (not 2*inter_size)
-  // because the fused kernel computes two GEMMs internally and applies SwiGLU inline.
-  // The fused path is a top-level choice: it uses its own fixed 64×64×128 tile and does
-  // not participate in swap_ab logic. The TMA setup forces swap_ab=false when this is active.
-  bool const use_fused_activation = fuse_activation && using_tma_ws_gemm1 &&
-      is_gated_activation && use_fp4;
+  // Unfused path only: for gated activations fc1_out_size is always 2*inter_size.
   size_t const fc1_out_size =
-      ((!use_ampere_activation_fusion) && is_gated_activation && !use_fused_activation)
+      ((!use_ampere_activation_fusion) && is_gated_activation)
           ? inter_size * 2 : inter_size;
 
   int64_t const* total_tokens_including_expert = expert_first_token_offset + 1;
@@ -3034,8 +3295,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
   if (min_latency_mode) {
     TLLM_CHECK_WITH_INFO(using_tma_ws_gemm1,
                          "Only TMA warp specialized GEMM is supported in min latency mode.");
-    // TODO: as for bias, need to get the correct expert id according to the active expert global
-    // ids
     TLLM_CHECK_WITH_INFO(fc1_expert_biases == nullptr, "Min latency mode does not support bias.");
     TLLM_CHECK(use_fp4);
   }
@@ -3047,86 +3306,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     TLLM_CHECK(!use_fp4 || fc2_fp4_act_flat);
 
     // =========================================================================
-    // Fused Activation Path (Layer 1A)
-    // =========================================================================
-    // When enabled, uses a dual-accumulator GEMM kernel that computes both
-    // A @ W_linear and A @ W_gate simultaneously, applying SwigluBias inline.
-    // This eliminates the separate doGatedActivation kernel and saves one HBM
-    // round-trip. Output is [M, inter_size] BF16 with SwiGLU already applied.
-    //
-    // After the fused GEMM, doActivation(Identity) handles FP8 quantization
-    // for FC2 input.
-    if (use_fused_activation) {
-#if defined(FLASHINFER_FUSED_ACTIVATION)
-      TLLM_LOG_DEBUG("[SM120 MoE] Fused activation: kernel dispatch (inter_size=%ld, hidden_size=%ld)",
-                     (long)inter_size, (long)hidden_size);
-
-      auto tma_ws_input = tma_ws_input_template;
-
-      // Get SM count for the launcher
-      int multi_processor_count = 0;
-      cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, 0);
-
-      // Call the fused activation launcher.
-      // The launcher internally:
-      //   1. Computes gate weight pointers by offsetting from linear pointers
-      //   2. Sets up per-expert output pointer/stride arrays
-      //   3. Runs the 6-plane TMA GEMM with inline SwigluBias
-      //
-      // Output goes to intermediate_result as BF16 [M, inter_size].
-      using namespace tensorrt_llm::kernels::cutlass_kernels_oss;
-      // Tile must be 64×64×128 for fused activation - the 6-plane TMA load (A, B, Aux,
-      // SFA, SFB, SFAux) uses ~71KB SMEM. Larger tiles exceed SM121's 101KB limit.
-      sm120_fused_act_moe_gemm_kernelLauncher<
-          T,                                                        // activation type (FP8)
-          WeightType,                                               // weight type (FP4)
-          OutputType,                                               // output type (BF16)
-          void,                                                     // EpilogueTag
-          cute::Shape<cute::Int<64>, cute::Int<64>, cute::Int<128>>,    // TileShape (fixed for SMEM)
-          cute::Shape<cute::_1, cute::_1, cute::_1>,                    // ClusterShape
-          true                                                          // IsMXFP4
-      >(tma_ws_input,
-        intermediate_result,        // aux_output: [M, inter_size] BF16
-        expert_first_token_offset,
-        inter_size,
-        hidden_size,
-        num_experts_per_node,
-        multi_processor_count,
-        stream,
-        nullptr,    // occupancy (not queried)
-        nullptr);   // workspace_size (not queried)
-
-      sync_check_cuda_error(stream);
-
-      // After fused GEMM: output has SwiGLU applied. Run doActivation(Identity)
-      // to handle FP8 quantization + scale factor computation for FC2 input.
-      using GatedActOutputType = std::conditional_t<use_w4afp8, BackBoneType, T>;
-      bool use_per_expert_act_scale = use_fp4 ? quant_params.fp4.fc2.use_per_expert_act_scale
-                                      : use_wfp4afp8
-                                          ? quant_params.fp8_mxfp4.fc2.use_per_expert_act_scale
-                                      : use_fp8 ? quant_params.fp8.fc2_use_per_expert_act_scale
-                                                : false;
-
-      // Use Identity activation - SwiGLU is already done by the fused kernel.
-      ActivationParams identity_activation(ActivationType::Identity);
-      doActivation<GatedActOutputType, UnfusedGemmOutputType>(
-          reinterpret_cast<GatedActOutputType*>(output),
-          static_cast<UnfusedGemmOutputType const*>(intermediate_result),
-          fc2_fp8_quant,
-          static_cast<ScaleBiasType const*>(nullptr),  // no bias (already applied in fused kernel)
-          bias_is_broadcast, expert_first_token_offset, num_experts_per_node, inter_size,
-          expanded_num_rows, identity_activation, quant_params, use_per_expert_act_scale,
-          fc2_fp4_act_flat, enable_pdl, stream);
-
-      sync_check_cuda_error(stream);
-      TLLM_LOG_DEBUG("[SM120 MoE] Fused activation: path complete");
-#else
-      TLLM_THROW("Fused activation requested but FLASHINFER_FUSED_ACTIVATION was not compiled. "
-                  "Load the fused-activation module (fuse_activation=True) and clear the JIT cache.");
-#endif
-    } else {
-    // =========================================================================
-    // Standard TMA Warp-Specialized Path (unfused)
+    // Standard TMA Warp-Specialized Path (unfused only)
     // =========================================================================
     bool has_different_gemm_output_type = using_tma_ws_gemm1 && !std::is_same_v<T, OutputType>;
     bool const has_intermediate = has_different_gemm_output_type || is_gated_activation;
@@ -3181,7 +3361,6 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         fc2_fp4_act_flat, enable_pdl, stream);
 
     sync_check_cuda_error(stream);
-    } // end else (standard unfused path)
   } else if (use_fp8) {
     TLLM_CHECK(!use_ampere_activation_fusion);
     TLLM_CHECK(!config.is_tma_warp_specialized);
@@ -3808,6 +3987,15 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                   experts_per_token, fc1_activation_type, parallelism_config, use_lora,
                   use_deepseek_fp8_block_scale, min_latency_mode, use_awq);
 
+  // Resolve fuse_activation once here. Both setupTmaWarpSpecializedInputs (TMA problem
+  // shapes) and gemm1 (kernel dispatch) must agree on whether fused activation is active.
+  // Computing it in one place eliminates the class of bugs where the two disagree.
+  bool const gemm1_is_tma_ws = moe_gemm_runner_.isTmaWarpSpecialized(*gemm1_config_);
+  bool const is_gated = isGatedActivation(fc1_activation_type);
+  int const sm = moe_gemm_runner_.getSM();
+  bool const use_fused_activation = fuse_activation && gemm1_is_tma_ws &&
+      is_gated && use_block_scaling && sm >= 120 && sm <= 121;
+
   int start_expert = num_experts_per_node * parallelism_config.ep_rank;
   int end_expert = start_expert + num_experts_per_node;
 
@@ -3830,12 +4018,16 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         parallelism_config.cluster_size, full_num_experts, enable_pdl, stream);
     sync_check_cuda_error(stream);
 
+    // Min latency mode does not support fused activation (requires use_fp4).
+    TLLM_CHECK_WITH_INFO(!use_fused_activation,
+        "Fused activation is not supported in min latency mode");
+
     auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(
         num_rows, expanded_num_rows, fc1_activation_type, hidden_size, unpadded_hidden_size,
         inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
         fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
         min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config,
-        enable_pdl, stream, fuse_activation);
+        enable_pdl, stream);
 
     // todo: input_activations_void should be nvfp4, waiting for yuxian's mr ready
     Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner,
@@ -3847,7 +4039,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
                 quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
                 num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_, !use_lora,
                 stream, *gemm1_config_, true, min_latency_params.num_active_experts_per_node,
-                min_latency_params.active_expert_global_ids, enable_pdl, fuse_activation);
+                min_latency_params.active_expert_global_ids, enable_pdl);
     sync_check_cuda_error(stream);
 
     auto gemm2_input =
@@ -3919,65 +4111,130 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
     sync_check_cuda_error(stream);
 
-    auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(
-        num_rows, expanded_num_rows, fc1_activation_type, hidden_size, unpadded_hidden_size,
-        inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
-        fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
-        min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config,
-        enable_pdl, stream, fuse_activation);
+    if (use_fused_activation) {
+      // =====================================================================
+      // Fused activation building block
+      // =====================================================================
+      // LoRA is not supported in the fused path (setupLoraWorkspace/loraFC1/loraFC2
+      // only exist in the unfused branch). Currently masked by binding hardcoding
+      // use_lora=false, but guard explicitly to prevent silent miscomputation.
+      TLLM_CHECK_WITH_INFO(!use_lora,
+          "Fused activation does not support LoRA; disable fuse_activation or LoRA");
+      // gemm1_fused() owns its entire GEMM1 data pipeline (TMA setup, kernel,
+      // post-processing). We call setupTmaWarpSpecializedInputs here for GEMM2
+      // setup and MXFP4 scale factor memset. The GEMM1 output is discarded --
+      // both GEMMs are set up in a single kernel (one thread per expert), so the
+      // extra per-expert writes are negligible vs. splitting the kernel.
+      auto [gemm1_tma_ws_unused, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(
+          num_rows, expanded_num_rows, fc1_activation_type, hidden_size, unpadded_hidden_size,
+          inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
+          fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases,
+          fc2_expert_biases, min_latency_mode, min_latency_params, use_lora, start_expert,
+          parallelism_config, enable_pdl, stream);
+      (void)gemm1_tma_ws_unused;
 
-    if (use_lora) {
-      bool all_token_without_lora = setupLoraWorkspace(
-          expanded_num_rows, num_rows, inter_size, hidden_size, start_expert, is_gated_activation,
-          num_experts_per_node, needs_num_valid, lora_params, stream);
-
-      if (!all_token_without_lora) {
-        fc1_expert_biases =
-            loraFC1(expanded_num_rows, inter_size, hidden_size, num_experts_per_node, start_expert,
-                    num_valid_tokens_ptr, is_gated_activation, fc1_expert_biases, lora_params,
-                    input_fp8_dequant, stream);
-        sync_check_cuda_error(stream);
-      } else {
-        use_lora = false;
+      if constexpr (!use_w4afp8) {
+        gemm1_input =
+            applyPrequantScale(smoothed_act_, permuted_data_,
+                               quant_params.groupwise.fc1.act_scales,
+                               num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq,
+                               stream);
       }
-    }
+      sync_check_cuda_error(stream);
 
-    if constexpr (!use_w4afp8) {
-      gemm1_input =
-          applyPrequantScale(smoothed_act_, permuted_data_, quant_params.groupwise.fc1.act_scales,
-                             num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq, stream);
-    }
-    sync_check_cuda_error(stream);
-    Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner, gemm1_input, fc1_result_,
-                glu_inter_result_, expert_first_token_offset_, gemm1_tma_ws_input,
-                fc1_expert_weights, fc1_expert_biases, num_valid_tokens_ptr, fc1_int_scales,
-                fc1_fp8_dequant, use_wfp4afp8 ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant,
-                fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows,
-                hidden_size, inter_size, num_experts_per_node, fc1_activation_type,
-                alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_, false, nullptr,
-                nullptr, enable_pdl, fuse_activation);
-    sync_check_cuda_error(stream);
+      // Call the fused building block (owns TMA setup + kernel + post-process)
+      Self::gemm1_fused(tma_ws_grouped_gemm1_input_,
+                        gemm1_input, fc1_result_, glu_inter_result_,
+                        expert_first_token_offset_, fc1_expert_weights,
+                        use_wfp4afp8 ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant,
+                        fc1_fp4_act_scale_, fc2_fp4_act_scale_,
+                        quant_params, expanded_num_rows, hidden_size, inter_size,
+                        num_experts_per_node, alpha_scale_ptr_array_fc1_,
+                        enable_pdl, stream);
+      sync_check_cuda_error(stream);
 
-    if (use_lora) {
-      loraFC2(inter_size, hidden_size, num_experts_per_node, start_expert, num_valid_tokens_ptr,
-              expanded_num_rows, lora_params, fc2_fp8_quant, stream);
+      auto gemm2_input =
+          applyPrequantScale(smoothed_act_, fc1_result_, quant_params.groupwise.fc2.act_scales,
+                             num_valid_tokens_ptr, expanded_num_rows, inter_size, use_awq, stream);
+      sync_check_cuda_error(stream);
+      Self::gemm2(
+          moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, fc2_result_, final_output,
+          expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
+          fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params,
+          token_topk_unpermuted_scales, permuted_token_final_scales_,
+          unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
+          token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
+          hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
+          experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
+          parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
+      sync_check_cuda_error(stream);
+    } else {
+      // =====================================================================
+      // Unfused path -- standard TMA + separate activation kernels
+      // =====================================================================
+      auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(
+          num_rows, expanded_num_rows, fc1_activation_type, hidden_size, unpadded_hidden_size,
+          inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
+          fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases,
+          fc2_expert_biases, min_latency_mode, min_latency_params, use_lora, start_expert,
+          parallelism_config, enable_pdl, stream);
+
+      if (use_lora) {
+        bool all_token_without_lora = setupLoraWorkspace(
+            expanded_num_rows, num_rows, inter_size, hidden_size, start_expert,
+            is_gated_activation, num_experts_per_node, needs_num_valid, lora_params, stream);
+
+        if (!all_token_without_lora) {
+          fc1_expert_biases =
+              loraFC1(expanded_num_rows, inter_size, hidden_size, num_experts_per_node,
+                      start_expert, num_valid_tokens_ptr, is_gated_activation, fc1_expert_biases,
+                      lora_params, input_fp8_dequant, stream);
+          sync_check_cuda_error(stream);
+        } else {
+          use_lora = false;
+        }
+      }
+
+      if constexpr (!use_w4afp8) {
+        gemm1_input =
+            applyPrequantScale(smoothed_act_, permuted_data_,
+                               quant_params.groupwise.fc1.act_scales,
+                               num_valid_tokens_ptr, expanded_num_rows, hidden_size, use_awq,
+                               stream);
+      }
+      sync_check_cuda_error(stream);
+      Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner, gemm1_input, fc1_result_,
+                  glu_inter_result_, expert_first_token_offset_, gemm1_tma_ws_input,
+                  fc1_expert_weights, fc1_expert_biases, num_valid_tokens_ptr, fc1_int_scales,
+                  fc1_fp8_dequant, use_wfp4afp8 ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant,
+                  fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params, num_rows,
+                  expanded_num_rows, hidden_size, inter_size, num_experts_per_node,
+                  fc1_activation_type, alpha_scale_ptr_array_fc1_, !use_lora, stream,
+                  *gemm1_config_, false, nullptr, nullptr, enable_pdl);
+      sync_check_cuda_error(stream);
+
+      if (use_lora) {
+        loraFC2(inter_size, hidden_size, num_experts_per_node, start_expert, num_valid_tokens_ptr,
+                expanded_num_rows, lora_params, fc2_fp8_quant, stream);
+        sync_check_cuda_error(stream);
+      }
+
+      auto gemm2_input =
+          applyPrequantScale(smoothed_act_, fc1_result_, quant_params.groupwise.fc2.act_scales,
+                             num_valid_tokens_ptr, expanded_num_rows, inter_size, use_awq, stream);
+      sync_check_cuda_error(stream);
+      Self::gemm2(
+          moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, fc2_result_, final_output,
+          expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
+          fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params,
+          token_topk_unpermuted_scales, permuted_token_final_scales_,
+          unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
+          token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
+          hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
+          experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
+          parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
       sync_check_cuda_error(stream);
     }
-
-    auto gemm2_input =
-        applyPrequantScale(smoothed_act_, fc1_result_, quant_params.groupwise.fc2.act_scales,
-                           num_valid_tokens_ptr, expanded_num_rows, inter_size, use_awq, stream);
-    sync_check_cuda_error(stream);
-    Self::gemm2(
-        moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, fc2_result_, final_output,
-        expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
-        fc2_int_scales, fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params,
-        token_topk_unpermuted_scales, permuted_token_final_scales_, unpermuted_row_to_permuted_row,
-        permuted_row_to_unpermuted_row_, token_selected_experts, num_valid_tokens_ptr, num_rows,
-        expanded_num_rows, hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node,
-        experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_, stream,
-        parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr, enable_pdl);
-    sync_check_cuda_error(stream);
   }
 }
 
@@ -4090,8 +4347,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
                                   ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
                                   MoeMinLatencyParams& min_latency_params, bool use_lora,
                                   int start_expert, MOEParallelismConfig parallelism_config,
-                                  bool enable_pdl, cudaStream_t stream,
-                                  bool fuse_activation) {
+                                  bool enable_pdl, cudaStream_t stream) {
   auto gemm1_tma_ws_input = tma_ws_grouped_gemm1_input_;
   auto gemm2_tma_ws_input = tma_ws_grouped_gemm2_input_;
 
@@ -4107,10 +4363,10 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
                  !use_wfp4a16;
 
   bool is_gated_activation = isGatedActivation(fc1_activation_type);
-  // For fused activation, the GEMM operates on inter_size (not 2*inter_size)
-  // because the dual-accumulator kernel handles the gate internally.
-  int64_t const fc1_out_size = (is_gated_activation && !fuse_activation)
-      ? inter_size * 2 : inter_size;
+  // This function only serves the unfused path. For gated activations,
+  // fc1_out_size is always 2*inter_size (linear + gate concatenated).
+  // The fused path has its own TMA setup via gemm1_fused().
+  int64_t const fc1_out_size = is_gated_activation ? inter_size * 2 : inter_size;
 
   bool has_different_gemm_output_type = !std::is_same_v<T, UnfusedGemmOutputType>;
   bool const has_intermediate = has_different_gemm_output_type || is_gated_activation;
@@ -4143,10 +4399,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
     gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
     gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
 
-    // Fused activation is a top-level kernel choice with its own fixed 64×64×128 tile.
-    // It does not use swap_ab -- the small tile already satisfies M>=64 natively.
-    // Override the config's swap_ab for FC1 so the TMA problem shapes are correct.
-    gemm1_tma_ws_input.swap_ab = fuse_activation ? false : gemm1_config_->swap_ab;
+    // Unfused path uses config's swap_ab directly.
+    gemm1_tma_ws_input.swap_ab = gemm1_config_->swap_ab;
     gemm2_tma_ws_input.swap_ab = gemm2_config_->swap_ab;
     TLLM_CHECK_WITH_INFO(
         (gemm1_tma_ws_input.swap_ab && gemm2_tma_ws_input.swap_ab) || !use_w4_groupwise,
@@ -4491,6 +4745,15 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
       (is_w4afp8_quant || is_wfp4a16_quant) ? num_experts_per_node * sizeof(float) : 0;
   size_t alpha_scale_ptr_array_size = num_experts_per_node * sizeof(float**);
   size_t gemm_workspace_size = mInterface->getGemmWorkspaceSize(num_experts_per_node);
+  // Keep profiler workspace sizing consistent with fused runtime path.
+  bool const use_fused_activation_profiler =
+      mFuseActivation && mGemmToProfile == GemmToProfile::GEMM_1 &&
+      mSM >= 120 && mSM <= 121 &&
+      mScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX &&
+      isGatedActivation(mActivationType);
+  if (use_fused_activation_profiler) {
+    gemm_workspace_size = std::max(gemm_workspace_size, size_t(128 * 1024));
+  }
 
   // Routing info
   size_t expert_first_token_offset_size =
@@ -4722,6 +4985,15 @@ void GemmProfilerBackend::prepareTmaWsInputs(
 
   auto workspaces = getProfilerWorkspaces(num_tokens, mSM >= 90);
 
+  bool const use_fused_activation_profiler =
+      mFuseActivation && mGemmToProfile == GemmToProfile::GEMM_1 &&
+      mSM >= 120 && mSM <= 121 &&
+      mScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX &&
+      isGatedActivation(mActivationType);
+  if (use_fused_activation_profiler && swap_ab) {
+    return;
+  }
+
 #define GET_WS_PTR(type, name)                                                                 \
   auto* name = (workspaces.at(#name).first                                                     \
                     ? reinterpret_cast<type>(workspace_ptr_char + workspaces.at(#name).second) \
@@ -4782,8 +5054,11 @@ void GemmProfilerBackend::prepareTmaWsInputs(
     auto& gemm2_tma_ws_input =
         mGemmToProfile == GemmToProfile::GEMM_2 ? cache_element : dummy_tma_ws_input;
     if (mSM >= 90) {
-      auto fc1_output_size =
-          isGatedActivation(mActivationType) ? mExpertInterSize * 2 : mExpertInterSize;
+      // TMA cache always uses unfused assumptions. The fused path (gemm1_fused)
+      // does its own TMA setup internally and doesn't use this cache for GEMM1.
+      auto fc1_output_size = isGatedActivation(mActivationType)
+                                 ? mExpertInterSize * 2
+                                 : mExpertInterSize;
 
       /* GEMM1 */
       gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
@@ -4904,6 +5179,12 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
 #undef GET_WS_PTR_OFFSET
 #undef GET_WS_PTR
 
+  bool const use_fused_activation_profiler =
+      mFuseActivation && mGemmToProfile == GemmToProfile::GEMM_1 &&
+      mSM >= 120 && mSM <= 121 &&
+      mScalingType == TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX &&
+      isGatedActivation(mActivationType);
+
   TmaWarpSpecializedGroupedGemmInput tma_ws_input_template;
   if (tactic.is_tma_warp_specialized) {
     // Use non-finalize cache when finalize fusion is not supported for the current GEMM
@@ -4919,44 +5200,75 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
                             cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
     bool use_finalize_index = request_finalize && finalize_supported_this_gemm;
 
-    tma_ws_input_template = mTmaInputCache[use_finalize_index][tactic.swap_ab][mSampleIndex];
+    // TMA cache uses unfused assumptions. For fused profiling, gemm1_fused()
+    // does its own TMA setup, so the cache entry is only used for workspace
+    // allocation. Use swap_ab=false for fused (the swap_ab=true cache may not
+    // have been initialized since prepareTmaWsInputs skips it for fused).
+    bool cache_swap_ab = use_fused_activation_profiler ? false : tactic.swap_ab;
+    tma_ws_input_template = mTmaInputCache[use_finalize_index][cache_swap_ab][mSampleIndex];
     TLLM_CHECK_WITH_INFO(tma_ws_input_template.isValid(),
                          "TMA WS input template is not initialized");
   }
 
   mInterface->is_profiler = true;
   if (mGemmToProfile == GemmToProfile::GEMM_1) {
-    mInterface->gemm1(input,                                             //
-                      output,                                            //
-                      intermediate,                                      //
-                      expert_first_token_offset,                         //
-                      tma_ws_input_template,                             //
-                      weights_sel,                                       //
-                      bias,                                              //
-                      expert_first_token_offset + num_experts_per_node,  //
-                      mQuantParams.wo.fc1_weight_scales,                 //
-                      mQuantParams.fp8.dequant_fc1,                      //
-                      mQuantParams.fp8_mxfp4.fc2.act_global_scale
-                          ? mQuantParams.fp8_mxfp4.fc2.act_global_scale
-                          : mQuantParams.fp8.quant_fc2,  //
-                      fp4_act_scale_flat,                //
-                      fp4_act_scale_flat,                //
-                      mQuantParams,                      //
-                      original_num_tokens,               //
-                      expanded_num_tokens,               //
-                      mExpertHiddenSize,                 //
-                      mExpertInterSize,                  //
-                      num_experts_per_node,              //
-                      ActivationParams(mActivationType, swiglu_alpha, swiglu_beta, swiglu_limit),
-                      alpha_scale_ptr_array,                   //
-                      !mUseLora,                               //
-                      /*use_deepseek_fp8_block_scale=*/false,  //
-                      stream,                                  //
-                      tactic,                                  //
-                      mMinLatencyMode,                         //
-                      num_active_experts_per_node,             //
-                      active_expert_global_ids,                //
-                      enable_pdl);                             //
+    if (use_fused_activation_profiler) {
+      // Fused profiling: call the same gemm1_fused() building block that
+      // production uses. It does its own TMA setup, kernel launch, and
+      // post-processing -- no parallel reimplementation needed.
+      mInterface->gemm1_fused(tma_ws_input_template,                           //
+                              input,                                           //
+                              output,                                          //
+                              intermediate,                                    //
+                              expert_first_token_offset,                       //
+                              weights_sel,                                     //
+                              mQuantParams.fp8_mxfp4.fc2.act_global_scale
+                                  ? mQuantParams.fp8_mxfp4.fc2.act_global_scale
+                                  : mQuantParams.fp8.quant_fc2,               //
+                              fp4_act_scale_flat,                              //
+                              fp4_act_scale_flat,                              //
+                              mQuantParams,                                    //
+                              expanded_num_tokens,                             //
+                              mExpertHiddenSize,                               //
+                              mExpertInterSize,                                //
+                              num_experts_per_node,                            //
+                              alpha_scale_ptr_array,                           //
+                              enable_pdl,                                      //
+                              stream);                                         //
+    } else {
+      // Unfused profiling: call gemm1() which uses the pre-computed TMA cache.
+      mInterface->gemm1(input,                                             //
+                        output,                                            //
+                        intermediate,                                      //
+                        expert_first_token_offset,                         //
+                        tma_ws_input_template,                             //
+                        weights_sel,                                       //
+                        bias,                                              //
+                        expert_first_token_offset + num_experts_per_node,  //
+                        mQuantParams.wo.fc1_weight_scales,                 //
+                        mQuantParams.fp8.dequant_fc1,                      //
+                        mQuantParams.fp8_mxfp4.fc2.act_global_scale
+                            ? mQuantParams.fp8_mxfp4.fc2.act_global_scale
+                            : mQuantParams.fp8.quant_fc2,  //
+                        fp4_act_scale_flat,                //
+                        fp4_act_scale_flat,                //
+                        mQuantParams,                      //
+                        original_num_tokens,               //
+                        expanded_num_tokens,               //
+                        mExpertHiddenSize,                 //
+                        mExpertInterSize,                  //
+                        num_experts_per_node,              //
+                        ActivationParams(mActivationType, swiglu_alpha, swiglu_beta, swiglu_limit),
+                        alpha_scale_ptr_array,                   //
+                        !mUseLora,                               //
+                        /*use_deepseek_fp8_block_scale=*/false,  //
+                        stream,                                  //
+                        tactic,                                  //
+                        mMinLatencyMode,                         //
+                        num_active_experts_per_node,             //
+                        active_expert_global_ids,                //
+                        enable_pdl);                             //
+    }
   } else {
     TLLM_CHECK(mGemmToProfile == GemmToProfile::GEMM_2);
     mInterface->gemm2(input,                                           //

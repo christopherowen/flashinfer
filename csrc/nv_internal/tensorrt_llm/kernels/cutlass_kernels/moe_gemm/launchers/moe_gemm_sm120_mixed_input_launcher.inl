@@ -86,7 +86,7 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
-// Gated FC1 kernel types
+// Fused FC1 kernel types
 #include "cutlass_extensions/gemm/collective/sm120_blockscaled_mma_gated_array_tma.hpp"
 #include "cutlass_extensions/gemm/kernel/sm120_gemm_gated_array_tma_warpspecialized.hpp"
 #include "cutlass_extensions/epilogue/sm120_gated_swiglu_epilogue.hpp"
@@ -344,9 +344,9 @@ using LayoutSFB = typename CollectiveMainloop::LayoutSFB;                       
 // CONSTRAINT: inter_size % 32 == 0 (SF_VEC_SIZE alignment)
 //
 // =============================================================================
-// MACRO: Gated FC1 Mode
+// MACRO: Fused FC1 Mode
 // =============================================================================
-// Gated FC1 GEMM with fused SwiGLU activation:
+// Fused FC1 GEMM with fused SwiGLU activation:
 // - Uses dual-accumulator pattern: A @ W_linear and A @ W_gate simultaneously
 // - Epilogue applies SwiGLU: output = SiLU(gate) * linear
 // - Output is BF16 [M, inter_size] (half the width of standard FC1)
@@ -427,7 +427,8 @@ constexpr int kSchedulerPipelineStages = 1;                                     
 /* Gated dispatch policy */                                                                    \
 using GatedDispatchPolicy = cutlass::gemm::collective::MainloopSm120ArrayTmaWarpSpecializedBlockScaledGated< \
     kGatedStages, kSchedulerPipelineStages, ClusterShape_MNK,                                  \
-    cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>;                                  \
+    cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongBlockScaledSm120<                   \
+        kSchedulerPipelineStages>>;                                                            \
                                                                                                \
 /* Build mainloop types using standard CollectiveBuilder, then adapt for gated */              \
 using BaseMainloop =                                                                           \
@@ -1237,7 +1238,7 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
 }
 
 // =============================================================================
-// SM120 Gated FC1 Launcher (Layer 1A)
+// SM120 Fused FC1 Launcher (Layer 1A)
 // =============================================================================
 //
 // This launcher runs the fused gated FC1 kernel with SwiGLU in the epilogue:
@@ -1324,11 +1325,11 @@ __global__ void computeGatedPointersAndStrides(
     auto gate_ptr = reinterpret_cast<uintptr_t>(ptr_weight_gate[0]);
     auto aux_ptr = reinterpret_cast<uintptr_t>(ptr_aux_output[0]);
     if (gate_ptr % 16 != 0) {
-      printf("[WARN] Gated FC1: gate weight pointer not 16-byte aligned: %p\n", 
+      printf("[WARN] Fused FC1: gate weight pointer not 16-byte aligned: %p\n", 
              (void*)gate_ptr);
     }
     if (aux_ptr % 16 != 0) {
-      printf("[WARN] Gated FC1: aux output pointer not 16-byte aligned: %p\n",
+      printf("[WARN] Fused FC1: aux output pointer not 16-byte aligned: %p\n",
              (void*)aux_ptr);
     }
   }
@@ -1402,7 +1403,7 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
 
   // Only MXFP4 supported
   static_assert(IsMXFP4,
-      "SM120 Gated FC1 only supports MXFP4 (FP8xFP4).");
+      "SM120 Fused FC1 only supports MXFP4 (FP8xFP4).");
 
   // Guardrails
   TLLM_CHECK_WITH_INFO(inter_size % 32 == 0,
@@ -1431,9 +1432,9 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
 
   // Alignment check (debug)
   TLLM_CHECK_WITH_INFO(gate_weight_bytes % 16 == 0,
-      "SM120 Gated FC1: gate weight offset must be 16-byte aligned for TMA");
+      "SM120 Fused FC1: gate weight offset must be 16-byte aligned for TMA");
 
-  TLLM_LOG_DEBUG("[SM120 Gated FC1] Gate offsets: weight=%ld bytes, SF=%ld elements",
+  TLLM_LOG_DEBUG("[SM120 Fused FC1] Gate offsets: weight=%ld bytes, SF=%ld elements",
       (long)gate_weight_bytes, (long)gate_sf_elems);
 
   // Workspace size query
@@ -1459,17 +1460,17 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
     auto layout = GatedFC1WorkspaceLayout::compute(base_gemm_ws, num_experts, sizeof(StrideDVal));
     *workspace_size = layout.total_size;
     
-    TLLM_LOG_DEBUG("[SM120 Gated FC1] workspace_size=%zu (gemm=%zu, ptr_arrays=%zu)",
+    TLLM_LOG_DEBUG("[SM120 Fused FC1] workspace_size=%zu (gemm=%zu, ptr_arrays=%zu)",
         layout.total_size, base_gemm_ws, layout.total_size - base_gemm_ws);
     return;
   }
 
   // Validate inputs
-  TLLM_CHECK_WITH_INFO(tma_inputs.stride_act != nullptr, "SM120 Gated FC1: stride_act is null");
-  TLLM_CHECK_WITH_INFO(tma_inputs.stride_weight != nullptr, "SM120 Gated FC1: stride_weight is null");
-  TLLM_CHECK_WITH_INFO(tma_inputs.stride_d != nullptr, "SM120 Gated FC1: stride_d is null");
-  TLLM_CHECK_WITH_INFO(tma_inputs.gemm_workspace != nullptr, "SM120 Gated FC1: workspace is null");
-  TLLM_CHECK_WITH_INFO(aux_output != nullptr, "SM120 Gated FC1: aux_output is null");
+  TLLM_CHECK_WITH_INFO(tma_inputs.stride_act != nullptr, "SM120 Fused FC1: stride_act is null");
+  TLLM_CHECK_WITH_INFO(tma_inputs.stride_weight != nullptr, "SM120 Fused FC1: stride_weight is null");
+  TLLM_CHECK_WITH_INFO(tma_inputs.stride_d != nullptr, "SM120 Fused FC1: stride_d is null");
+  TLLM_CHECK_WITH_INFO(tma_inputs.gemm_workspace != nullptr, "SM120 Fused FC1: workspace is null");
+  TLLM_CHECK_WITH_INFO(aux_output != nullptr, "SM120 Fused FC1: aux_output is null");
 
   // Compute workspace layout
   // StrideD for grouped GEMM epilogue is the element type (value, not pointer)
@@ -1490,7 +1491,13 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
     base_gemm_ws = gemm.get_workspace_size(ws_arguments);
   }
   auto ws_layout = GatedFC1WorkspaceLayout::compute(base_gemm_ws, num_experts, sizeof(StrideDVal));
-  
+
+  TLLM_CHECK_WITH_INFO(
+      tma_inputs.gemm_workspace_size >= ws_layout.total_size,
+      "SM120 fused activation: workspace too small (%zu < %zu)",
+      tma_inputs.gemm_workspace_size,
+      ws_layout.total_size);
+
   // Carve workspace for all pointer/stride arrays
   char* ws_base = reinterpret_cast<char*>(tma_inputs.gemm_workspace);
   void* gemm_workspace = ws_base + ws_layout.gemm_workspace_offset;
@@ -1506,7 +1513,7 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
   ElementOutput** ptr_aux_output = reinterpret_cast<ElementOutput**>(ws_base + ws_layout.ptr_aux_output_offset);
   StrideDVal* stride_aux_output = reinterpret_cast<StrideDVal*>(ws_base + ws_layout.stride_aux_output_offset);
 
-  TLLM_LOG_DEBUG("[SM120 Gated FC1] Workspace carved: gemm=%p, ptr_gate=%p, sf_gate=%p, ptr_aux=%p, stride_aux=%p",
+  TLLM_LOG_DEBUG("[SM120 Fused FC1] Workspace carved: gemm=%p, ptr_gate=%p, sf_gate=%p, ptr_aux=%p, stride_aux=%p",
       gemm_workspace, ptr_weight_gate, sf_gate, ptr_aux_output, stride_aux_output);
 
   // Launch kernel to compute gate weight pointers, output pointers, and strides
@@ -1535,7 +1542,7 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
         problem_shapes,
         num_experts);
     
-    TLLM_LOG_DEBUG("[SM120 Gated FC1] Launched pointer/stride kernel: blocks=%d, threads=%d", blocks, threads);
+    TLLM_LOG_DEBUG("[SM120 Fused FC1] Launched pointer/stride kernel: blocks=%d, threads=%d", blocks, threads);
   }
 
   // Build GEMM arguments
@@ -1625,23 +1632,47 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
   arguments.epilogue.thread.alpha = 1.0f;
   arguments.epilogue.thread.beta = 0.0f;
 
+  // Opt-in to extended shared memory for the fused kernel.
+  // The 6-plane gated mainloop (A, B, Aux, SFA, SFB, SFAux) needs ~71KB at
+  // 64x64x128 tiles, which exceeds the default 48KB limit.  Without this call
+  // the kernel hits "illegal instruction" on SM12x (hardware reports SMEM
+  // overruns as illegal-instruction, not OOM).
+  {
+    int smem_size = int(Gemm::GemmKernel::SharedStorageSize);
+    int optin_limit = -1;
+    (void)cudaDeviceGetAttribute(&optin_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+    TLLM_LOG_DEBUG("[SM120 Fused FC1] SharedStorageSize=%dB  MaxSharedMemoryPerBlockOptin=%dB",
+                   smem_size, optin_limit);
+    if (smem_size >= (48 << 10)) {
+      cudaError_t attr_err = cudaFuncSetAttribute(
+          cutlass::device_kernel<typename Gemm::GemmKernel>,
+          cudaFuncAttributeMaxDynamicSharedMemorySize,
+          smem_size);
+      if (attr_err != cudaSuccess) {
+        (void)cudaGetLastError();  // clear sticky error
+        TLLM_THROW("SM120 Fused FC1: cudaFuncSetAttribute(MaxDynamicSharedMemorySize=%d) failed: %s",
+                   smem_size, cudaGetErrorString(attr_err));
+      }
+    }
+  }
+
   // Initialize GEMM
   auto init_status = gemm.initialize(arguments, gemm_workspace, stream);
   if (init_status != cutlass::Status::kSuccess) {
     cudaError_t cuda_err = cudaGetLastError();
-    TLLM_THROW("SM120 Gated FC1: initialize failed: %s (CUDA: %s)",
+    TLLM_THROW("SM120 Fused FC1: initialize failed: %s (CUDA: %s)",
                cutlassGetStatusString(init_status), cudaGetErrorString(cuda_err));
   }
-  TLLM_LOG_DEBUG("[SM120 Gated FC1] GEMM initialized successfully");
+  TLLM_LOG_DEBUG("[SM120 Fused FC1] GEMM initialized successfully");
 
   // Run GEMM
   auto run_status = gemm.run(stream);
   if (run_status != cutlass::Status::kSuccess) {
     cudaError_t cuda_err = cudaGetLastError();
-    TLLM_THROW("SM120 Gated FC1: run failed: %s (CUDA: %s)",
+    TLLM_THROW("SM120 Fused FC1: run failed: %s (CUDA: %s)",
                cutlassGetStatusString(run_status), cudaGetErrorString(cuda_err));
   }
-  TLLM_LOG_DEBUG("[SM120 Gated FC1] GEMM run launched");
+  TLLM_LOG_DEBUG("[SM120 Fused FC1] GEMM run launched");
 
   if (occupancy != nullptr) {
     *occupancy = 1;

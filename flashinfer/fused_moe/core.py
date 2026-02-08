@@ -664,6 +664,7 @@ def get_cutlass_fused_moe_module(
                 do_preparation,
                 self.enable_pdl,
                 self.activation_type,
+                fuse_activation,
             )
 
         @classmethod
