@@ -928,7 +928,7 @@ struct CollectiveMma<
     int const n_offset = shared_tensors.n_tile_offset;
     // Identity tensor maps fragment element index → (M, N) tile coordinate
     auto cD = make_identity_tensor(make_shape(size<0>(TileShape{}), size<1>(TileShape{})));
-    auto tCcD = tiled_mma.partition_C(cD);
+    auto tCcD = thread_mma.partition_C(cD);
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(accum); ++i) {
