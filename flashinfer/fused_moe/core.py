@@ -386,20 +386,20 @@ SM120_SUPPORTED_TILE_MN = (
 
 
 # Supported tile shapes for fused-activation modules on SM120/121.
-# The fused mainloop loads 6 TMA planes (A, B, Aux, SFA, SFB, SFAux) which
-# requires ~71KB SMEM for a 64x64x128 tile.  Larger tiles exceed SM121's
-# 101,376-byte limit.  Only non-swap_ab tiles are supported.
+# Sequential SMEM reuse: the fused gated mainloop uses 4 SMEM arrays (same as
+# unfused), so both 64x128 and 128x128 tiles fit within the 101KB SMEM budget.
 SM120_FUSED_SUPPORTED_TILE_MN = (
-    (64, 64),    # ~71KB SMEM - fits with 29KB margin
+    (64, 128),   # ~58KB SMEM - decode (small M), fits with ~43KB margin
+    (128, 128),  # ~95KB SMEM - prefill (large M), fits with ~6KB margin
 )
 
 
 def select_tile_mn_for_sm120_fused(num_tokens: int) -> tuple[int, int]:
     """Select logical (M,N) tile for SM120/121 fused-activation MoE GEMM.
 
-    Currently only 64x64 is validated for the fused path.  As more tiles
-    are validated, this function will implement batch-size-aware selection
-    analogous to ``select_tile_mn_for_sm120``.
+    Matches the unfused tile selection logic: 64x128 for decode (small batches),
+    128x128 for prefill (large batches).  Sequential SMEM reuse gives the fused
+    kernel the same SMEM footprint as the unfused kernel, so both tiles fit.
 
     Args:
         num_tokens: Number of tokens in the batch.
@@ -407,7 +407,9 @@ def select_tile_mn_for_sm120_fused(num_tokens: int) -> tuple[int, int]:
     Returns:
         Tile shape (M, N).
     """
-    return (64, 64)
+    if num_tokens < 64:
+        return (64, 128)
+    return (128, 128)
 
 
 def select_tile_mn_for_sm120(num_tokens: int) -> tuple[int, int]:
@@ -1160,8 +1162,8 @@ def prewarm_moe_tiles():
         # Unfused tiles
         ((128, 128), False),  # Prefill default
         ((64, 128), False),   # Decode-optimized native tile
-        # Fused tiles
-        ((64, 64), True),     # Fused activation (SwiGLU in GEMM epilogue)
+        # Fused tiles (sequential SMEM reuse - same size as unfused)
+        ((128, 128), True),   # Fused activation (SwiGLU in mainloop)
     ]
     try:
         major, minor = torch.cuda.get_device_capability()

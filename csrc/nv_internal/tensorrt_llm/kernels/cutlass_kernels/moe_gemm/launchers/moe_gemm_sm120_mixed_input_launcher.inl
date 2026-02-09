@@ -86,10 +86,8 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
-// Fused FC1 kernel types
+// Fused FC1 kernel types (sequential SMEM reuse for gated mainloop)
 #include "cutlass_extensions/gemm/collective/sm120_blockscaled_mma_gated_array_tma.hpp"
-#include "cutlass_extensions/gemm/kernel/sm120_gemm_gated_array_tma_warpspecialized.hpp"
-#include "cutlass_extensions/epilogue/sm120_gated_swiglu_epilogue.hpp"
 
 #ifdef __GNUC__
 #pragma GCC diagnostic pop
@@ -184,12 +182,21 @@ constexpr int kEpiTileN_Large = 64;  /* Best trade-off: 2 iterations, fits in sm
 constexpr int kEpiTileN = (TILE_N_VAL >= 64) ? kEpiTileN_Large : kEpiTileN_Small;                 \
 using EpilogueTile_MN = cute::tuple<cute::C<64>, cute::C<kEpiTileN>>; \
                                                                                                   \
-/* Epilogue collective */                                                                         \
+/* Epilogue collective                                                                            \
+ * ElementC = void: we never use a source/residual tensor (beta is always 0).                     \
+ * Passing void disables the source TMA load, eliminating uninitialized reads                     \
+ * from the output buffer and saving one HBM read per epilogue tile.                              \
+ *                                                                                                \
+ * SCOPE: this applies to ALL SM120 paths (standard, transposed, gated).                          \
+ * The SM120 MoE launcher unconditionally sets beta=0; no SM120 code path uses                    \
+ * source tensor semantics. If a future path needs beta!=0, it must use a                         \
+ * separate epilogue builder with a non-void ElementC.                                            \
+ */                                                                                               \
 using CollectiveEpilogue =                                                                        \
     typename cutlass::epilogue::collective::CollectiveBuilder<                                    \
         ArchTag, OperatorClass, TileShape_MNK, ClusterShape_MNK,                                  \
         EpilogueTile_MN, ElementAccumulator, ElementCompute,                                      \
-        ElementC, LayoutC*, AlignmentC, ElementD, LayoutC*, AlignmentD,                           \
+        void, void*, 0, ElementD, LayoutC*, AlignmentD,                                           \
         cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;                       \
                                                                                                   \
 /* Stage count (carve out space for epilogue shared memory) */                                    \
@@ -286,12 +293,14 @@ using EpilogueTile_Explicit = cute::tuple<cute::C<64>, cute::C<kEpiTileN_Explici
 using EpilogueTile_Auto = cutlass::epilogue::collective::EpilogueTileAuto;                        \
 using EpilogueTile_MN = cute::conditional_t<(TILE_N_VAL >= 64), EpilogueTile_Auto, EpilogueTile_Explicit>; \
                                                                                                   \
-/* Epilogue collective */                                                                         \
+/* Epilogue collective — see SCOPE comment in DEFINE_SM120_MXFP4_STANDARD_NAMESPACE.              \
+ * ElementC = void: no source/residual tensor (beta always 0 in SM120 launcher).                  \
+ */                                                                                               \
 using CollectiveEpilogue =                                                                        \
     typename cutlass::epilogue::collective::CollectiveBuilder<                                    \
         ArchTag, OperatorClass, TileShape_MNK, ClusterShape_MNK,                                  \
         EpilogueTile_MN, ElementAccumulator, ElementCompute,                                      \
-        ElementC, LayoutC*, AlignmentC, ElementD, LayoutC*, AlignmentD,                           \
+        void, void*, 0, ElementD, LayoutC*, AlignmentD,                                           \
         cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;                       \
                                                                                                   \
 /* Stage count (carve out space for epilogue shared memory) */                                    \
@@ -410,33 +419,39 @@ using StrideOutput = cutlass::detail::TagToStrideC_t<LayoutOutput*>;            
  * Since SwiGLU is now applied INSIDE the mainloop (single-accumulator mma()),                 \
  * we can use the STANDARD epilogue - it just stores the already-fused result.                 \
  * This allows using the standard GemmUniversal kernel instead of GemmUniversalGated!          \
+ * ElementC = void: no source/residual tensor (beta=0), disables source TMA load.              \
  */                                                                                            \
 using EpilogueTile_MN = cute::tuple<cute::C<64>, cute::C<64>>;                                 \
 using CollectiveEpilogue =                                                                     \
     typename cutlass::epilogue::collective::CollectiveBuilder<                                 \
         ArchTag, OperatorClass, TileShape_MNK, ClusterShape_MNK,                               \
         EpilogueTile_MN, ElementAccumulator, ElementCompute,                                   \
-        ElementOutput, LayoutOutput*, AlignmentOutput, ElementOutput, LayoutOutput*, AlignmentOutput, \
+        void, void*, 0, ElementOutput, LayoutOutput*, AlignmentOutput,                         \
         cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;                           \
                                                                                                \
-/* Stage count (gated mainloop needs more SMEM for Aux operand) */                             \
-/* Use conservative stage count to avoid SMEM pressure */                                      \
-constexpr int kGatedStages = 2;                                                                \
-constexpr int kSchedulerPipelineStages = 1;                                                    \
-                                                                                               \
-/* Gated dispatch policy */                                                                    \
-using GatedDispatchPolicy = cutlass::gemm::collective::MainloopSm120ArrayTmaWarpSpecializedBlockScaledGated< \
-    kGatedStages, kSchedulerPipelineStages, ClusterShape_MNK,                                  \
-    cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpongBlockScaledSm120<                   \
-        kSchedulerPipelineStages>>;                                                            \
-                                                                                               \
-/* Build mainloop types using standard CollectiveBuilder, then adapt for gated */              \
+/* Build base mainloop first to resolve auto-carved stages and extract types */                 \
+/* StageCountAutoCarveout picks optimal stage count within the 101KB SMEM budget. */            \
+/* Sequential SMEM reuse gives us the same footprint as the unfused kernel,                 */ \
+/* so base auto-carveout is correct for the gated variant too.                              */ \
+using StageCount = cutlass::gemm::collective::StageCountAutoCarveout<                           \
+    static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>;                     \
 using BaseMainloop =                                                                           \
     typename cutlass::gemm::collective::CollectiveBuilder<                                     \
         ArchTag, OperatorClass, ElementA, LayoutA*, AlignmentA, ElementB, LayoutB*, AlignmentB,\
-        ElementAccumulator, TileShape_MNK, ClusterShape_MNK,                                   \
-        cutlass::gemm::collective::StageCount<kGatedStages>,                                   \
+        ElementAccumulator, TileShape_MNK, ClusterShape_MNK, StageCount,                       \
         cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>::CollectiveOp;                \
+                                                                                               \
+/* Extract resolved stage count and schedule from the base mainloop */                         \
+static constexpr int kGatedStages = BaseMainloop::DispatchPolicy::Stages;                      \
+static constexpr int kSchedulerPipelineStages =                                                \
+    BaseMainloop::DispatchPolicy::SchedulerPipelineStageCount;                                 \
+                                                                                               \
+/* Gated dispatch policy                                                                */     \
+/* Uses same tile/stages as unfused kernel but with IsGated=true for two-phase K iter.  */      \
+/* Schedule inherits from base so GemmUniversal dispatch finds the right kernel.         */     \
+using GatedDispatchPolicy = cutlass::gemm::collective::MainloopSm120ArrayTmaWarpSpecializedBlockScaledGated< \
+    kGatedStages, kSchedulerPipelineStages, ClusterShape_MNK,                                  \
+    typename BaseMainloop::DispatchPolicy::Schedule>;                                          \
                                                                                                \
 /* Gated mainloop - inherits from base and adds Aux operand + dual accumulator */             \
 /* NOTE: Must pass the *Pair* and *Atoms* types (tuples), not individual extracted types */   \
@@ -511,15 +526,20 @@ DEFINE_SM120_MXFP4_STANDARD_NAMESPACE(sm120_mxfp4_bf16, LOGICAL_TILE_M, LOGICAL_
 #endif
 
 // Fused activation mode (FC1 with fused SwiGLU) - instantiated when FLASHINFER_FUSED_ACTIVATION is defined
-// FIXED tile 64×64×128: the fused mainloop loads 6 TMA planes (A, B, Aux, SFA, SFB, SFAux)
-// which requires ~71KB SMEM. Larger tiles exceed the SM121 SMEM limit (101,376 bytes):
-//   128×128×128 → 129,024 bytes (over by 28KB)
-//    64×128×128 → 112,640 bytes (over by 11KB)
-//    64× 64×128 →  71,680 bytes (FITS with 29KB margin)
+// Uses sequential SMEM reuse (4 planes, same as unfused):
+//   128×128×128 → ~95KB SMEM (fits in 101,376 with 6KB margin)
+//    64×128×128 → ~58KB SMEM (fits with ~43KB margin)
+// The fused mainloop runs two K-reduction phases in sequence, reusing the same
+// B/SFB SMEM slots for gate weights in phase 2. This avoids the 6-plane approach
+// (which exceeded SMEM limits for tiles larger than 64×64).
+// Tile shape is selected by LOGICAL_TILE_M at JIT compile time (64 for decode, 128 for prefill).
 #ifdef FLASHINFER_FUSED_ACTIVATION
 #if !SWAP_AB
-// Fused activation only supports standard (non-swapped) layout
-DEFINE_SM120_MXFP4_GATED_NAMESPACE(sm120_mxfp4_bf16_gated, 64, 64, 128)
+#if LOGICAL_TILE_M == 64
+DEFINE_SM120_MXFP4_GATED_NAMESPACE(sm120_mxfp4_bf16_gated, 64, 128, 128)
+#else
+DEFINE_SM120_MXFP4_GATED_NAMESPACE(sm120_mxfp4_bf16_gated, 128, 128, 128)
+#endif
 #endif
 #endif  // FLASHINFER_FUSED_ACTIVATION
 
@@ -569,8 +589,10 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
   Gemm gemm;
 
   // Hardware info
+  int current_device = 0;
+  cudaGetDevice(&current_device);
   cutlass::KernelHardwareInfo hw_info{};
-  hw_info.device_id = 0;
+  hw_info.device_id = current_device;
   hw_info.sm_count = multi_processor_count;
 
   // Operand wiring based on swap_ab (set above from compile-time SWAP_AB):
@@ -916,9 +938,14 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
        strideD_arg},
       hw_info};
   
-  // Set epilogue thread args
+  // Set epilogue thread args.
+  // INVARIANT: beta MUST be 0 for SM120 — the epilogue is built with ElementC=void
+  // (no source tensor), so any nonzero beta would silently produce wrong results.
   arguments.epilogue.thread.alpha = 1.0f;
   arguments.epilogue.thread.beta = 0.0f;
+  TLLM_CHECK_WITH_INFO(arguments.epilogue.thread.beta == 0.0f,
+      "SM120 MoE epilogue is built with ElementC=void (no source tensor); "
+      "beta must be 0. Nonzero beta requires a separate epilogue with real ElementC.");
 
   // Validate inputs
   TLLM_CHECK_WITH_INFO(tma_inputs.isValid(), "SM120 MXFP4 MoE: Invalid TMA inputs");
@@ -931,12 +958,28 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
     TLLM_THROW("SM120 MXFP4 MoE: can_implement failed: %s", cutlassGetStatusString(can_impl));
   }
 
-  // Validate workspace size
-  size_t required_workspace = gemm.get_workspace_size(arguments);
-  if (tma_inputs.gemm_workspace_size < required_workspace) {
-    TLLM_THROW("SM120 MXFP4 MoE: workspace too small (%zu < %zu)",
-               tma_inputs.gemm_workspace_size, required_workspace);
+  // Validate workspace size (debug only — avoid get_workspace_size() on the hot path;
+  // the caller already queried and allocated the required size).
+#ifndef NDEBUG
+  {
+    size_t required_workspace = gemm.get_workspace_size(arguments);
+    if (tma_inputs.gemm_workspace_size < required_workspace) {
+      TLLM_THROW("SM120 MXFP4 MoE: workspace too small (%zu < %zu)",
+                 tma_inputs.gemm_workspace_size, required_workspace);
+    }
   }
+#endif
+
+  // Zero GEMM workspace for compute-sanitizer initcheck cleanliness.
+  // CUTLASS initialize() writes all fields it uses; the memset is a
+  // workaround for sanitizer not tracking TMA / internal CUTLASS stores.
+  // Compiled out in release builds (NDEBUG) to avoid hot-path bandwidth cost.
+#ifndef NDEBUG
+  if (tma_inputs.gemm_workspace && tma_inputs.gemm_workspace_size > 0
+      && !tensorrt_llm::common::isCapturing(stream)) {
+    cudaMemsetAsync(tma_inputs.gemm_workspace, 0, tma_inputs.gemm_workspace_size, stream);
+  }
+#endif
 
   // Extra debug: split `initialize()` into its two conceptual phases.
   // This helps diagnose "Error Internal" during initialize for specific tiles.
@@ -953,29 +996,27 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
                cudaGetErrorString(sync_err));
   }
 
-  // For CUTLASS 3.x kernels, `initialize()` will attempt to opt-in to large dynamic shared memory
-  // via cudaFuncSetAttribute. If that call fails, CUTLASS returns kErrorInternal after clearing
-  // the CUDA error state, which makes it hard to diagnose from the caller.
-  //
-  // Probe it explicitly here so we can see the exact smem size and the CUDA error.
+  // One-time-per-device SMEM opt-in for CUTLASS kernels that exceed the default 48 KB limit.
+  // SharedStorageSize is a compile-time constant; cudaFuncSetAttribute is per-device-context
+  // so re-run when the active device changes.
   {
-    int smem_size = int(Gemm::GemmKernel::SharedStorageSize);
-    int optin_limit = -1;
-    (void)cudaDeviceGetAttribute(&optin_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
-    TLLM_LOG_DEBUG("[SM120 MXFP4 MoE] kernel SharedStorageSize=%dB cudaDevAttrMaxSharedMemoryPerBlockOptin=%dB",
-                   smem_size, optin_limit);
-    if (smem_size >= (48 << 10)) {
-      cudaError_t attr_err = cudaFuncSetAttribute(
-          cutlass::device_kernel<typename Gemm::GemmKernel>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          smem_size);
-      if (attr_err != cudaSuccess) {
-        // Clear sticky error and throw with details.
-        (void)cudaGetLastError();
-        TLLM_THROW("SM120 MXFP4 MoE: cudaFuncSetAttribute(MaxDynamicSharedMemorySize=%d) failed: %s",
-                   smem_size,
-                   cudaGetErrorString(attr_err));
+    thread_local int smem_opted_device = -1;
+    if (current_device != smem_opted_device) {
+      int constexpr smem_size = int(Gemm::GemmKernel::SharedStorageSize);
+      TLLM_LOG_DEBUG("[SM120 MXFP4 MoE] kernel SharedStorageSize=%dB", smem_size);
+      if (smem_size >= (48 << 10)) {
+        cudaError_t attr_err = cudaFuncSetAttribute(
+            cutlass::device_kernel<typename Gemm::GemmKernel>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size);
+        if (attr_err != cudaSuccess) {
+          (void)cudaGetLastError();
+          TLLM_THROW("SM120 MXFP4 MoE: cudaFuncSetAttribute(MaxDynamicSharedMemorySize=%d) failed: %s",
+                     smem_size,
+                     cudaGetErrorString(attr_err));
+        }
       }
+      smem_opted_device = current_device;
     }
   }
 
@@ -1256,11 +1297,11 @@ void sm120_mixed_input_moe_gemm_kernelLauncher(
 //   - One HBM write of [M, inter_size] BF16
 //   - One kernel launch
 //
-// Weight layout (per expert):
-//   - W_linear: first inter_size columns
-//   - W_gate: second inter_size columns
-//   - Pointer offset: (inter_size * K / 2) bytes (FP4 packed)
-//   - Scale offset: (inter_size * ceil(K/32)) elements (MXFP4)
+// Weight layout (per expert, LayoutB = ColumnMajor, K-contiguous):
+//   B[N=2*inter_size, K=hidden_size] with stride (hidden_size, 1)
+//   - W_linear: N indices [0, inter_size)
+//   - W_gate: N indices [inter_size, 2*inter_size)
+//   - Pointer offset: (inter_size * hidden_size) / 2 bytes (FP4 packed)
 //
 
 #if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4) && defined(FLASHINFER_FUSED_ACTIVATION)
@@ -1284,8 +1325,8 @@ __global__ void computeGatedPointersAndStrides(
     void const** __restrict__ ptr_weight_gate,          // [E] output: gate pointers
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* const* __restrict__ sf_linear,  // [E]
     TmaWarpSpecializedGroupedGemmInput::ElementSF const** __restrict__ sf_gate,          // [E] output
-    int64_t gate_weight_bytes,   // (inter_size * hidden_size) / 2
-    int64_t gate_sf_elems,       // inter_size * ceil(hidden_size / 32)
+    int64_t gate_weight_bytes,   // (inter_size * hidden_size) / 2  (ColumnMajor B: N-stride = K, FP4 packed)
+    int64_t gate_sf_elems,       // SF element offset from linear to gate within one expert
     // Aux output inputs/outputs
     ElementOutput* aux_output_base,                     // Contiguous output buffer
     ElementOutput** __restrict__ ptr_aux_output,        // [E] output: per-expert output pointers
@@ -1393,7 +1434,11 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
     int64_t inter_size,
     int64_t hidden_size,
     int num_experts,
-    int multi_processor_count, 
+    int multi_processor_count,
+    float const* swiglu_alpha,  // Per-expert SwiGLU params (device ptrs, nullptr = defaults)
+    float const* swiglu_beta,
+    float const* swiglu_limit,
+    void const* fc1_bias,       // Per-expert FC1 bias [num_experts, 2*inter_size], nullptr = no bias
     cudaStream_t stream, 
     int* occupancy,
     size_t* workspace_size) {
@@ -1421,14 +1466,29 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
   Gemm gemm;
 
   // Hardware info
+  int current_device = 0;
+  cudaGetDevice(&current_device);
   cutlass::KernelHardwareInfo hw_info{};
-  hw_info.device_id = 0;
+  hw_info.device_id = current_device;
   hw_info.sm_count = multi_processor_count;
 
   // Compute gate weight and scale factor offsets
-  int64_t const k_blocks = (hidden_size + 31) / 32;  // ceil(K/32)
-  int64_t const gate_weight_bytes = (inter_size * hidden_size) / 2;  // FP4: 2 elements/byte
-  int64_t const gate_sf_elems = inter_size * k_blocks;
+  //
+  // LayoutB = ColumnMajor  →  B[N, K] has K-contiguous stride: (K, 1, L).
+  // Per-expert weight shape: [N=2*inter_size, K=hidden_size] in column-major.
+  //   Element (n, k) at FP4-element offset: n * hidden_size + k
+  //   Gate starts at N = inter_size  →  element offset = inter_size * hidden_size
+  //   FP4 packed (2 per byte)        →  byte offset   = inter_size * hidden_size / 2
+  int64_t const gate_weight_bytes = (inter_size * hidden_size) / 2;  // ColumnMajor B: N-stride = K
+
+  // LayoutSFB is K-contiguous (row-major for [N, K/block_size]).  The N-stride
+  // is padded_K / block_size.  For practical models hidden_size % 128 == 0, so
+  // padded_K == hidden_size and the stride equals ceil(hidden_size / 32).
+  using TmaInput = TmaWarpSpecializedGroupedGemmInput;
+  int64_t const padded_k = TmaInput::alignToSfDim(
+      hidden_size, TmaInput::MinKDimAlignmentMXFPX);
+  int64_t const sf_k_stride = padded_k / TmaInput::MXFPXBlockScaleVectorSize;
+  int64_t const gate_sf_elems = inter_size * sf_k_stride;
 
   // Alignment check (debug)
   TLLM_CHECK_WITH_INFO(gate_weight_bytes % 16 == 0,
@@ -1444,9 +1504,11 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
     typename Gemm::Arguments ws_arguments = {
         cutlass::gemm::GemmUniversalMode::kGrouped,
         tma_inputs.shape_info,
-        // Mainloop args (placeholders)
+        // Mainloop args (placeholders + SwiGLU defaults)
         {nullptr, StrideA{}, nullptr, StrideB{}, nullptr, LayoutSFA{}, nullptr, LayoutSFB{},
-         nullptr, StrideAux{}, nullptr, LayoutSFAux{}},
+         nullptr, StrideAux{}, nullptr, LayoutSFAux{},
+         swiglu_alpha, swiglu_beta, swiglu_limit,
+         fc1_bias, inter_size},
         // Epilogue args (CollectiveBuilder format: {FusionArgs, ptr_C, ptr_D, strides})
         {{}, nullptr, nullptr, nullptr, StrideD{}},
         hw_info};
@@ -1472,24 +1534,29 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
   TLLM_CHECK_WITH_INFO(tma_inputs.gemm_workspace != nullptr, "SM120 Fused FC1: workspace is null");
   TLLM_CHECK_WITH_INFO(aux_output != nullptr, "SM120 Fused FC1: aux_output is null");
 
-  // Compute workspace layout
-  // StrideD for grouped GEMM epilogue is the element type (value, not pointer)
-  // The epilogue expects StrideD* (array of per-expert strides)
+  // Compute workspace layout.
+  // Cache base_gemm_ws — for a given template instantiation the CUTLASS workspace
+  // size depends only on the group count (num_experts), which is stable across calls.
   using StrideDVal = std::remove_pointer_t<StrideD>;
-  size_t base_gemm_ws = 0;
-  {
+  thread_local int    cached_num_experts = -1;
+  thread_local size_t cached_base_gemm_ws = 0;
+  if (num_experts != cached_num_experts) {
     typename Gemm::Arguments ws_arguments = {
         cutlass::gemm::GemmUniversalMode::kGrouped,
         tma_inputs.shape_info,
         {nullptr, StrideA{}, nullptr, StrideB{}, nullptr, LayoutSFA{}, nullptr, LayoutSFB{},
-         nullptr, StrideAux{}, nullptr, LayoutSFAux{}},
+         nullptr, StrideAux{}, nullptr, LayoutSFAux{},
+         swiglu_alpha, swiglu_beta, swiglu_limit,
+         fc1_bias, inter_size},
         // Epilogue args (CollectiveBuilder format)
         {{}, nullptr, nullptr, nullptr, StrideD{}},
         hw_info};
     ws_arguments.epilogue.thread.alpha = 1.0f;
     ws_arguments.epilogue.thread.beta = 0.0f;
-    base_gemm_ws = gemm.get_workspace_size(ws_arguments);
+    cached_base_gemm_ws = gemm.get_workspace_size(ws_arguments);
+    cached_num_experts = num_experts;
   }
+  size_t const base_gemm_ws = cached_base_gemm_ws;
   auto ws_layout = GatedFC1WorkspaceLayout::compute(base_gemm_ws, num_experts, sizeof(StrideDVal));
 
   TLLM_CHECK_WITH_INFO(
@@ -1497,6 +1564,16 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
       "SM120 fused activation: workspace too small (%zu < %zu)",
       tma_inputs.gemm_workspace_size,
       ws_layout.total_size);
+
+  // Zero fused workspace for compute-sanitizer initcheck cleanliness.
+  // computeGatedPointersAndStrides writes all per-expert values; the
+  // memset covers struct padding only.  Compiled out in release (NDEBUG).
+#ifndef NDEBUG
+  if (tma_inputs.gemm_workspace && ws_layout.total_size > 0
+      && !tensorrt_llm::common::isCapturing(stream)) {
+    cudaMemsetAsync(tma_inputs.gemm_workspace, 0, ws_layout.total_size, stream);
+  }
+#endif
 
   // Carve workspace for all pointer/stride arrays
   char* ws_base = reinterpret_cast<char*>(tma_inputs.gemm_workspace);
@@ -1542,6 +1619,16 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
         problem_shapes,
         num_experts);
     
+    // Check for launch errors immediately so we don't feed partially-initialized
+    // metadata into the downstream GEMM.  Use cudaPeekAtLastError (not
+    // cudaGetLastError) to avoid clearing sticky error state that downstream
+    // callers may need to observe.
+    {
+      cudaError_t launch_err = cudaPeekAtLastError();
+      TLLM_CHECK_WITH_INFO(launch_err == cudaSuccess,
+          "SM120 Fused FC1: computeGatedPointersAndStrides launch failed: %s",
+          cudaGetErrorString(launch_err));
+    }
     TLLM_LOG_DEBUG("[SM120 Fused FC1] Launched pointer/stride kernel: blocks=%d, threads=%d", blocks, threads);
   }
 
@@ -1614,7 +1701,14 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
         reinterpret_cast<typename CollectiveMainloop::ElementAux const**>(ptr_weight_gate),
         stride_aux,
         reinterpret_cast<MainloopElementSF const**>(sf_gate),
-        layout_sfaux
+        layout_sfaux,
+        // SwiGLU activation parameters
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        // FC1 bias (nullptr = no bias)
+        fc1_bias,
+        inter_size
       },
       // Epilogue args (CollectiveBuilder format: {thread_args, ptr_C, stride_C, ptr_D, stride_D})
       // For grouped GEMM: ptr_D and stride_D are DEVICE POINTERS to per-expert arrays
@@ -1629,30 +1723,34 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
   };
   
   // Set fusion params (alpha=1, beta=0 for passthrough)
+  // INVARIANT: beta MUST be 0 for SM120 — the epilogue is built with ElementC=void
+  // (no source tensor), so any nonzero beta would silently produce wrong results.
   arguments.epilogue.thread.alpha = 1.0f;
   arguments.epilogue.thread.beta = 0.0f;
+  TLLM_CHECK_WITH_INFO(arguments.epilogue.thread.beta == 0.0f,
+      "SM120 fused FC1 epilogue is built with ElementC=void (no source tensor); "
+      "beta must be 0. Nonzero beta requires a separate epilogue with real ElementC.");
 
-  // Opt-in to extended shared memory for the fused kernel.
-  // The 6-plane gated mainloop (A, B, Aux, SFA, SFB, SFAux) needs ~71KB at
-  // 64x64x128 tiles, which exceeds the default 48KB limit.  Without this call
-  // the kernel hits "illegal instruction" on SM12x (hardware reports SMEM
-  // overruns as illegal-instruction, not OOM).
+  // One-time-per-device SMEM opt-in for extended shared memory.
+  // SharedStorageSize is a compile-time constant; cudaFuncSetAttribute is per-device-context
+  // so re-run when the active device changes.
   {
-    int smem_size = int(Gemm::GemmKernel::SharedStorageSize);
-    int optin_limit = -1;
-    (void)cudaDeviceGetAttribute(&optin_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
-    TLLM_LOG_DEBUG("[SM120 Fused FC1] SharedStorageSize=%dB  MaxSharedMemoryPerBlockOptin=%dB",
-                   smem_size, optin_limit);
-    if (smem_size >= (48 << 10)) {
-      cudaError_t attr_err = cudaFuncSetAttribute(
-          cutlass::device_kernel<typename Gemm::GemmKernel>,
-          cudaFuncAttributeMaxDynamicSharedMemorySize,
-          smem_size);
-      if (attr_err != cudaSuccess) {
-        (void)cudaGetLastError();  // clear sticky error
-        TLLM_THROW("SM120 Fused FC1: cudaFuncSetAttribute(MaxDynamicSharedMemorySize=%d) failed: %s",
-                   smem_size, cudaGetErrorString(attr_err));
+    thread_local int smem_opted_device = -1;
+    if (current_device != smem_opted_device) {
+      int constexpr smem_size = int(Gemm::GemmKernel::SharedStorageSize);
+      TLLM_LOG_DEBUG("[SM120 Fused FC1] SharedStorageSize=%dB", smem_size);
+      if (smem_size >= (48 << 10)) {
+        cudaError_t attr_err = cudaFuncSetAttribute(
+            cutlass::device_kernel<typename Gemm::GemmKernel>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size);
+        if (attr_err != cudaSuccess) {
+          (void)cudaGetLastError();
+          TLLM_THROW("SM120 Fused FC1: cudaFuncSetAttribute(MaxDynamicSharedMemorySize=%d) failed: %s",
+                     smem_size, cudaGetErrorString(attr_err));
+        }
       }
+      smem_opted_device = current_device;
     }
   }
 
@@ -1681,8 +1779,10 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
 #else
   (void)tma_inputs; (void)aux_output; (void)expert_first_token_offset;
   (void)inter_size; (void)hidden_size;
-  (void)num_experts; (void)multi_processor_count; (void)stream;
-  (void)occupancy; (void)workspace_size;
+  (void)num_experts; (void)multi_processor_count;
+  (void)swiglu_alpha; (void)swiglu_beta; (void)swiglu_limit;
+  (void)fc1_bias;
+  (void)stream; (void)occupancy; (void)workspace_size;
   TLLM_THROW("SM120 fused activation requires CUTLASS_ARCH_MMA_SM12x_SUPPORTED, ENABLE_FP4, and FLASHINFER_FUSED_ACTIVATION");
 #endif
 }
@@ -1696,13 +1796,13 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
 #if defined(CUTLASS_ARCH_MMA_SM12x_SUPPORTED) && defined(ENABLE_FP4) && defined(FLASHINFER_FUSED_ACTIVATION)
 
 // FP8 activations × FP4 weights → BF16 output (standard MXFP4)
-// Tile must be 64×64×128 to fit the 6-plane fused mainloop in SM121 SMEM (71KB < 101KB limit)
+// Tile shape selected at JIT compile time via LOGICAL_TILE_M/N macros.
 template void sm120_fused_act_moe_gemm_kernelLauncher<
     __nv_fp8_e4m3,      // T (activation type)
     __nv_fp4_e2m1,      // WeightType
     __nv_bfloat16,      // OutputType
     void,               // EpilogueTag
-    cute::Shape<cute::Int<64>, cute::Int<64>, cute::Int<128>>,    // TileShape (fixed for fused SMEM)
+    cute::Shape<cute::Int<LOGICAL_TILE_M>, cute::Int<LOGICAL_TILE_N>, cute::Int<128>>,  // TileShape
     cute::Shape<cute::_1, cute::_1, cute::_1>,                    // ClusterShape
     true                // IsMXFP4
 >(
@@ -1713,6 +1813,10 @@ template void sm120_fused_act_moe_gemm_kernelLauncher<
     int64_t hidden_size,
     int num_experts,
     int multi_processor_count,
+    float const* swiglu_alpha,
+    float const* swiglu_beta,
+    float const* swiglu_limit,
+    void const* fc1_bias,
     cudaStream_t stream,
     int* occupancy,
     size_t* workspace_size);

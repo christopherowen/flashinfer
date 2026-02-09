@@ -295,18 +295,19 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     CHECK_DIM(3, fc1_expert_weights);
     CHECK_DIM(3, fc2_expert_weights);
 
-    if (fc1_expert_biases.has_value() || fc2_expert_biases.has_value()) {
+    if (fc1_expert_biases.has_value()) {
       CHECK_INPUT_TYPE(fc1_expert_biases.value(), mOutputDtype);
-      CHECK_INPUT_TYPE(fc2_expert_biases.value(), mOutputDtype);
-
       CHECK_DIM(2, fc1_expert_biases.value());
-      CHECK_DIM(2, fc2_expert_biases.value());
       TVM_FFI_ICHECK_EQ(fc1_expert_weights.size(0), fc1_expert_biases.value().size(0))
           << "fc1_expert_weights and fc1_expert_biases must have the same number of experts.";
-      TVM_FFI_ICHECK_EQ(fc2_expert_weights.size(0), fc2_expert_biases.value().size(0))
-          << "fc2_expert_weights and fc2_expert_biases must have the same number of experts.";
       TVM_FFI_ICHECK_EQ(fc1_expert_biases.value().size(1), fc1_expert_weights.size(1))
           << "fc1_expert_biases should match fc1_expert_weights output shape.";
+    }
+    if (fc2_expert_biases.has_value()) {
+      CHECK_INPUT_TYPE(fc2_expert_biases.value(), mOutputDtype);
+      CHECK_DIM(2, fc2_expert_biases.value());
+      TVM_FFI_ICHECK_EQ(fc2_expert_weights.size(0), fc2_expert_biases.value().size(0))
+          << "fc2_expert_weights and fc2_expert_biases must have the same number of experts.";
       TVM_FFI_ICHECK_EQ(fc2_expert_biases.value().size(1), fc2_expert_weights.size(1))
           << "fc2_expert_biases should match fc2_expert_weights output shape.";
     }
@@ -385,7 +386,6 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
                                                                : nullptr),
         reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().data_ptr()
                                                                 : nullptr));
-
     setRunnerProfiles(profile_ids);
 
     auto stream = get_stream(input.device());
@@ -476,17 +476,19 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     CHECK_DIM(3, fc1_expert_weights);
     CHECK_DIM(3, fc2_expert_weights);
 
-    if (fc1_expert_biases.has_value() || fc2_expert_biases.has_value()) {
+    if (fc1_expert_biases.has_value()) {
       CHECK_INPUT_TYPE(fc1_expert_biases.value(), mOutputDtype);
-      CHECK_INPUT_TYPE(fc2_expert_biases.value(), mOutputDtype);
       CHECK_DIM(2, fc1_expert_biases.value());
-      CHECK_DIM(2, fc2_expert_biases.value());
       TVM_FFI_ICHECK_EQ(fc1_expert_weights.size(0), fc1_expert_biases.value().size(0))
           << "fc1_expert_weights and fc1_expert_biases must have the same number of experts.";
-      TVM_FFI_ICHECK_EQ(fc2_expert_weights.size(0), fc2_expert_biases.value().size(0))
-          << "fc2_expert_weights and fc2_expert_biases must have the same number of experts.";
       TVM_FFI_ICHECK_EQ(fc1_expert_biases.value().size(1), fc1_expert_weights.size(1))
           << "fc1_expert_biases should match fc1_expert_weights output shape.";
+    }
+    if (fc2_expert_biases.has_value()) {
+      CHECK_INPUT_TYPE(fc2_expert_biases.value(), mOutputDtype);
+      CHECK_DIM(2, fc2_expert_biases.value());
+      TVM_FFI_ICHECK_EQ(fc2_expert_weights.size(0), fc2_expert_biases.value().size(0))
+          << "fc2_expert_weights and fc2_expert_biases must have the same number of experts.";
       TVM_FFI_ICHECK_EQ(fc2_expert_biases.value().size(1), fc2_expert_weights.size(1))
           << "fc2_expert_biases should match fc2_expert_weights output shape.";
     }

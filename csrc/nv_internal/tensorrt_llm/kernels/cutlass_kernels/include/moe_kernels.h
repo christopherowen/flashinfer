@@ -114,6 +114,7 @@ class CubKeyValueSorter {
 
 struct ActivationParams {
   ActivationType activation_type;
+  // Per-expert device pointers (used by both unfused doActivation and fused CUTLASS kernel)
   float const* swiglu_alpha = nullptr;
   float const* swiglu_beta = nullptr;
   float const* swiglu_limit = nullptr;
@@ -469,12 +470,16 @@ class CutlassMoeFCRunnerInterface {
                            void const* const input, void* const output,
                            void* const intermediate_result,
                            int64_t const* const expert_first_token_offset,
-                           void const* const fc1_expert_weights, float const* const fc2_fp8_quant,
+                           void const* const fc1_expert_weights,
+                           void const* const fc1_expert_biases,
+                           float const* const fc2_fp8_quant,
                            TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
                            TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat,
                            QuantParams quant_params, int64_t const expanded_num_rows,
                            int64_t const hidden_size, int64_t const inter_size,
                            int const num_experts_per_node, float const** alpha_scale_ptr_array,
+                           float const* swiglu_alpha, float const* swiglu_beta,
+                           float const* swiglu_limit,
                            bool enable_pdl, cudaStream_t stream) = 0;
 
   virtual void gemm2(
@@ -673,12 +678,15 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                           T const* const input, T* const output, void* const intermediate_result,
                           int64_t const* const expert_first_token_offset,
                           WeightType const* const fc1_expert_weights,
+                          ScaleBiasType const* const fc1_expert_biases,
                           float const* const fc2_fp8_quant,
                           TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
                           TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat,
                           QuantParams quant_params, int64_t const expanded_num_rows,
                           int64_t const hidden_size, int64_t const inter_size,
                           int const num_experts_per_node, float const** alpha_scale_ptr_array,
+                          float const* swiglu_alpha, float const* swiglu_beta,
+                          float const* swiglu_limit,
                           bool enable_pdl, cudaStream_t stream);
 
   static void gemm2(
@@ -736,20 +744,26 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   void gemm1_fused(TmaWarpSpecializedGroupedGemmInput tma_ws_input_template,
                    void const* const input, void* const output, void* const intermediate_result,
                    int64_t const* const expert_first_token_offset,
-                   void const* const fc1_expert_weights, float const* const fc2_fp8_quant,
+                   void const* const fc1_expert_weights,
+                   void const* const fc1_expert_biases,
+                   float const* const fc2_fp8_quant,
                    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
                    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat,
                    QuantParams quant_params, int64_t const expanded_num_rows,
                    int64_t const hidden_size, int64_t const inter_size,
                    int const num_experts_per_node, float const** alpha_scale_ptr_array,
+                   float const* swiglu_alpha, float const* swiglu_beta,
+                   float const* swiglu_limit,
                    bool enable_pdl, cudaStream_t stream) override {
     return Self::gemm1_fused(tma_ws_input_template, static_cast<T const*>(input),
                              static_cast<T*>(output), intermediate_result,
                              expert_first_token_offset,
                              static_cast<WeightType const*>(fc1_expert_weights),
+                             static_cast<ScaleBiasType const*>(fc1_expert_biases),
                              fc2_fp8_quant, fc1_fp4_act_flat, fc2_fp4_act_flat, quant_params,
                              expanded_num_rows, hidden_size, inter_size, num_experts_per_node,
-                             alpha_scale_ptr_array, enable_pdl, stream);
+                             alpha_scale_ptr_array, swiglu_alpha, swiglu_beta, swiglu_limit,
+                             enable_pdl, stream);
   }
 
   void gemm2(void const* const input, void* const gemm_output, void* const final_output,
@@ -842,7 +856,7 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
   }
 
  private:
-  // Unfused path only -- the fused path uses gemm1_fused() which does its own TMA setup.
+  // Unfused path only -- the fused path uses setupGemm2TmaInputForFused() instead.
   std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
   setupTmaWarpSpecializedInputs(int64_t num_rows, int64_t expanded_num_rows,
                                 ActivationParams fc1_activation_type, int64_t hidden_size,
@@ -856,6 +870,17 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                                 MoeMinLatencyParams& min_latency_params, bool use_lora,
                                 int start_expert, MOEParallelismConfig parallelism_config,
                                 bool enable_pdl, cudaStream_t stream);
+
+  // Fused path only -- sets up GEMM2 TMA descriptors and MXFP4 memset without
+  // the redundant GEMM1 stride work (gemm1_fused() handles GEMM1 TMA itself).
+  TmaWarpSpecializedGroupedGemmInput
+  setupGemm2TmaInputForFused(int64_t num_rows, int64_t expanded_num_rows,
+                             int64_t hidden_size, int64_t unpadded_hidden_size,
+                             int64_t inter_size, int64_t num_experts_per_node,
+                             void* final_output, WeightType const* fc2_expert_weights,
+                             QuantParams quant_params, ScaleBiasType const* fc2_expert_biases,
+                             bool use_lora, MOEParallelismConfig parallelism_config,
+                             bool enable_pdl, cudaStream_t stream);
 
   static std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
   computeStridesTmaWarpSpecialized(
@@ -891,7 +916,8 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface {
                        int64_t const inter_size, int const num_experts_per_node,
                        int const experts_per_token, ActivationType activation_type,
                        MOEParallelismConfig parallelism_config, bool use_lora,
-                       bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq);
+                       bool use_deepseek_fp8_block_scale, bool min_latency_mode, bool use_awq,
+                       cudaStream_t stream = nullptr);
 
  private:
   bool mayHaveDifferentGEMMOutputType() const {
@@ -1130,6 +1156,10 @@ void sm120_fused_act_moe_gemm_kernelLauncher(
     int64_t hidden_size,
     int num_experts,
     int multi_processor_count,
+    float const* swiglu_alpha,
+    float const* swiglu_beta,
+    float const* swiglu_limit,
+    void const* fc1_bias,
     cudaStream_t stream,
     int* occupancy,
     size_t* workspace_size);

@@ -86,8 +86,25 @@ size_t TmaWarpSpecializedGroupedGemmInput::workspaceSize(int num_experts,
 void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, int num_experts,
                                                             void* gemm_workspace,
                                                             size_t gemm_workspace_size,
-                                                            FpXBlockScalingType scaling_type) {
+                                                            FpXBlockScalingType scaling_type,
+                                                            cudaStream_t stream) {
   auto buffers = workspaceBuffers(num_experts, scaling_type);
+
+  // Zero metadata workspace to suppress compute-sanitizer initcheck warnings
+  // from struct padding bytes in per-expert metadata arrays (Stride*, LayoutSF,
+  // ProblemShape).  Not required for correctness — all fields the CUTLASS
+  // kernel reads are fully written by setupTmaWarpSpecializedInputs().
+  // Compiled out in release (NDEBUG) to avoid hot-path bandwidth cost.
+#ifndef NDEBUG
+  if (stream && !tensorrt_llm::common::isCapturing(stream)) {
+    size_t total_size = tensorrt_llm::common::calculateTotalWorkspaceSize(
+        buffers.data(), buffers.size());
+    cudaMemsetAsync(start_ptr, 0, total_size, stream);
+  }
+#else
+  (void)stream;
+#endif
+
   std::array<int8_t*, 20> pointers{};
   TLLM_CHECK_WITH_INFO(pointers.size() == buffers.size(),
                        "Mismatching workspace size and number of buffers");

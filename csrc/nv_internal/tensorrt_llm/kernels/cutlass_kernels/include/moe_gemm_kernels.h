@@ -224,7 +224,8 @@ struct TmaWarpSpecializedGroupedGemmInput {
   static size_t workspaceSize(int num_experts, FpXBlockScalingType scaling_type);
 
   void configureWorkspace(int8_t* start_ptr, int num_experts, void* gemm_workspace,
-                          size_t gemm_workspace_size, FpXBlockScalingType scaling_type);
+                          size_t gemm_workspace_size, FpXBlockScalingType scaling_type,
+                          cudaStream_t stream = nullptr);
 
   bool isValid() const { return stride_act != nullptr && ptr_act != nullptr; }
 
