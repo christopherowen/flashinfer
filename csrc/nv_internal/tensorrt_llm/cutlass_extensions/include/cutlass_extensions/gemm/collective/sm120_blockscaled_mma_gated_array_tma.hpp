@@ -2,21 +2,29 @@
  * Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: BSD-3-Clause
  *
- * Sequential SMEM Reuse Gated Mainloop for SM120 block-scaled MMA.
+ * Interleaved Gated Mainloop for SM120 block-scaled MMA.
  *
  * Key design: Instead of allocating 6 SMEM arrays (A, B, Aux, SFA, SFB, SFAux),
  * we allocate only 4 (A, B, SFA, SFB) and reuse smem_B/smem_SFB for both linear
- * and gate weights by running two sequential K-reduction passes:
+ * and gate weights by interleaving at the K-tile granularity:
  *
- *   Phase 1: Load A + B_linear + SFA + SFB_linear → accum0 (linear GEMM)
- *   Phase 2: Load A + B_gate + SFA + SFB_gate → accum1 (gate GEMM)
- *   Then:    accum = SiLU(accum1) * accum0  (SwiGLU in registers)
+ *   Stage 0: A[0] + B_linear[0] + SFA[0] + SFB[0]   → accum       (linear)
+ *   Stage 1: A[0] + B_gate[0]   + SFA[0] + SFAux[0]  → accum_gate  (gate)
+ *   Stage 2: A[1] + B_linear[1] + SFA[1] + SFB[1]   → accum       (linear)
+ *   Stage 3: A[1] + B_gate[1]   + SFA[1] + SFAux[1]  → accum_gate  (gate)
+ *   ...
+ *   Then:    accum = SiLU(accum_gate) * accum  (SwiGLU in registers)
+ *
+ * By interleaving linear and gate loads for the same K-tile in adjacent pipeline
+ * stages, the second A-operand load is virtually guaranteed to hit L2 cache,
+ * eliminating the HBM traffic doubling that occurs with sequential two-phase
+ * loading (where k_real stages separate the two loads of the same A tile).
  *
  * This reduces SMEM from ~112KB (6 arrays @ 128x128) to ~66KB (4 arrays @ 128x128),
  * fitting within SM121's 101KB limit and satisfying the N%128 hardware constraint.
  *
  * The kernel doubles k_tile_count for this mainloop (via IsGated flag), so load()
- * and mma() each receive 2 * real_k_tile_count and split into two phases internally.
+ * and mma() each receive 2 * real_k_tile_count.
  *
  **************************************************************************************************/
 
@@ -49,11 +57,11 @@ struct MainloopSm120ArrayTmaWarpSpecializedBlockScaledGated {
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// Sequential SMEM Reuse Gated Collective MMA for SM120 Block-Scaled Array TMA
+/// Interleaved Gated Collective MMA for SM120 Block-Scaled Array TMA
 ///
-/// Uses 4 SMEM arrays (same as unfused kernel), runs 2 sequential K passes.
-/// The kernel provides 2*k_tile_count pipeline stages; this mainloop splits them
-/// into two phases: linear GEMM then gate GEMM, with SwiGLU applied in registers.
+/// Uses 4 SMEM arrays (same as unfused kernel). Interleaves linear and gate
+/// K-tile loads in adjacent pipeline stages for near-guaranteed L2 cache hits
+/// on the second A-operand load. SwiGLU is applied in registers after all stages.
 ///
 template <
   int Stages,
@@ -590,14 +598,20 @@ struct CollectiveMma<
   }
 
   //
-  // load - TWO-PHASE loading with sequential SMEM reuse
+  // load - INTERLEAVED loading with sequential SMEM reuse
   //
   // The kernel provides k_tile_count = 2 * real_k_tile_count.
-  // Phase 1 (k_real stages): Load A + B_linear + SFA + SFB into smem_A/smem_B/smem_SFA/smem_SFB
-  // Phase 2 (k_real stages): Load A + B_gate + SFA + SFAux into smem_A/smem_B/smem_SFA/smem_SFB
+  // Interleaved pattern (linear and gate alternate for each K position):
+  //   Stage 0: A[0] + B_linear[0] + SFA[0] + SFB[0]    (linear, K=0)
+  //   Stage 1: A[0] + B_gate[0]   + SFA[0] + SFAux[0]  (gate,   K=0)
+  //   Stage 2: A[1] + B_linear[1] + SFA[1] + SFB[1]    (linear, K=1)
+  //   Stage 3: A[1] + B_gate[1]   + SFA[1] + SFAux[1]  (gate,   K=1)
+  //   ...
   //
-  // Both phases load into the SAME 4 SMEM arrays. This is safe because the pipeline
-  // ensures the consumer finishes reading before the producer overwrites.
+  // Both linear and gate load into the SAME 4 SMEM arrays (A, B, SFA, SFB).
+  // The pipeline ensures the consumer finishes reading before the producer
+  // overwrites.  A[k] is loaded in two adjacent stages (linear then gate),
+  // so the second TMA load is virtually guaranteed to hit L2 cache.
   //
   template <class LoadTuple, class TensorMapTuple, class KTileIterator, class BlockCoord>
   CUTLASS_DEVICE void
@@ -670,58 +684,48 @@ struct CollectiveMma<
       Tensor tAuxgSFAux = block_tma_sfaux.partition_S(gSFAux);
       Tensor tAuxsSFB = block_tma_sfaux.partition_D(sSFB); // Gate SF goes into same smem_SFB
 
-      // Two-phase load in a single loop.  The kernel provides k_tile_count = 2 * k_real.
-      // Phase 1 (first k_real iters): load A + B_linear + SFA + SFB_linear
-      // Phase 2 (last  k_real iters): load A + B_gate  + SFA + SFAux
+      // Interleaved load: k_tile_count = 2 * k_real.
+      // Even stages (s % 2 == 0): load A + B_linear + SFA + SFB_linear
+      // Odd  stages (s % 2 == 1): load A + B_gate  + SFA + SFAux
       //
-      // ForwardCoordIterator does NOT wrap modulo shape — it increments past end.
-      // We explicitly reset the coord at the phase boundary so phase 2 re-reads
-      // A/SFA from the same K positions and loads gate B/SFAux at matching coords.
-      // NOTE: These invariants are guaranteed by the kernel's k_tile_count doubling
-      // logic in sm90_gemm_array_tma_warpspecialized_pingpong.hpp.  The checks are
-      // compiled out in release (NDEBUG) to avoid device-side trap instructions.
+      // The K iterator advances once per pair of stages (after the gate load),
+      // so both linear and gate stages for the same K position use the same
+      // A/SFA data.  No K iterator reset is needed — interleaving eliminates
+      // the two-phase boundary.
 #ifndef NDEBUG
       if (!(k_tile_count % 2 == 0 && k_tile_count > 0)) { return; }
 #endif
-      int k_real = k_tile_count / 2;
-
-      // Save starting coord so we can reset the iterator for phase 2.
-      auto k_start_coord = *k_tile_iter;
 
       CUTLASS_PRAGMA_NO_UNROLL
-      for (int k = 0; k < k_tile_count; ++k) {
-        // Reset K iterator at phase boundary: phase 2 re-reads the same K coords
-        if (k == k_real) {
-          k_tile_iter.coord = k_start_coord;
-        }
-
+      for (int s = 0; s < k_tile_count; ++s) {
         pipeline.producer_acquire(smem_pipe_write);
 
         using BarrierType = typename MainloopPipeline::ProducerBarrierType;
         BarrierType* tma_barrier = pipeline.producer_get_barrier(smem_pipe_write);
         int write_stage = smem_pipe_write.index();
 
-        // A + SFA loaded every iteration (same for both phases)
+        // A + SFA loaded every stage (same K position for both linear and gate)
         copy(params.base.tma_load_a.with(get<0>(input_tensormaps), *tma_barrier), 
              tAgA(_, _, _, *k_tile_iter), tAsA(_, _, _, write_stage));
         copy(params.base.tma_load_sfa.with(get<2>(input_tensormaps), *tma_barrier),
              tAgSFA(_, _, _, *k_tile_iter), tAsSFA(_, _, _, write_stage));
         
-        if (k < k_real) {
-          // Phase 1: Load B_linear + SFB_linear into smem_B / smem_SFB
+        if (s % 2 == 0) {
+          // Even stage: Load B_linear + SFB_linear into smem_B / smem_SFB
           copy(params.base.tma_load_b.with(get<1>(input_tensormaps), *tma_barrier),
                tBgB(_, _, _, *k_tile_iter), tBsB(_, _, _, write_stage));
           copy(params.base.tma_load_sfb.with(get<3>(input_tensormaps), *tma_barrier),
                tBgSFB(_, _, _, *k_tile_iter), tBsSFB(_, _, _, write_stage));
         } else {
-          // Phase 2: Load B_gate + SFAux INTO same smem_B / smem_SFB
+          // Odd stage: Load B_gate + SFAux INTO same smem_B / smem_SFB
           copy(params.aux.tma_load_aux.with(get<4>(input_tensormaps), *tma_barrier),
                tAuxgAux(_, _, _, *k_tile_iter), tAuxsB(_, _, _, write_stage));
           copy(params.aux.tma_load_sfaux.with(get<5>(input_tensormaps), *tma_barrier),
                tAuxgSFAux(_, _, _, *k_tile_iter), tAuxsSFB(_, _, _, write_stage));
+          // Advance K iterator after both linear and gate for this K position
+          ++k_tile_iter;
         }
 
-        ++k_tile_iter;
         ++smem_pipe_write;
       }
     }
@@ -737,11 +741,11 @@ struct CollectiveMma<
   }
 
   //
-  // mma - TWO-PHASE compute with inline SwiGLU (single accumulator interface)
+  // mma - INTERLEAVED compute with inline SwiGLU (single accumulator interface)
   //
   // The kernel provides k_tile_count = 2 * real_k_tile_count.
-  // Phase 1 (k_real stages): accum = A @ B_linear  (linear GEMM)
-  // Phase 2 (k_real stages): accum_gate = A @ B_gate (gate GEMM, B_gate was loaded into smem_B)
+  // Even stages (s=0,2,4,...): A @ B_linear → accum       (linear GEMM)
+  // Odd  stages (s=1,3,5,...): A @ B_gate   → accum_gate  (gate GEMM)
   // Then: accum = SiLU(accum_gate) * accum  (SwiGLU in registers)
   //
   // This provides a single-accumulator output, compatible with standard GemmUniversal epilogue.
@@ -759,6 +763,10 @@ struct CollectiveMma<
     static_assert(is_rmem<FrgTensorC>::value, "C tensor must be rmem resident.");
 
     clear(accum);
+
+    // Gate accumulator — allocated up front for interleaved accumulation
+    FrgTensorC accum_gate;
+    clear(accum_gate);
 
     // SMEM tensors - only 4 arrays
     Tensor sA = make_tensor(make_smem_ptr(shared_tensors.smem_A.begin()), SmemLayoutA{});
@@ -807,14 +815,11 @@ struct CollectiveMma<
 
     auto K_BLOCK_MAX = size<2>(tCrA);
 
-    // Split k_tile_count into two phases.
-    // Same invariant as load() — guaranteed by kernel k_tile_count doubling.
 #ifndef NDEBUG
     if (!(k_tile_count % 2 == 0 && k_tile_count > 0)) { return; }
 #endif
-    int k_real = k_tile_count / 2;
 
-    // Helper lambdas for copy and gemm (reused by both phases)
+    // Helper lambdas for copy and gemm
     auto update_stage_views = [&](int read_stage, auto& tCsA_stage, auto& tCsB_stage,
                                    auto& tCsSFA_stage, auto& tCsSFB_stage) {
       tCsA_stage = tCsA(_,_,_,read_stage);
@@ -823,8 +828,16 @@ struct CollectiveMma<
       tCsSFB_stage = tCsSFB(_,_,_,read_stage);
     };
 
-    // Run one phase of the pipelined MMA loop over k_phase_count tiles
-    auto run_mma_phase = [&](int k_phase_count, FrgTensorC& phase_accum) {
+    // ================================================================
+    // Interleaved MMA: single loop over k_tile_count stages.
+    // Even stages (stage_idx % 2 == 0) accumulate into accum (linear).
+    // Odd  stages (stage_idx % 2 == 1) accumulate into accum_gate (gate).
+    //
+    // The pipelined loop structure is the same as the base mainloop:
+    // for each stage, iterate over K_BLOCK_MAX k-blocks with prefetch
+    // of the next k-block overlapping compute of the current k-block.
+    // ================================================================
+    {
       int read_stage = smem_pipe_read.index();
       auto tCsA_stage = tCsA(_,_,_,read_stage);
       auto tCsB_stage = tCsB(_,_,_,read_stage);
@@ -843,18 +856,24 @@ struct CollectiveMma<
         copy(tCsSFB_stage(_,_,k_block), tCrSFB_copy_view(_,_,k_block));
       };
 
-      auto gemm_kblock = [&](auto k_block) {
+      auto gemm_kblock = [&](auto k_block, FrgTensorC& target_accum) {
         cute::gemm(tiled_mma,
                    make_zip_tensor(tCrA(_,_,k_block), tCrSFA(_,_,k_block)),
                    make_zip_tensor(tCrB(_,_,k_block), tCrSFB(_,_,k_block)),
-                   phase_accum);
+                   target_accum);
       };
+
+      int stage_idx = 0;  // 0-based stage counter for linear/gate parity
 
       pipeline.consumer_wait(smem_pipe_read);
       copy_kblock(_0{});
 
+      // All stages except the last
       CUTLASS_PRAGMA_NO_UNROLL
-      for (int k = k_phase_count; k > 1; --k) {
+      for (int remaining = k_tile_count; remaining > 1; --remaining) {
+        // Select accumulator for current stage: even → linear, odd → gate
+        FrgTensorC& curr_acc = (stage_idx % 2 == 0) ? accum : accum_gate;
+
         for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
           auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
 
@@ -863,46 +882,38 @@ struct CollectiveMma<
               thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
             pipeline.consumer_release(smem_pipe_read);
             ++smem_pipe_read;
+            ++stage_idx;
             read_stage = smem_pipe_read.index();
             update_stage_views(read_stage, tCsA_stage, tCsB_stage, tCsSFA_stage, tCsSFB_stage);
             pipeline.consumer_wait(smem_pipe_read);
           }
 
           copy_kblock(k_block_next);
-          gemm_kblock(k_block);
+          gemm_kblock(k_block, curr_acc);
         });
       }
 
-      // Last k_tile
-      for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
-        auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
+      // Last stage
+      {
+        FrgTensorC& curr_acc = (stage_idx % 2 == 0) ? accum : accum_gate;
 
-        if (k_block == K_BLOCK_MAX - 1) {
-          cutlass::arch::NamedBarrier::sync(
-            thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
-          pipeline.consumer_release(smem_pipe_read);
-          ++smem_pipe_read;
-        }
+        for_each(make_int_sequence<K_BLOCK_MAX>{}, [&] (auto k_block) {
+          auto k_block_next = ((k_block + 1) == K_BLOCK_MAX) ? 0 : (k_block + 1);
 
-        if (k_block_next > 0) {
-          copy_kblock(k_block_next);
-        }
-        gemm_kblock(k_block);
-      });
-    };
+          if (k_block == K_BLOCK_MAX - 1) {
+            cutlass::arch::NamedBarrier::sync(
+              thr_size(tiled_mma), cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier);
+            pipeline.consumer_release(smem_pipe_read);
+            ++smem_pipe_read;
+          }
 
-    // ================================================================
-    // PHASE 1: Linear GEMM → accum
-    // ================================================================
-    run_mma_phase(k_real, accum);
-
-    // ================================================================
-    // PHASE 2: Gate GEMM → accum_gate
-    // ================================================================
-    // smem_B/smem_SFB now contain gate weights (loaded by phase 2 of load())
-    FrgTensorC accum_gate;
-    clear(accum_gate);
-    run_mma_phase(k_real, accum_gate);
+          if (k_block_next > 0) {
+            copy_kblock(k_block_next);
+          }
+          gemm_kblock(k_block, curr_acc);
+        });
+      }
+    }
 
     // ================================================================
     // FC1 bias + per-expert SwiGLU: matches doActivationKernel in unfused path
