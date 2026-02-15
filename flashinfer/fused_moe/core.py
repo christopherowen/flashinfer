@@ -1151,19 +1151,21 @@ def cutlass_fused_moe(
     )
 
 
-def prewarm_moe_tiles():
-    """Pre-compile all MoE tile variants during server startup.
+def prewarm_moe_tiles(fuse_activation: bool = False):
+    """JIT-compile MoE tile variants needed for the active mode at startup.
 
-    Compiles both fused and unfused modules so that runtime selection
-    via VLLM_MXFP4_FUSE_ACTIVATION has no JIT latency penalty.
+    Only does work when modules actually need JIT compilation.  Skips
+    entirely when all needed ``.so`` files already exist (AOT or cached).
+
+    Args:
+        fuse_activation: If True, compile fused-activation tiles (SwiGLU
+            in the GEMM mainloop).  If False, compile unfused tiles
+            (separate GEMM + doGatedActivation kernel).
     """
-    # (tile_mn, fuse_activation) pairs to prewarm
-    MODULES_TO_PREWARM: list[tuple[tuple[int, int], bool]] = [
-        # Unfused tiles
-        ((128, 128), False),  # Prefill default
-        ((64, 128), False),   # Decode-optimized native tile
-        # Fused tiles (sequential SMEM reuse - same size as unfused)
-        ((128, 128), True),   # Fused activation (SwiGLU in mainloop)
+    # Two tiles per mode: 128x128 for prefill, 64x128 for decode.
+    TILES: list[tuple[int, int]] = [
+        (128, 128),  # Prefill (large M)
+        (64, 128),   # Decode (small M)
     ]
     try:
         major, minor = torch.cuda.get_device_capability()
@@ -1171,12 +1173,28 @@ def prewarm_moe_tiles():
         if arch not in ("120", "121"):
             return
 
-        logger.info(f"Prewarming {len(MODULES_TO_PREWARM)} MoE modules for SM{arch}...")
-        for tile_mn, fuse in MODULES_TO_PREWARM:
-            _ = get_cutlass_fused_moe_module(
-                backend="120", tile_mn=tile_mn, fuse_activation=fuse,
+        # Probe which modules actually need compilation.
+        needs_compile: list[tuple[int, int]] = []
+        for tile_mn in TILES:
+            spec = gen_cutlass_fused_moe_sm120_module(
+                tile_mn=tile_mn, fuse_activation=fuse_activation,
             )
-        logger.info(f"Prewarmed {len(MODULES_TO_PREWARM)} MoE modules")
+            if not spec.is_compiled:
+                needs_compile.append(tile_mn)
+
+        if not needs_compile:
+            return
+
+        mode = "fused" if fuse_activation else "unfused"
+        logger.info(
+            "JIT-compiling %d %s MoE module(s) for SM%s: %s",
+            len(needs_compile), mode, arch, needs_compile,
+        )
+        for tile_mn in needs_compile:
+            _ = get_cutlass_fused_moe_module(
+                backend="120", tile_mn=tile_mn, fuse_activation=fuse_activation,
+            )
+        logger.info("MoE prewarm complete")
     except Exception as e:
         logger.warning(f"Failed to prewarm MoE tiles: {e}")
 
