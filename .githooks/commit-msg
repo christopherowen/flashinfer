@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+msg_file="${1:-}"
+if [[ -z "$msg_file" || ! -f "$msg_file" ]]; then
+  echo "ERROR: commit-msg hook requires a valid commit message file path." >&2
+  exit 1
+fi
+
+if python3 - "$msg_file" <<'PY'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8", errors="replace")
+pattern = re.compile(r"^\s*Co-authored-by\s*:", re.IGNORECASE | re.MULTILINE)
+sys.exit(0 if pattern.search(text) else 1)
+PY
+then
+  cat >&2 <<'EOF'
+ERROR: Commit message contains a forbidden "Co-authored-by:" trailer.
+
+This repository does not allow co-author trailers from automation.
+Please remove all "Co-authored-by:" lines and commit again.
+
+Example fix:
+  git commit --amend
+  # delete the trailer lines, save, then push
+EOF
+  exit 1
+fi
